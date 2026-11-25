@@ -42,6 +42,22 @@ func (h *ServiceNowHandler) CreateIncident(w http.ResponseWriter, r *http.Reques
 	apierror.WriteJSON(w, http.StatusCreated, resp)
 }
 
+// CreateBulkIncident handles POST /api/v1/servicenow/incidents/bulk.
+func (h *ServiceNowHandler) CreateBulkIncident(w http.ResponseWriter, r *http.Request) {
+	var req model.CreateBulkIncidentRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	op, _ := auth.OperatorFromContext(r.Context())
+	resp, err := h.svc.CreateBulkIncident(r.Context(), op, req)
+	if err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	apierror.WriteJSON(w, http.StatusCreated, resp)
+}
+
 // LinkIncident handles POST /api/v1/alerts/{alert_id}/servicenow/link.
 func (h *ServiceNowHandler) LinkIncident(w http.ResponseWriter, r *http.Request) {
 	alertID := chi.URLParam(r, "alert_id")

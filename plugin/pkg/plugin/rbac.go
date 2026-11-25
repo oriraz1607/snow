@@ -57,9 +57,12 @@ func RequiredPermissionForRoute(method, cleanPath string) (string, bool) {
 	case http.MethodPost:
 		if len(parts) == 4 && parts[1] == "alerts" && isValidResourceSegment(parts[2]) {
 			switch parts[3] {
-			case "acknowledge", "unacknowledge", "dismiss", "reopen", "notes":
+			case "acknowledge", "unacknowledge", "dismiss", "reopen", "notes", "team":
 				return PermAlertsTriage, true
 			}
+		}
+		if len(parts) == 4 && parts[1] == "servicenow" && parts[2] == "incidents" && parts[3] == "bulk" {
+			return PermIncidentsWrite, true
 		}
 		if len(parts) == 5 && parts[1] == "alerts" && isValidResourceSegment(parts[2]) && parts[3] == "servicenow" {
 			switch parts[4] {

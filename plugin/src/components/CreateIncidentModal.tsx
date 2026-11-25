@@ -16,27 +16,34 @@ import { alertApi, ApiClientError } from '../api/client';
 import {
   Alert,
   AppPluginSettings,
-  CreateIncidentResponse,
+  ServiceNowIncident,
   ServiceNowMetadataResponse,
   SnowCallerMode,
 } from '../types/api';
 import {
-  buildDefaultDescription,
-  buildDefaultShortDescription,
+  buildBulkDescription,
+  buildBulkShortDescription,
   calculateServiceNowPriority,
   defaultImpactUrgencyForSeverity,
   generateUuid,
+  getAlertEnvironment,
+  getAlertSite,
+  getAlertTeam,
+  highestSeverity,
 } from '../utils/format';
 import { getCurrentUser } from '../utils/permissions';
 
 interface CreateIncidentModalProps {
   isOpen: boolean;
-  alert: Alert | null;
+  alerts: Alert[];
   metadata: ServiceNowMetadataResponse | null;
   pluginSettings: AppPluginSettings;
   initialWorkNote?: string;
   onClose: () => void;
-  onCreated: (alert: Alert, resp: CreateIncidentResponse) => void;
+  onCreated: (
+    alertIds: string[],
+    result: { servicenow_incident: ServiceNowIncident; warnings?: string[] }
+  ) => void;
 }
 
 const IMPACT_URGENCY_OPTIONS: Array<SelectableValue<1 | 2 | 3>> = [
@@ -47,7 +54,7 @@ const IMPACT_URGENCY_OPTIONS: Array<SelectableValue<1 | 2 | 3>> = [
 
 export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   isOpen,
-  alert,
+  alerts,
   metadata,
   pluginSettings,
   initialWorkNote = '',
@@ -71,35 +78,49 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [canRetry, setCanRetry] = useState(false);
 
-  // Track which (isOpen, alert.id) session was initialized so background alert polling
-  // never resets in-progress operator edits inside the open modal.
-  const initializedAlertIdRef = useRef<string | null>(null);
+  // Track the initialized selection key so background queue polling never resets modal edits.
+  const initializedKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!isOpen || !alert) {
-      initializedAlertIdRef.current = null;
+    if (!isOpen || alerts.length === 0) {
+      initializedKeyRef.current = null;
       return;
     }
-    if (initializedAlertIdRef.current === alert.id) {
+    const selectionKey = alerts
+      .map((a) => a.id)
+      .sort()
+      .join(',');
+    if (initializedKeyRef.current === selectionKey) {
       return;
     }
-    initializedAlertIdRef.current = alert.id;
+    initializedKeyRef.current = selectionKey;
 
-    const mapped = defaultImpactUrgencyForSeverity(alert.severity);
-    const labelGroup =
-      alert.labels?.assignment_group?.trim() ||
-      alert.labels?.team?.trim() ||
-      metadata?.default_assignment_group ||
-      'Infrastructure';
+    const topSeverity = highestSeverity(alerts);
+    const mapped = defaultImpactUrgencyForSeverity(topSeverity);
+
+    let defaultGroup = metadata?.default_assignment_group || 'Infrastructure';
+    for (const a of alerts) {
+      const explicitGroup = a.labels?.assignment_group?.trim();
+      const teamName = getAlertTeam(a).team;
+      if (explicitGroup) {
+        defaultGroup = explicitGroup;
+        break;
+      }
+      if (teamName) {
+        defaultGroup = teamName;
+        break;
+      }
+    }
+
     const defaultCategory = metadata?.default_category || 'Infrastructure';
     const defaultMode: SnowCallerMode =
       pluginSettings.defaultCallerMode || metadata?.default_caller_mode || 'sso_user';
 
-    setShortDescription(buildDefaultShortDescription(alert));
-    setDescription(buildDefaultDescription(alert));
+    setShortDescription(buildBulkShortDescription(alerts));
+    setDescription(buildBulkDescription(alerts));
     setImpact(mapped.impact);
     setUrgency(mapped.urgency);
-    setAssignmentGroup(labelGroup);
+    setAssignmentGroup(defaultGroup);
     setCategory(defaultCategory);
     setCallerMode(defaultMode);
     setWorkNotes(initialWorkNote);
@@ -107,9 +128,9 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
     setSubmitError(null);
     setCanRetry(false);
     setSubmitting(false);
-  }, [isOpen, alert, metadata, pluginSettings.defaultCallerMode, initialWorkNote]);
+  }, [isOpen, alerts, metadata, pluginSettings.defaultCallerMode, initialWorkNote]);
 
-  if (!isOpen || !alert) {
+  if (!isOpen || alerts.length === 0) {
     return null;
   }
 
@@ -157,6 +178,13 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
 
   const trimmedShort = shortDescription.trim();
   const shortInvalid = trimmedShort.length < 5 || trimmedShort.length > 160;
+  const firingCount = alerts.filter((a) => a.state === 'firing').length;
+  const isBulk = alerts.length > 1 || firingCount > 0;
+
+  const modalTitle =
+    alerts.length > 1
+      ? `Create Single ServiceNow Incident (${alerts.length} alerts)`
+      : `Create ServiceNow Incident — ${alerts[0].alert_name}`;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -167,28 +195,52 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
     setSubmitError(null);
 
     try {
-      const resp = await alertApi.createIncident(
-        alert.id,
-        {
-          short_description: trimmedShort,
-          description,
-          impact,
-          urgency,
-          assignment_group: assignmentGroup.trim(),
-          category: category.trim(),
-          caller_mode: callerMode,
-          work_notes: workNotes.trim(),
-        },
-        idempotencyKey
-      );
-      onCreated(alert, resp);
+      if (isBulk) {
+        const resp = await alertApi.createBulkIncident(
+          {
+            alert_ids: alerts.map((a) => a.id),
+            short_description: trimmedShort,
+            description,
+            impact,
+            urgency,
+            assignment_group: assignmentGroup.trim(),
+            category: category.trim(),
+            caller_mode: callerMode,
+            work_notes: workNotes.trim(),
+          },
+          idempotencyKey
+        );
+        onCreated(resp.alert_ids, {
+          servicenow_incident: resp.servicenow_incident,
+          warnings: resp.warnings,
+        });
+      } else {
+        const resp = await alertApi.createIncident(
+          alerts[0].id,
+          {
+            short_description: trimmedShort,
+            description,
+            impact,
+            urgency,
+            assignment_group: assignmentGroup.trim(),
+            category: category.trim(),
+            caller_mode: callerMode,
+            work_notes: workNotes.trim(),
+          },
+          idempotencyKey
+        );
+        onCreated([resp.alert_id], {
+          servicenow_incident: resp.servicenow_incident,
+          warnings: resp.warnings,
+        });
+      }
     } catch (err) {
       const apiErr = err as ApiClientError;
       const isTransient = apiErr?.status === 502 || apiErr?.status === 503 || apiErr?.status === 504;
       setCanRetry(isTransient);
       setSubmitError(
         isTransient
-          ? `ServiceNow returned HTTP ${apiErr.status}: ${apiErr.message}. Alert remains acknowledged — retry safely with the preserved form and idempotency key.`
+          ? `ServiceNow returned HTTP ${apiErr.status}: ${apiErr.message}. Alert(s) remain acknowledged — retry safely with the preserved form and idempotency key.`
           : apiErr?.message || 'Failed to create ServiceNow incident.'
       );
     } finally {
@@ -197,18 +249,35 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   };
 
   return (
-    <Modal
-      isOpen={isOpen}
-      title={`Create ServiceNow Incident — ${alert.alert_name}`}
-      onDismiss={onClose}
-      className={styles.modal}
-    >
+    <Modal isOpen={isOpen} title={modalTitle} onDismiss={onClose} className={styles.modal}>
       <form onSubmit={handleSubmit}>
         {submitError && (
           <div className={styles.errorBox}>
             <GrafanaAlert severity="error" title="ServiceNow incident creation failed">
               {submitError}
             </GrafanaAlert>
+          </div>
+        )}
+
+        {(alerts.length > 1 || firingCount > 0) && (
+          <div className={styles.selectedSummary} data-testid="selected-alerts-summary">
+            <div className={styles.selectedHeader}>
+              <strong>Included Alerts ({alerts.length})</strong>
+              {firingCount > 0 && (
+                <span className={styles.autoAckNote}>
+                  {firingCount} firing alert{firingCount === 1 ? '' : 's'} will be auto-acknowledged
+                </span>
+              )}
+            </div>
+            <ul className={styles.selectedList}>
+              {alerts.map((a) => (
+                <li key={a.id}>
+                  <strong>{a.alert_name}</strong> ({a.severity}, {a.state}
+                  {getAlertEnvironment(a) ? `, env=${getAlertEnvironment(a)}` : ''}
+                  {getAlertSite(a) ? `, site=${getAlertSite(a)}` : ''})
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 
@@ -286,7 +355,10 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
           </Field>
         </div>
 
-        <Field label="Caller Identity" description="Falls back to the service account if SSO email lookup misses in ServiceNow.">
+        <Field
+          label="Caller Identity"
+          description="Falls back to the service account if SSO email lookup misses in ServiceNow."
+        >
           <div className={styles.radioGroup}>
             <label className={styles.radioOption}>
               <input
@@ -328,7 +400,13 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
               Cancel
             </Button>
             <Button variant="primary" type="submit" disabled={shortInvalid || submitting}>
-              {submitting ? 'Creating Incident...' : canRetry ? 'Retry Creation' : 'Create ServiceNow Incident'}
+              {submitting
+                ? 'Creating Incident...'
+                : canRetry
+                  ? 'Retry Creation'
+                  : alerts.length > 1
+                    ? `Create Single Incident (${alerts.length})`
+                    : 'Create ServiceNow Incident'}
             </Button>
           </div>
         </div>
@@ -339,10 +417,34 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
 
 const getStyles = (theme: GrafanaTheme2) => ({
   modal: css`
-    width: min(680px, 95vw);
+    width: min(700px, 95vw);
   `,
   errorBox: css`
     margin-bottom: ${theme.spacing(2)};
+  `,
+  selectedSummary: css`
+    padding: ${theme.spacing(1.25)};
+    margin-bottom: ${theme.spacing(1.5)};
+    border: 1px solid ${theme.colors.border.medium};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+    font-size: ${theme.typography.bodySmall.fontSize};
+  `,
+  selectedHeader: css`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: ${theme.spacing(0.5)};
+  `,
+  autoAckNote: css`
+    color: ${theme.colors.warning.text};
+    font-size: 11px;
+  `,
+  selectedList: css`
+    margin: 0;
+    padding-left: ${theme.spacing(2.25)};
+    max-height: 110px;
+    overflow-y: auto;
   `,
   gridRow: css`
     display: flex;

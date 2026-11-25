@@ -27,6 +27,9 @@ type IncidentRepository interface {
 	ReserveIncidentCreation(ctx context.Context, alertID string, op auth.OperatorContext, req model.CreateIncidentRequest, allowRetrospective bool) (*store.IncidentReservation, error)
 	FinalizeIncidentCreated(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool) (*model.ServiceNowIncident, error)
 	FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg string) error
+	ReserveBulkIncidentCreation(ctx context.Context, alertIDs []string, op auth.OperatorContext, req model.CreateBulkIncidentRequest, allowTriage bool) (*store.BulkIncidentReservation, error)
+	FinalizeBulkIncidentCreated(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool) (*model.ServiceNowIncident, error)
+	FinalizeBulkIncidentFailed(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, errMsg string) error
 	SaveLinkedIncident(ctx context.Context, alertID string, op auth.OperatorContext, snowInc store.SnowCreateResult, allowRetrospective bool) (*model.IncidentSyncResponse, error)
 	GetAlertAndIncident(ctx context.Context, alertID string) (model.AlertState, *model.ServiceNowIncident, error)
 	UpdateIncidentForAlert(ctx context.Context, alertID string, op auth.OperatorContext, update store.SnowSyncUpdate) (*model.IncidentSyncResponse, error)
@@ -105,9 +108,6 @@ func (s *IncidentService) CreateIncident(
 		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "caller_mode must be \"sso_user\" or \"generic_noc\".")
 	}
 	req.AssignmentGroup = strings.TrimSpace(req.AssignmentGroup)
-	if req.AssignmentGroup == "" {
-		req.AssignmentGroup = s.cfg.DefaultAssignmentGroup
-	}
 	req.Category = strings.TrimSpace(req.Category)
 	if req.Category == "" {
 		req.Category = s.cfg.DefaultCategory
@@ -147,11 +147,7 @@ func (s *IncidentService) CreateIncident(
 	}
 	assignGroup := req.AssignmentGroup
 	if assignGroup == "" {
-		if g := strings.TrimSpace(resv.Alert.Labels["assignment_group"]); g != "" {
-			assignGroup = g
-		} else if t := strings.TrimSpace(resv.Alert.Labels["team"]); t != "" {
-			assignGroup = t
-		}
+		assignGroup = resolveDefaultAssignmentGroup([]model.AlertDetail{resv.Alert}, s.cfg.DefaultAssignmentGroup)
 	}
 
 	payload := servicenow.CreateIncidentPayload{
@@ -197,6 +193,131 @@ func (s *IncidentService) CreateIncident(
 
 	return &model.CreateIncidentResponse{
 		AlertID:            alertID,
+		ServiceNowIncident: inc,
+		Warnings:           buildCallerWarnings(callerRes, op),
+	}, nil
+}
+
+// CreateBulkIncident creates one ServiceNow incident covering multiple selected alert episodes,
+// auto-acknowledging any selected firing alerts under a single deterministic reservation tx.
+func (s *IncidentService) CreateBulkIncident(
+	ctx context.Context,
+	op auth.OperatorContext,
+	req model.CreateBulkIncidentRequest,
+) (*model.CreateBulkIncidentResponse, error) {
+	if len(req.AlertIDs) == 0 || len(req.AlertIDs) > 50 {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_ids must contain between 1 and 50 alert IDs.")
+	}
+	for _, rawID := range req.AlertIDs {
+		if !model.IsValidUUID(strings.TrimSpace(rawID)) {
+			return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "All alert_ids must be valid UUIDs.")
+		}
+	}
+
+	req.ShortDescription = strings.TrimSpace(req.ShortDescription)
+	if len(req.ShortDescription) < 5 || len(req.ShortDescription) > 160 {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "short_description must be between 5 and 160 characters.")
+	}
+	if req.Impact < 1 || req.Impact > 3 {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "impact must be 1, 2, or 3.")
+	}
+	if req.Urgency < 1 || req.Urgency > 3 {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "urgency must be 1, 2, or 3.")
+	}
+	if req.CallerMode == "" {
+		req.CallerMode = model.CallerModeSSOUser
+	} else if req.CallerMode != model.CallerModeSSOUser && req.CallerMode != model.CallerModeGenericNOC {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "caller_mode must be \"sso_user\" or \"generic_noc\".")
+	}
+	req.AssignmentGroup = strings.TrimSpace(req.AssignmentGroup)
+	req.Category = strings.TrimSpace(req.Category)
+	if req.Category == "" {
+		req.Category = s.cfg.DefaultCategory
+	}
+
+	allowTriage := auth.HasPermission(op, auth.PermAlertsTriage)
+	resv, err := s.repo.ReserveBulkIncidentCreation(ctx, req.AlertIDs, op, req, allowTriage)
+	if err != nil {
+		return nil, err
+	}
+
+	resolvedIDs := make([]string, 0, len(resv.Alerts))
+	for _, a := range resv.Alerts {
+		resolvedIDs = append(resolvedIDs, a.ID)
+	}
+
+	callerRes := s.caller.Resolve(ctx, req.CallerMode, op)
+
+	if resv.IsRetry {
+		existing, lookupErr := s.snowClient.FindIncidentByCorrelationID(ctx, resv.PrimaryAlertID)
+		if lookupErr != nil {
+			_ = s.repo.FinalizeBulkIncidentFailed(ctx, resv, op, lookupErr.Error())
+			return nil, lookupErr
+		}
+		if existing != nil {
+			inc, finErr := s.repo.FinalizeBulkIncidentCreated(ctx, resv, op, existing.ToCreateResult(), callerRes, true)
+			if finErr != nil {
+				return nil, finErr
+			}
+			return &model.CreateBulkIncidentResponse{
+				AlertIDs:           resolvedIDs,
+				ServiceNowIncident: inc,
+				Warnings:           buildCallerWarnings(callerRes, op),
+			}, nil
+		}
+	}
+
+	desc := strings.TrimSpace(req.Description)
+	if desc == "" {
+		desc = formatBulkDefaultDescription(s.cfg.GrafanaPublicURL, resv.Alerts)
+	}
+	assignGroup := req.AssignmentGroup
+	if assignGroup == "" {
+		assignGroup = resolveDefaultAssignmentGroup(resv.Alerts, s.cfg.DefaultAssignmentGroup)
+	}
+
+	payload := servicenow.CreateIncidentPayload{
+		ShortDescription:   req.ShortDescription,
+		Description:        desc,
+		Impact:             fmt.Sprintf("%d", req.Impact),
+		Urgency:            fmt.Sprintf("%d", req.Urgency),
+		AssignmentGroup:    assignGroup,
+		Category:           req.Category,
+		CallerID:           callerRes.SysID,
+		CorrelationID:      resv.PrimaryAlertID,
+		CorrelationDisplay: "Grafana NOC Alert Manager",
+		ContactType:        "monitoring",
+		WorkNotes:          formatInitialWorkNotes(op, req.WorkNotes, callerRes),
+	}
+
+	created, createErr := s.snowClient.CreateIncident(ctx, payload)
+	if createErr != nil {
+		var snowErr *servicenow.SnowError
+		if errors.As(createErr, &snowErr) && snowErr.IsCallerIDRejection() && callerRes.SysID != s.cfg.DefaultCallerSysID {
+			reason := fmt.Sprintf("ServiceNow rejected caller_id (%s); fell back to generic service user.", callerRes.SysID)
+			callerRes = store.CallerResolution{
+				SysID:            s.cfg.DefaultCallerSysID,
+				ResolutionStatus: model.CallerResFallbackNOC,
+				FallbackReason:   &reason,
+			}
+			payload.CallerID = s.cfg.DefaultCallerSysID
+			payload.WorkNotes = formatInitialWorkNotes(op, req.WorkNotes, callerRes)
+			created, createErr = s.snowClient.CreateIncident(ctx, payload)
+		}
+	}
+
+	if createErr != nil {
+		_ = s.repo.FinalizeBulkIncidentFailed(ctx, resv, op, createErr.Error())
+		return nil, createErr
+	}
+
+	inc, finErr := s.repo.FinalizeBulkIncidentCreated(ctx, resv, op, created.ToCreateResult(), callerRes, false)
+	if finErr != nil {
+		return nil, finErr
+	}
+
+	return &model.CreateBulkIncidentResponse{
+		AlertIDs:           resolvedIDs,
 		ServiceNowIncident: inc,
 		Warnings:           buildCallerWarnings(callerRes, op),
 	}, nil
@@ -392,6 +513,47 @@ func (s *IncidentService) logInboundWebhook(ctx context.Context, hash string, st
 		ProcessingMs: int(time.Since(started).Milliseconds()),
 		ErrorMessage: errMsg,
 	})
+}
+
+func resolveDefaultAssignmentGroup(alerts []model.AlertDetail, fallback string) string {
+	for _, a := range alerts {
+		if g := strings.TrimSpace(a.Labels["assignment_group"]); g != "" {
+			return g
+		}
+		if t := strings.TrimSpace(a.Labels["team"]); t != "" {
+			return t
+		}
+		if a.AssignedTeam != nil && strings.TrimSpace(*a.AssignedTeam) != "" {
+			return strings.TrimSpace(*a.AssignedTeam)
+		}
+	}
+	return fallback
+}
+
+func formatBulkDefaultDescription(grafanaPublicURL string, alerts []model.AlertDetail) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Grafana Alert Manager — Combined Incident (%d alerts)\n---------------------------------------------------\n", len(alerts))
+	for i, a := range alerts {
+		env, site, team, _ := model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
+		fmt.Fprintf(&b, "\n%d. %s (severity=%s", i+1, a.AlertName, a.Severity)
+		if env != "" {
+			fmt.Fprintf(&b, ", environment=%s", env)
+		}
+		if site != "" {
+			fmt.Fprintf(&b, ", site=%s", site)
+		}
+		if team != "" {
+			fmt.Fprintf(&b, ", team=%s", team)
+		}
+		fmt.Fprintf(&b, ", starts_at=%s)\n", a.StartsAt.UTC().Format(time.RFC3339))
+		if summary := strings.TrimSpace(a.Annotations["summary"]); summary != "" {
+			fmt.Fprintf(&b, "   Summary: %s\n", summary)
+		}
+		if grafanaPublicURL != "" {
+			fmt.Fprintf(&b, "   Link: %s/a/noc-alert-manager-app/alerts/%s\n", grafanaPublicURL, a.ID)
+		}
+	}
+	return b.String()
 }
 
 func formatDefaultDescription(grafanaPublicURL string, alert model.AlertDetail) string {

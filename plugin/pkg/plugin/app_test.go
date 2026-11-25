@@ -149,8 +149,12 @@ func TestCallResourceRBACEnforcementAndRouteAllowlist(t *testing.T) {
 		{"viewer reads metadata", "Viewer", http.MethodGet, "v1/servicenow/metadata", http.StatusOK},
 		{"viewer reads history", "Viewer", http.MethodGet, "v1/alerts/11111111-1111-4111-8111-111111111111/history", http.StatusOK},
 		{"viewer cannot acknowledge", "Viewer", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/acknowledge", http.StatusForbidden},
+		{"viewer cannot tag team", "Viewer", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/team", http.StatusForbidden},
 		{"viewer cannot create snow incident", "Viewer", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/servicenow/incident", http.StatusForbidden},
+		{"viewer cannot create bulk snow incident", "Viewer", http.MethodPost, "v1/servicenow/incidents/bulk", http.StatusForbidden},
 		{"editor can acknowledge", "Editor", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/acknowledge", http.StatusOK},
+		{"editor can tag team", "Editor", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/team", http.StatusOK},
+		{"editor can create bulk snow incident", "Editor", http.MethodPost, "v1/servicenow/incidents/bulk", http.StatusOK},
 		{"editor can post work notes", "Editor", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/servicenow/work-notes", http.StatusOK},
 		{"admin can sync snow incident", "Admin", http.MethodPost, "v1/alerts/11111111-1111-4111-8111-111111111111/servicenow/sync", http.StatusOK},
 		{"webhooks blocked", "Admin", http.MethodPost, "v1/webhooks/alertmanager", http.StatusNotFound},
@@ -183,8 +187,8 @@ func TestCallResourceRBACEnforcementAndRouteAllowlist(t *testing.T) {
 		})
 	}
 
-	if upstreamCalled != 6 {
-		t.Fatalf("expected exactly 6 authorized upstream calls, got %d", upstreamCalled)
+	if upstreamCalled != 8 {
+		t.Fatalf("expected exactly 8 authorized upstream calls, got %d", upstreamCalled)
 	}
 }
 

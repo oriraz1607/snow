@@ -7,6 +7,8 @@ import {
   ApiErrorEnvelope,
   AppPluginSettings,
   AuditEvent,
+  CreateBulkIncidentRequest,
+  CreateBulkIncidentResponse,
   CreateIncidentRequest,
   CreateIncidentResponse,
   DismissRequest,
@@ -17,6 +19,7 @@ import {
   PLUGIN_ID,
   ServiceNowMetadataResponse,
   StateMutationRequest,
+  TagTeamRequest,
   WorkNoteRequest,
   WorkNoteResponse,
 } from '../types/api';
@@ -234,6 +237,13 @@ export const alertApi = {
     });
   },
 
+  tagAlertTeam(alertId: string, payload: TagTeamRequest): Promise<Alert> {
+    return requestResource<Alert>(`/alerts/${encodeURIComponent(alertId)}/team`, {
+      method: 'POST',
+      data: payload,
+    });
+  },
+
   getServiceNowMetadata(signal?: AbortSignal): Promise<ServiceNowMetadataResponse> {
     return requestResource<ServiceNowMetadataResponse>('/servicenow/metadata', { signal });
   },
@@ -244,6 +254,19 @@ export const alertApi = {
     idempotencyKey: string
   ): Promise<CreateIncidentResponse> {
     return requestResource<CreateIncidentResponse>(`/alerts/${encodeURIComponent(alertId)}/servicenow/incident`, {
+      method: 'POST',
+      data: payload,
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+    });
+  },
+
+  createBulkIncident(
+    payload: CreateBulkIncidentRequest,
+    idempotencyKey: string
+  ): Promise<CreateBulkIncidentResponse> {
+    return requestResource<CreateBulkIncidentResponse>('/servicenow/incidents/bulk', {
       method: 'POST',
       data: payload,
       headers: {

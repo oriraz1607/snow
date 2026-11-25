@@ -200,6 +200,32 @@ func (h *AlertsHandler) AddNote(w http.ResponseWriter, r *http.Request) {
 	apierror.WriteJSON(w, http.StatusCreated, ev)
 }
 
+// TagTeam handles POST /api/v1/alerts/{alert_id}/team.
+func (h *AlertsHandler) TagTeam(w http.ResponseWriter, r *http.Request) {
+	alertID := chi.URLParam(r, "alert_id")
+	if !model.IsValidUUID(alertID) {
+		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_id must be a valid UUID."))
+		return
+	}
+	var req model.TagTeamRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	team := strings.TrimSpace(req.Team)
+	if len(team) < 1 || len(team) > 128 {
+		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "team must be between 1 and 128 characters."))
+		return
+	}
+	op, _ := auth.OperatorFromContext(r.Context())
+	updated, err := h.repo.TagAlertTeam(r.Context(), alertID, op, team)
+	if err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	apierror.WriteJSON(w, http.StatusOK, updated)
+}
+
 func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 	q := r.URL.Query()
 	filter := model.ListAlertsFilter{
@@ -236,6 +262,8 @@ func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 			switch st {
 			case model.AlertStateFiring, model.AlertStateAcknowledged, model.AlertStateDismissed, model.AlertStateResolved:
 				filter.States = append(filter.States, st)
+			case model.AlertStateFilterNonActiveAcknowledged:
+				filter.NonActiveAcknowledged = true
 			default:
 				return filter, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Invalid alert state filter value.")
 			}

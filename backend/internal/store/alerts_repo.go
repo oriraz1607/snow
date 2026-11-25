@@ -54,13 +54,20 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 		return fmt.Sprintf("$%d", len(args))
 	}
 
-	if len(filter.States) > 0 {
-		stateStrings := make([]string, len(filter.States))
-		for i, st := range filter.States {
-			stateStrings[i] = string(st)
+	if len(filter.States) > 0 || filter.NonActiveAcknowledged {
+		var stateClauses []string
+		if len(filter.States) > 0 {
+			stateStrings := make([]string, len(filter.States))
+			for i, st := range filter.States {
+				stateStrings[i] = string(st)
+			}
+			ph := addArg(stateStrings)
+			stateClauses = append(stateClauses, fmt.Sprintf("a.state = ANY(%s::alert_state[])", ph))
 		}
-		ph := addArg(stateStrings)
-		where = append(where, fmt.Sprintf("a.state = ANY(%s::alert_state[])", ph))
+		if filter.NonActiveAcknowledged {
+			stateClauses = append(stateClauses, "(a.state = 'resolved' AND a.acknowledged_at IS NOT NULL)")
+		}
+		where = append(where, "("+strings.Join(stateClauses, " OR ")+")")
 	}
 
 	if len(filter.Severities) > 0 {
@@ -188,7 +195,8 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	query := fmt.Sprintf(`
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
-			a.alert_name, a.severity, a.labels, a.annotations, a.generator_url,
+			a.alert_name, a.severity, a.labels, a.annotations,
+			a.assigned_team, a.assigned_team_by, a.assigned_team_at, a.generator_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
 			(SELECT COUNT(*) FROM alerts prev WHERE prev.fingerprint = a.fingerprint AND prev.starts_at < a.starts_at) AS previous_episode_count,
@@ -254,11 +262,12 @@ func (r *AlertRepository) getSummaryCounts(ctx context.Context) (model.SummaryCo
 			COUNT(*) FILTER (WHERE a.state = 'firing') AS firing,
 			COUNT(*) FILTER (WHERE a.state = 'acknowledged') AS acknowledged,
 			COUNT(*) FILTER (WHERE a.state = 'acknowledged' AND (s.id IS NULL OR s.sync_status NOT IN ('created', 'linked'))) AS acknowledged_without_incident,
+			COUNT(*) FILTER (WHERE a.state = 'resolved' AND a.acknowledged_at IS NOT NULL) AS non_active_acknowledged,
 			COUNT(*) FILTER (WHERE a.state = 'dismissed') AS dismissed,
 			COUNT(*) FILTER (WHERE a.state = 'resolved' AND s.sync_status IN ('created', 'linked') AND s.snow_state IN (1, 2, 3)) AS resolved_open_ticket
 		FROM alerts a
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
-	`).Scan(&s.Firing, &s.Acknowledged, &s.AcknowledgedWithoutIncident, &s.Dismissed, &s.ResolvedOpenTicket)
+	`).Scan(&s.Firing, &s.Acknowledged, &s.AcknowledgedWithoutIncident, &s.NonActiveAcknowledged, &s.Dismissed, &s.ResolvedOpenTicket)
 	return s, err
 }
 
@@ -268,6 +277,7 @@ func (r *AlertRepository) GetAlert(ctx context.Context, alertID string) (*model.
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
 			a.alert_name, a.severity, a.group_key, a.receiver, a.labels, a.annotations,
+			a.assigned_team, a.assigned_team_by, a.assigned_team_at,
 			a.generator_url, a.external_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
@@ -621,6 +631,78 @@ func (r *AlertRepository) AddOperatorNote(ctx context.Context, alertID string, o
 	return &created, nil
 }
 
+// TagAlertTeam persists an operator-assigned team on the alert episode and records it by
+// fingerprint so future alert episodes without a Prometheus team label inherit it automatically.
+func (r *AlertRepository) TagAlertTeam(ctx context.Context, alertID string, op auth.OperatorContext, team string) (*model.Alert, error) {
+	trimmedTeam := strings.TrimSpace(team)
+	var result *model.Alert
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		var fingerprint, stateStr string
+		var prevTeam *string
+		err := tx.QueryRow(ctx, `
+			SELECT fingerprint, state::text, assigned_team
+			FROM alerts
+			WHERE id = $1::uuid
+			FOR UPDATE
+		`, alertID).Scan(&fingerprint, &stateStr, &prevTeam)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")
+			}
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert episode.").WithCause(err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			UPDATE alerts
+			SET assigned_team = $2,
+				assigned_team_by = $3,
+				assigned_team_at = NOW()
+			WHERE id = $1::uuid
+		`, alertID, trimmedTeam, op.Login); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to save alert team tag.").WithCause(err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO alert_fingerprint_teams (fingerprint, team, tagged_by, tagged_by_email)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (fingerprint) DO UPDATE
+			SET team = EXCLUDED.team,
+				tagged_by = EXCLUDED.tagged_by,
+				tagged_by_email = EXCLUDED.tagged_by_email,
+				updated_at = NOW()
+		`, fingerprint, trimmedTeam, op.Login, model.StringPtrOrNil(op.Email)); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to persist fingerprint team mapping.").WithCause(err)
+		}
+
+		st := model.AlertState(stateStr)
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       alertID,
+			EventType:     model.AuditAlertTeamTagged,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &st,
+			NewState:      &st,
+			Comment:       &trimmedTeam,
+			Metadata: map[string]any{
+				"fingerprint":   fingerprint,
+				"previous_team": prevTeam,
+				"new_team":      trimmedTeam,
+			},
+		}); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record team tag audit event.").WithCause(err)
+		}
+
+		result, err = getAlertItemTx(ctx, tx, alertID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (r *AlertRepository) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -739,7 +821,8 @@ func getAlertItemTx(ctx context.Context, tx pgx.Tx, alertID string) (*model.Aler
 	row := tx.QueryRow(ctx, `
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
-			a.alert_name, a.severity, a.labels, a.annotations, a.generator_url,
+			a.alert_name, a.severity, a.labels, a.annotations,
+			a.assigned_team, a.assigned_team_by, a.assigned_team_at, a.generator_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
 			(SELECT COUNT(*) FROM alerts prev WHERE prev.fingerprint = a.fingerprint AND prev.starts_at < a.starts_at) AS previous_episode_count,
@@ -811,7 +894,8 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 
 	err := row.Scan(
 		&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
-		&a.AlertName, &a.Severity, &labelsRaw, &annRaw, &a.GeneratorURL,
+		&a.AlertName, &a.Severity, &labelsRaw, &annRaw,
+		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt, &a.GeneratorURL,
 		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
 		&a.DismissedBy, &a.DismissedAt, &a.DismissReason, &a.ResolvedAt,
 		&a.PreviousEpisodeCount,
@@ -827,6 +911,7 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 	a.State = model.AlertState(stateStr)
 	a.Labels = unmarshalStringMap(labelsRaw)
 	a.Annotations = unmarshalStringMap(annRaw)
+	a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
 
 	if snowID != nil && snowSyncStatus != nil && snowCallerMode != nil && snowCallerRes != nil {
 		a.ServiceNowIncident = &model.ServiceNowIncident{
@@ -866,6 +951,7 @@ func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
 	err := row.Scan(
 		&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
 		&a.AlertName, &a.Severity, &a.GroupKey, &a.Receiver, &labelsRaw, &annRaw,
+		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt,
 		&a.GeneratorURL, &a.ExternalURL,
 		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
 		&a.DismissedBy, &a.DismissedAt, &a.DismissReason, &a.ResolvedAt,
@@ -883,6 +969,7 @@ func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
 	a.State = model.AlertState(stateStr)
 	a.Labels = unmarshalStringMap(labelsRaw)
 	a.Annotations = unmarshalStringMap(annRaw)
+	a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
 
 	if snowID != nil && snowSyncStatus != nil && snowCallerMode != nil && snowCallerRes != nil {
 		a.ServiceNowIncident = &model.ServiceNowIncident{

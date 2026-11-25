@@ -13,6 +13,19 @@ if (typeof global.ResizeObserver === 'undefined') {
     disconnect() {}
   };
 }
+if (typeof global.IntersectionObserver === 'undefined') {
+  global.IntersectionObserver = class IntersectionObserver {
+    readonly root = null;
+    readonly rootMargin = '';
+    readonly thresholds: ReadonlyArray<number> = [];
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+    takeRecords() {
+      return [];
+    }
+  } as unknown as typeof global.IntersectionObserver;
+}
 if (typeof window !== 'undefined' && typeof window.matchMedia === 'undefined') {
   window.matchMedia = () =>
     ({

@@ -17,6 +17,8 @@ const (
 	AlertStateAcknowledged AlertState = "acknowledged"
 	AlertStateDismissed    AlertState = "dismissed"
 	AlertStateResolved     AlertState = "resolved"
+
+	AlertStateFilterNonActiveAcknowledged = "non_active_acknowledged"
 )
 
 type SnowSyncStatus string
@@ -54,6 +56,7 @@ const (
 	AuditAlertUnacknowledged  AuditEventType = "alert_unacknowledged"
 	AuditAlertDismissed       AuditEventType = "alert_dismissed"
 	AuditAlertReopened        AuditEventType = "alert_reopened"
+	AuditAlertTeamTagged      AuditEventType = "alert_team_tagged"
 	AuditOperatorNoteAdded    AuditEventType = "operator_note_added"
 	AuditSnowIncidentReq      AuditEventType = "snow_incident_requested"
 	AuditSnowIncidentCreated  AuditEventType = "snow_incident_created"
@@ -100,24 +103,31 @@ type Alert struct {
 	Severity            string            `json:"severity"`
 	GroupKey            string            `json:"group_key,omitempty"`
 	Receiver            string            `json:"receiver,omitempty"`
-	Labels              map[string]string `json:"labels"`
-	Annotations         map[string]string `json:"annotations"`
-	GeneratorURL        *string           `json:"generator_url"`
-	ExternalURL         *string           `json:"external_url,omitempty"`
-	AcknowledgedBy      *string           `json:"acknowledged_by"`
-	AcknowledgedByEmail *string           `json:"acknowledged_by_email"`
-	AcknowledgedAt      *time.Time        `json:"acknowledged_at"`
-	DismissedBy         *string           `json:"dismissed_by"`
-	DismissedByEmail    *string           `json:"dismissed_by_email,omitempty"`
-	DismissedAt         *time.Time        `json:"dismissed_at"`
-	DismissReason       *string           `json:"dismiss_reason"`
-	ResolvedAt          *time.Time        `json:"resolved_at"`
-	FirstReceivedAt     time.Time         `json:"first_received_at,omitempty"`
-	LastReceivedAt      time.Time         `json:"last_received_at,omitempty"`
-	DeliveryCount       int               `json:"delivery_count,omitempty"`
-	PreviousEpisodeCount int              `json:"previous_episode_count"`
-	IncidentDriftStatus IncidentDriftStatus `json:"incident_drift_status"`
-	ServiceNowIncident  *ServiceNowIncident `json:"servicenow_incident"`
+	Labels               map[string]string   `json:"labels"`
+	Annotations          map[string]string   `json:"annotations"`
+	Environment          string              `json:"environment"`
+	Site                 string              `json:"site"`
+	Team                 string              `json:"team"`
+	TeamSource           string              `json:"team_source"`
+	AssignedTeam         *string             `json:"assigned_team,omitempty"`
+	AssignedTeamBy       *string             `json:"assigned_team_by,omitempty"`
+	AssignedTeamAt       *time.Time          `json:"assigned_team_at,omitempty"`
+	GeneratorURL         *string             `json:"generator_url"`
+	ExternalURL          *string             `json:"external_url,omitempty"`
+	AcknowledgedBy       *string             `json:"acknowledged_by"`
+	AcknowledgedByEmail  *string             `json:"acknowledged_by_email"`
+	AcknowledgedAt       *time.Time          `json:"acknowledged_at"`
+	DismissedBy          *string             `json:"dismissed_by"`
+	DismissedByEmail     *string             `json:"dismissed_by_email,omitempty"`
+	DismissedAt          *time.Time          `json:"dismissed_at"`
+	DismissReason        *string             `json:"dismiss_reason"`
+	ResolvedAt           *time.Time          `json:"resolved_at"`
+	FirstReceivedAt      time.Time           `json:"first_received_at,omitempty"`
+	LastReceivedAt       time.Time           `json:"last_received_at,omitempty"`
+	DeliveryCount        int                 `json:"delivery_count,omitempty"`
+	PreviousEpisodeCount int                 `json:"previous_episode_count"`
+	IncidentDriftStatus  IncidentDriftStatus `json:"incident_drift_status"`
+	ServiceNowIncident   *ServiceNowIncident `json:"servicenow_incident"`
 }
 
 // AlertDetail extends Alert with full ingestion metadata and recent audit events.
@@ -134,6 +144,13 @@ type AlertDetail struct {
 	Receiver             string              `json:"receiver"`
 	Labels               map[string]string   `json:"labels"`
 	Annotations          map[string]string   `json:"annotations"`
+	Environment          string              `json:"environment"`
+	Site                 string              `json:"site"`
+	Team                 string              `json:"team"`
+	TeamSource           string              `json:"team_source"`
+	AssignedTeam         *string             `json:"assigned_team,omitempty"`
+	AssignedTeamBy       *string             `json:"assigned_team_by,omitempty"`
+	AssignedTeamAt       *time.Time          `json:"assigned_team_at,omitempty"`
 	GeneratorURL         *string             `json:"generator_url"`
 	ExternalURL          *string             `json:"external_url"`
 	AcknowledgedBy       *string             `json:"acknowledged_by"`
@@ -225,6 +242,7 @@ type SummaryCounts struct {
 	Firing                      int64 `json:"firing"`
 	Acknowledged                int64 `json:"acknowledged"`
 	AcknowledgedWithoutIncident int64 `json:"acknowledged_without_incident"`
+	NonActiveAcknowledged       int64 `json:"non_active_acknowledged"`
 	Dismissed                   int64 `json:"dismissed"`
 	ResolvedOpenTicket          int64 `json:"resolved_open_ticket"`
 }
@@ -238,18 +256,19 @@ type ListAlertsResponse struct {
 
 // ListAlertsFilter defines supported filters and pagination for GET /api/v1/alerts.
 type ListAlertsFilter struct {
-	States        []AlertState
-	Severities    []string
-	IncidentDrift string
-	HasIncident   *bool
-	Fingerprint   string
-	Labels        map[string]string
-	Search        string
-	From          *time.Time
-	To            *time.Time
-	Sort          string
-	Limit         int
-	Cursor        *PageCursor
+	States                []AlertState
+	NonActiveAcknowledged bool
+	Severities            []string
+	IncidentDrift         string
+	HasIncident           *bool
+	Fingerprint           string
+	Labels                map[string]string
+	Search                string
+	From                  *time.Time
+	To                    *time.Time
+	Sort                  string
+	Limit                 int
+	Cursor                *PageCursor
 }
 
 // PageCursor encodes opaque keyset pagination state.
@@ -311,6 +330,11 @@ type AddNoteRequest struct {
 	Comment string `json:"comment"`
 }
 
+// TagTeamRequest is the payload for POST /api/v1/alerts/{id}/team.
+type TagTeamRequest struct {
+	Team string `json:"team"`
+}
+
 // CreateIncidentRequest is the payload for POST /api/v1/alerts/{id}/servicenow/incident.
 type CreateIncidentRequest struct {
 	ShortDescription string         `json:"short_description"`
@@ -326,6 +350,26 @@ type CreateIncidentRequest struct {
 // CreateIncidentResponse is returned on 201 Created for incident creation.
 type CreateIncidentResponse struct {
 	AlertID            string              `json:"alert_id"`
+	ServiceNowIncident *ServiceNowIncident `json:"servicenow_incident"`
+	Warnings           []string            `json:"warnings,omitempty"`
+}
+
+// CreateBulkIncidentRequest is the payload for POST /api/v1/servicenow/incidents/bulk.
+type CreateBulkIncidentRequest struct {
+	AlertIDs         []string       `json:"alert_ids"`
+	ShortDescription string         `json:"short_description"`
+	Description      string         `json:"description"`
+	Impact           int16          `json:"impact"`
+	Urgency          int16          `json:"urgency"`
+	AssignmentGroup  string         `json:"assignment_group"`
+	Category         string         `json:"category"`
+	CallerMode       SnowCallerMode `json:"caller_mode"`
+	WorkNotes        string         `json:"work_notes"`
+}
+
+// CreateBulkIncidentResponse is returned on 201 Created for bulk multi-alert incident creation.
+type CreateBulkIncidentResponse struct {
+	AlertIDs           []string            `json:"alert_ids"`
 	ServiceNowIncident *ServiceNowIncident `json:"servicenow_incident"`
 	Warnings           []string            `json:"warnings,omitempty"`
 }
@@ -534,4 +578,25 @@ func StringPtrOrNil(s string) *string {
 		return nil
 	}
 	return &trimmed
+}
+
+// PopulateDerivedMetadata extracts environment, site, and effective team (Prometheus label
+// takes precedence over operator-tagged assigned_team).
+func PopulateDerivedMetadata(labels map[string]string, assignedTeam *string) (env, site, team, teamSource string) {
+	if labels != nil {
+		env = strings.TrimSpace(labels["environment"])
+		if env == "" {
+			env = strings.TrimSpace(labels["env"])
+		}
+		site = strings.TrimSpace(labels["site"])
+		if t := strings.TrimSpace(labels["team"]); t != "" {
+			return env, site, t, "label"
+		}
+	}
+	if assignedTeam != nil {
+		if t := strings.TrimSpace(*assignedTeam); t != "" {
+			return env, site, t, "operator"
+		}
+	}
+	return env, site, "", "none"
 }

@@ -14,7 +14,7 @@ import (
 )
 
 // ExpectedSchemaVersion is verified by /readyz against schema_migrations.
-const ExpectedSchemaVersion = 1
+const ExpectedSchemaVersion = 2
 
 const migrationAdvisoryLockID int64 = 728394015
 
@@ -278,7 +278,7 @@ func GrantAppRole(ctx context.Context, conn *pgx.Conn, roleName string) error {
 	ident := pgx.Identifier{roleName}.Sanitize()
 	statements := []string{
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, ident),
-		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON alerts, servicenow_incidents, snow_user_cache, webhook_ingestion_log TO %s`, ident),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON alerts, servicenow_incidents, snow_user_cache, webhook_ingestion_log, alert_fingerprint_teams TO %s`, ident),
 		fmt.Sprintf(`GRANT SELECT, INSERT ON alert_audit_log TO %s`, ident),
 		fmt.Sprintf(`REVOKE UPDATE, DELETE ON alert_audit_log FROM %s`, ident),
 		fmt.Sprintf(`GRANT SELECT ON schema_migrations TO %s`, ident),

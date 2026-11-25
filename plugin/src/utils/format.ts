@@ -1,4 +1,4 @@
-import { Alert, PLUGIN_ID } from '../types/api';
+import { Alert, PLUGIN_ID, TeamSource } from '../types/api';
 
 const PRIORITY_LABELS: Record<number, string> = {
   1: '1 - Critical',
@@ -7,6 +7,106 @@ const PRIORITY_LABELS: Record<number, string> = {
   4: '4 - Low',
   5: '5 - Planning',
 };
+
+const SEVERITY_RANK: Record<string, number> = {
+  critical: 1,
+  warning: 2,
+  info: 3,
+  unknown: 4,
+};
+
+export function getAlertEnvironment(alert: Alert): string {
+  return (
+    alert.environment?.trim() ||
+    alert.labels?.environment?.trim() ||
+    alert.labels?.env?.trim() ||
+    ''
+  );
+}
+
+export function getAlertSite(alert: Alert): string {
+  return alert.site?.trim() || alert.labels?.site?.trim() || '';
+}
+
+export function getAlertTeam(alert: Alert): {
+  team: string;
+  source: TeamSource;
+  taggedBy: string | null;
+} {
+  const labelTeam = alert.labels?.team?.trim();
+  if (labelTeam) {
+    return { team: labelTeam, source: 'label', taggedBy: null };
+  }
+  const assignedTeam = alert.assigned_team?.trim();
+  if (assignedTeam) {
+    return { team: assignedTeam, source: 'operator', taggedBy: alert.assigned_team_by ?? null };
+  }
+  const derivedTeam = alert.team?.trim();
+  if (derivedTeam) {
+    return {
+      team: derivedTeam,
+      source: alert.team_source ?? 'operator',
+      taggedBy: alert.assigned_team_by ?? null,
+    };
+  }
+  return { team: '', source: 'none', taggedBy: null };
+}
+
+export function isAlertSelectableForIncident(alert: Alert): boolean {
+  if (alert.state !== 'firing' && alert.state !== 'acknowledged') {
+    return false;
+  }
+  const sync = alert.servicenow_incident?.sync_status;
+  return !sync || sync === 'failed';
+}
+
+export function highestSeverity(alerts: Alert[]): string {
+  let best = 'unknown';
+  let bestRank = 99;
+  for (const alert of alerts) {
+    const sev = (alert.severity || 'unknown').toLowerCase();
+    const rank = SEVERITY_RANK[sev] ?? 4;
+    if (rank < bestRank) {
+      bestRank = rank;
+      best = sev;
+    }
+  }
+  return best;
+}
+
+export function buildBulkShortDescription(alerts: Alert[]): string {
+  if (alerts.length <= 1) {
+    return alerts[0] ? buildDefaultShortDescription(alerts[0]) : '';
+  }
+  const sev = highestSeverity(alerts).toUpperCase();
+  const names = alerts.map((a) => a.alert_name).join(', ');
+  const raw = `[${sev}] ${alerts.length} alerts: ${names}`;
+  return raw.length <= 160 ? raw : `${raw.slice(0, 157)}...`;
+}
+
+export function buildBulkDescription(alerts: Alert[]): string {
+  if (alerts.length <= 1) {
+    return alerts[0] ? buildDefaultDescription(alerts[0]) : '';
+  }
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
+  const blocks = alerts.map((alert, idx) => {
+    const env = getAlertEnvironment(alert) || '—';
+    const site = getAlertSite(alert) || '—';
+    const { team } = getAlertTeam(alert);
+    const lines = [
+      `${idx + 1}. ${alert.alert_name} [${alert.severity}]`,
+      `   Environment: ${env} | Site: ${site} | Team: ${team || 'Untagged'}`,
+      `   Starts At (UTC): ${formatUtcTimestamp(alert.starts_at)}`,
+      `   Grafana Alert Link: ${origin}/a/${PLUGIN_ID}/alerts/${alert.id}`,
+    ];
+    if (alert.annotations?.summary) {
+      lines.push(`   Summary: ${alert.annotations.summary}`);
+    }
+    return lines.join('\n');
+  });
+
+  return [`Combined Incident (${alerts.length} alerts selected)`, '', ...blocks].join('\n');
+}
 
 export function calculateServiceNowPriority(impact: 1 | 2 | 3, urgency: 1 | 2 | 3): {
   value: number;

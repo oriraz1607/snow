@@ -8,9 +8,8 @@ export type QuickFilterKey =
   | 'all'
   | 'firing'
   | 'acknowledged'
-  | 'resolved_open_ticket'
-  | 'dismissed'
-  | 'resolved';
+  | 'non_active_acknowledged'
+  | 'dismissed';
 
 interface KpiFilterStripProps {
   summary: SummaryCounts;
@@ -27,11 +26,12 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
   const styles = getStyles(theme);
 
   const ticketOpen = Math.max(0, summary.acknowledged - summary.acknowledged_without_incident);
+  const nonActiveAckCount = summary.non_active_acknowledged ?? summary.resolved_open_ticket;
 
   const cards: Array<{
     key: QuickFilterKey;
     label: string;
-    count?: number;
+    count: number;
     subtext: string;
     accentColor: string;
   }> = [
@@ -39,7 +39,7 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
       key: 'firing',
       label: 'Firing',
       count: summary.firing,
-      subtext: 'Unacknowledged alerts',
+      subtext: 'Unacknowledged active alerts',
       accentColor: theme.colors.error.main,
     },
     {
@@ -50,10 +50,13 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
       accentColor: theme.colors.warning.main,
     },
     {
-      key: 'resolved_open_ticket',
-      label: 'Resolved — Open Ticket',
-      count: summary.resolved_open_ticket,
-      subtext: 'Alert stopped, ServiceNow open',
+      key: 'non_active_acknowledged',
+      label: 'Non active Acknowledged',
+      count: nonActiveAckCount,
+      subtext:
+        summary.resolved_open_ticket > 0
+          ? `${summary.resolved_open_ticket} open ServiceNow ticket`
+          : 'Resolved after acknowledgement',
       accentColor: '#a855f7',
     },
     {
@@ -62,12 +65,6 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
       count: summary.dismissed,
       subtext: 'Suppressed for episode',
       accentColor: theme.colors.text.secondary,
-    },
-    {
-      key: 'resolved',
-      label: 'All Resolved',
-      subtext: 'Closed alert episodes',
-      accentColor: theme.colors.success.main,
     },
   ];
 
@@ -93,9 +90,7 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
                 aria-hidden="true"
               />
             </div>
-            <div className={styles.cardValue}>
-              {typeof card.count === 'number' ? card.count : 'View'}
-            </div>
+            <div className={styles.cardValue}>{card.count}</div>
             <div className={styles.cardSubtext}>{card.subtext}</div>
           </button>
         );
@@ -107,9 +102,13 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
 const getStyles = (theme: GrafanaTheme2) => ({
   strip: css`
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    grid-template-columns: repeat(4, minmax(180px, 1fr));
     gap: ${theme.spacing(1.5)};
     margin-bottom: ${theme.spacing(2)};
+
+    @media (max-width: 900px) {
+      grid-template-columns: repeat(2, minmax(160px, 1fr));
+    }
   `,
   card: css`
     display: flex;
@@ -122,7 +121,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     border-top-width: 3px;
     border-radius: ${theme.shape.radius.default};
     cursor: pointer;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
 
     &:hover {
       border-color: ${theme.colors.border.strong};

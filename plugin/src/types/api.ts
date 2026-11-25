@@ -1,5 +1,9 @@
 export type AlertState = 'firing' | 'acknowledged' | 'dismissed' | 'resolved';
 
+export type AlertStateFilter = AlertState | 'non_active_acknowledged';
+
+export type TeamSource = 'label' | 'operator' | 'none';
+
 export type SnowSyncStatus = 'pending' | 'created' | 'linked' | 'failed';
 
 export type SnowCallerMode = 'sso_user' | 'generic_noc';
@@ -22,6 +26,7 @@ export type AuditEventType =
   | 'alert_unacknowledged'
   | 'alert_dismissed'
   | 'alert_reopened'
+  | 'alert_team_tagged'
   | 'operator_note_added'
   | 'snow_incident_requested'
   | 'snow_incident_created'
@@ -68,6 +73,13 @@ export interface Alert {
   receiver?: string;
   labels: Record<string, string>;
   annotations: Record<string, string>;
+  environment?: string;
+  site?: string;
+  team?: string;
+  team_source?: TeamSource;
+  assigned_team?: string | null;
+  assigned_team_by?: string | null;
+  assigned_team_at?: string | null;
   generator_url: string | null;
   external_url?: string | null;
   acknowledged_by: string | null;
@@ -129,6 +141,7 @@ export interface SummaryCounts {
   firing: number;
   acknowledged: number;
   acknowledged_without_incident: number;
+  non_active_acknowledged?: number;
   dismissed: number;
   resolved_open_ticket: number;
 }
@@ -140,7 +153,7 @@ export interface ListAlertsResponse {
 }
 
 export interface ListAlertsQuery {
-  states?: AlertState[];
+  states?: AlertStateFilter[];
   severities?: string[];
   incident_drift?: 'all' | IncidentDriftStatus;
   has_incident?: boolean;
@@ -150,6 +163,28 @@ export interface ListAlertsQuery {
   sort?: AlertSort;
   limit?: number;
   cursor?: string;
+}
+
+export interface TagTeamRequest {
+  team: string;
+}
+
+export interface CreateBulkIncidentRequest {
+  alert_ids: string[];
+  short_description: string;
+  description: string;
+  impact: 1 | 2 | 3;
+  urgency: 1 | 2 | 3;
+  assignment_group: string;
+  category: string;
+  caller_mode: SnowCallerMode;
+  work_notes: string;
+}
+
+export interface CreateBulkIncidentResponse {
+  alert_ids: string[];
+  servicenow_incident: ServiceNowIncident;
+  warnings?: string[];
 }
 
 export interface StateMutationRequest {

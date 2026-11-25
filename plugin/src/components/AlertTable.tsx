@@ -1,9 +1,15 @@
 import React from 'react';
 import { css } from '@emotion/css';
 import { GrafanaTheme2 } from '@grafana/data';
-import { Badge, Button, Spinner, Tag, Tooltip, useTheme2 } from '@grafana/ui';
+import { Badge, Button, Spinner, Tooltip, useTheme2 } from '@grafana/ui';
 import { Alert } from '../types/api';
-import { formatRelativeTime } from '../utils/format';
+import {
+  formatRelativeTime,
+  getAlertEnvironment,
+  getAlertSite,
+  getAlertTeam,
+  isAlertSelectableForIncident,
+} from '../utils/format';
 
 interface AlertTableProps {
   alerts: Alert[];
@@ -11,6 +17,9 @@ interface AlertTableProps {
   canTriage: boolean;
   canWriteIncidents: boolean;
   busyAlertId: string | null;
+  selectedAlertIds: Set<string>;
+  onToggleSelectAlert: (alertId: string) => void;
+  onToggleSelectAll: (selectableIds: string[], selectAll: boolean) => void;
   onSelectAlert: (alert: Alert) => void;
   onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
@@ -33,6 +42,9 @@ export const AlertTable: React.FC<AlertTableProps> = ({
   canTriage,
   canWriteIncidents,
   busyAlertId,
+  selectedAlertIds,
+  onToggleSelectAlert,
+  onToggleSelectAll,
   onSelectAlert,
   onAcknowledge,
   onUnacknowledge,
@@ -65,48 +77,76 @@ export const AlertTable: React.FC<AlertTableProps> = ({
     );
   }
 
+  const selectableIds = alerts.filter(isAlertSelectableForIncident).map((a) => a.id);
+  const allSelectableChecked =
+    selectableIds.length > 0 && selectableIds.every((id) => selectedAlertIds.has(id));
+
   return (
     <div className={styles.tableWrapper}>
       <table className={styles.table} aria-label="Alert queue table">
         <thead>
           <tr>
-            <th>Severity &amp; State</th>
-            <th>Alert &amp; Summary</th>
-            <th>Duration / Timeline</th>
-            <th>Owner / Ack</th>
-            <th>ServiceNow Incident</th>
-            <th>Quick Actions</th>
+            <th className={styles.checkboxCell}>
+              <input
+                type="checkbox"
+                aria-label="Select all eligible alerts"
+                disabled={selectableIds.length === 0}
+                checked={allSelectableChecked}
+                onChange={(e) => onToggleSelectAll(selectableIds, e.currentTarget.checked)}
+              />
+            </th>
+            <th>Severity</th>
+            <th>State</th>
+            <th>Alert</th>
+            <th>Environment</th>
+            <th>Site</th>
+            <th>Team</th>
+            <th>Duration</th>
+            <th>Owner</th>
+            <th>ServiceNow</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {alerts.map((alert) => {
+          {alerts.map((alert, idx) => {
             const inc = alert.servicenow_incident;
             const hasLinkedIncident =
               Boolean(inc) && (inc?.sync_status === 'created' || inc?.sync_status === 'linked');
             const isAckWithoutIncident = alert.state === 'acknowledged' && !hasLinkedIncident;
             const isBusy = busyAlertId === alert.id;
-
-            const topLabels = Object.entries(alert.labels ?? {})
-              .filter(([k]) => k !== 'alertname' && k !== 'severity')
-              .slice(0, 4);
+            const selectable = isAlertSelectableForIncident(alert);
+            const checked = selectedAlertIds.has(alert.id);
+            const env = getAlertEnvironment(alert);
+            const site = getAlertSite(alert);
+            const teamInfo = getAlertTeam(alert);
 
             return (
               <React.Fragment key={alert.id}>
                 <tr
-                  className={`${styles.row} ${isAckWithoutIncident ? styles.rowWithActionBar : ''}`}
+                  className={`${styles.row} ${idx % 2 === 1 ? styles.zebraRow : ''} ${
+                    checked ? styles.selectedRow : ''
+                  } ${isAckWithoutIncident ? styles.rowWithActionBar : ''}`}
                   data-testid={`alert-row-${alert.id}`}
                 >
-                  <td>
-                    <div className={styles.badgesCol}>
-                      <Badge
-                        text={alert.severity || 'unknown'}
-                        color={severityColor(alert.severity)}
-                      />
-                      <Badge text={stateLabel(alert.state)} color={stateColor(alert.state)} />
-                    </div>
+                  <td className={styles.checkboxCell}>
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${alert.alert_name}`}
+                      disabled={!selectable}
+                      checked={checked}
+                      onChange={() => onToggleSelectAlert(alert.id)}
+                    />
                   </td>
 
-                  <td>
+                  <td className={styles.nowrapCell}>
+                    <Badge text={alert.severity || 'unknown'} color={severityColor(alert.severity)} />
+                  </td>
+
+                  <td className={styles.nowrapCell}>
+                    <Badge text={displayStateLabel(alert)} color={displayStateColor(alert)} />
+                  </td>
+
+                  <td className={styles.alertCell}>
                     <button
                       type="button"
                       className={styles.alertNameBtn}
@@ -115,35 +155,61 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                       {alert.alert_name}
                     </button>
                     {alert.annotations?.summary && (
-                      <div className={styles.summaryText}>{alert.annotations.summary}</div>
+                      <div className={styles.summaryText} title={alert.annotations.summary}>
+                        {alert.annotations.summary}
+                      </div>
                     )}
-                    <div className={styles.chipRow}>
-                      {topLabels.map(([k, v]) => (
-                        <Tag key={`${k}=${v}`} name={`${k}=${v}`} colorIndex={9} />
-                      ))}
-                      {alert.previous_episode_count > 0 && (
-                        <button
-                          type="button"
-                          className={styles.historyLinkBtn}
-                          onClick={() => onFilterByFingerprint(alert.fingerprint)}
-                        >
-                          Fired {alert.previous_episode_count}× previously
-                        </button>
-                      )}
-                    </div>
+                    {alert.previous_episode_count > 0 && (
+                      <button
+                        type="button"
+                        className={styles.historyLinkBtn}
+                        onClick={() => onFilterByFingerprint(alert.fingerprint)}
+                      >
+                        {alert.previous_episode_count} prior episode
+                        {alert.previous_episode_count === 1 ? '' : 's'}
+                      </button>
+                    )}
+                  </td>
+
+                  <td className={styles.nowrapCell}>
+                    {env ? <span className={styles.metaPill}>{env}</span> : <span className={styles.mutedText}>—</span>}
+                  </td>
+
+                  <td className={styles.nowrapCell}>
+                    {site ? <span className={styles.metaPill}>{site}</span> : <span className={styles.mutedText}>—</span>}
+                  </td>
+
+                  <td className={styles.nowrapCell}>
+                    {teamInfo.team ? (
+                      <Tooltip
+                        content={
+                          teamInfo.source === 'label'
+                            ? 'From Prometheus team label'
+                            : `Tagged by ${teamInfo.taggedBy || 'operator'}`
+                        }
+                        placement="top"
+                      >
+                        <span>
+                          <Badge
+                            text={teamInfo.team}
+                            color={teamInfo.source === 'label' ? 'blue' : 'purple'}
+                          />
+                        </span>
+                      </Tooltip>
+                    ) : (
+                      <span className={styles.untaggedText}>Untagged</span>
+                    )}
                   </td>
 
                   <td className={styles.nowrapCell}>
                     {alert.state === 'resolved' && alert.resolved_at ? (
                       <div>
                         <div>Resolved {formatRelativeTime(alert.resolved_at)} ago</div>
-                        <div className={styles.mutedText}>
-                          Started {formatRelativeTime(alert.starts_at)} ago
-                        </div>
+                        <div className={styles.mutedText}>Started {formatRelativeTime(alert.starts_at)} ago</div>
                       </div>
                     ) : (
                       <div>
-                        <div>Firing {formatRelativeTime(alert.starts_at)}</div>
+                        <div>{formatRelativeTime(alert.starts_at)}</div>
                         <div className={styles.mutedText}>v{alert.version}</div>
                       </div>
                     )}
@@ -154,15 +220,11 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                       <div>
                         <div>{alert.acknowledged_by}</div>
                         {alert.acknowledged_at && (
-                          <div className={styles.mutedText}>
-                            {formatRelativeTime(alert.acknowledged_at)} ago
-                          </div>
+                          <div className={styles.mutedText}>{formatRelativeTime(alert.acknowledged_at)} ago</div>
                         )}
                       </div>
                     ) : alert.dismissed_by ? (
-                      <div>
-                        <div>Dismissed by {alert.dismissed_by}</div>
-                      </div>
+                      <div>Dismissed by {alert.dismissed_by}</div>
                     ) : (
                       <span className={styles.mutedText}>—</span>
                     )}
@@ -175,9 +237,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                         <Spinner inline size="sm" /> Creating...
                       </span>
                     )}
-                    {inc && inc.sync_status === 'failed' && (
-                      <Badge text="SNOW Failed" color="red" />
-                    )}
+                    {inc && inc.sync_status === 'failed' && <Badge text="SNOW Failed" color="red" />}
                     {inc && hasLinkedIncident && (
                       <div className={styles.snowCol}>
                         <div className={styles.snowLinkRow}>
@@ -193,21 +253,19 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                           ) : (
                             <span>{inc.incident_number || 'Incident'}</span>
                           )}
-                          {inc.snow_state_label && (
-                            <Badge text={inc.snow_state_label} color="blue" />
-                          )}
+                          {inc.snow_state_label && <Badge text={inc.snow_state_label} color="blue" />}
                         </div>
                         {alert.incident_drift_status === 'resolved_open_ticket' && (
-                          <Badge text="Alert Resolved · Ticket Still Open" color="orange" />
+                          <Badge text="Ticket Still Open" color="orange" />
                         )}
                         {alert.incident_drift_status === 'active_closed_ticket' && (
-                          <Badge text="Alert Firing · Ticket Closed" color="red" />
+                          <Badge text="Ticket Closed" color="red" />
                         )}
                       </div>
                     )}
                   </td>
 
-                  <td>
+                  <td className={styles.actionsCell}>
                     <div className={styles.actionsRow}>
                       {alert.state === 'firing' && (
                         <>
@@ -323,7 +381,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
 
                 {isAckWithoutIncident && (
                   <tr className={styles.actionBarRow} data-testid={`action-bar-${alert.id}`}>
-                    <td colSpan={6}>
+                    <td colSpan={11}>
                       <div className={styles.actionBarContent}>
                         <span className={styles.actionBarPrompt}>
                           Acknowledged by <strong>{alert.acknowledged_by || 'operator'}</strong> — next step:
@@ -476,6 +534,20 @@ export function stateLabel(state: Alert['state']): string {
   }
 }
 
+export function displayStateLabel(alert: Alert): string {
+  if (alert.state === 'resolved' && alert.acknowledged_at) {
+    return 'Non active Ack';
+  }
+  return stateLabel(alert.state);
+}
+
+export function displayStateColor(alert: Alert): 'red' | 'orange' | 'green' | 'blue' | 'purple' {
+  if (alert.state === 'resolved' && alert.acknowledged_at) {
+    return 'purple';
+  }
+  return stateColor(alert.state);
+}
+
 const getStyles = (theme: GrafanaTheme2) => ({
   emptyState: css`
     display: flex;
@@ -490,35 +562,58 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   tableWrapper: css`
     overflow-x: auto;
-    border: 1px solid ${theme.colors.border.weak};
+    border: 1px solid ${theme.colors.border.medium};
     border-radius: ${theme.shape.radius.default};
     background: ${theme.colors.background.primary};
   `,
   table: css`
     width: 100%;
     border-collapse: collapse;
+    font-size: ${theme.typography.bodySmall.fontSize};
 
     th {
       text-align: left;
-      padding: ${theme.spacing(1.25)} ${theme.spacing(1.5)};
-      font-size: ${theme.typography.bodySmall.fontSize};
-      font-weight: ${theme.typography.fontWeightMedium};
+      padding: ${theme.spacing(1)} ${theme.spacing(1.25)};
+      font-size: 12px;
+      font-weight: ${theme.typography.fontWeightBold};
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
       color: ${theme.colors.text.secondary};
       background: ${theme.colors.background.secondary};
-      border-bottom: 1px solid ${theme.colors.border.weak};
+      border-bottom: 1px solid ${theme.colors.border.medium};
+      border-right: 1px solid ${theme.colors.border.weak};
       white-space: nowrap;
     }
 
-    td {
-      padding: ${theme.spacing(1.5)};
-      border-bottom: 1px solid ${theme.colors.border.weak};
-      vertical-align: top;
+    th:last-child {
+      border-right: none;
     }
+
+    td {
+      padding: ${theme.spacing(1)} ${theme.spacing(1.25)};
+      border-bottom: 1px solid ${theme.colors.border.weak};
+      border-right: 1px solid ${theme.colors.border.weak};
+      vertical-align: middle;
+    }
+
+    td:last-child {
+      border-right: none;
+    }
+  `,
+  checkboxCell: css`
+    width: 34px;
+    text-align: center !important;
   `,
   row: css`
     &:hover {
-      background: ${theme.colors.emphasize(theme.colors.background.primary, 0.02)};
+      background: ${theme.colors.emphasize(theme.colors.background.primary, 0.04)};
     }
+  `,
+  zebraRow: css`
+    background: ${theme.colors.emphasize(theme.colors.background.primary, 0.015)};
+  `,
+  selectedRow: css`
+    background: rgba(50, 116, 217, 0.12) !important;
   `,
   rowWithActionBar: css`
     td {
@@ -528,8 +623,8 @@ const getStyles = (theme: GrafanaTheme2) => ({
   actionBarRow: css`
     background: ${theme.colors.background.secondary};
     td {
-      padding: ${theme.spacing(1)} ${theme.spacing(1.5)} ${theme.spacing(1.5)};
-      border-bottom: 1px solid ${theme.colors.border.weak};
+      padding: ${theme.spacing(0.75)} ${theme.spacing(1.25)} ${theme.spacing(1.25)};
+      border-bottom: 1px solid ${theme.colors.border.medium};
     }
   `,
   actionBarContent: css`
@@ -538,7 +633,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     align-items: center;
     justify-content: space-between;
     gap: ${theme.spacing(1)};
-    padding: ${theme.spacing(1)} ${theme.spacing(1.5)};
+    padding: ${theme.spacing(0.75)} ${theme.spacing(1.25)};
     border-left: 3px solid ${theme.colors.warning.main};
     background: ${theme.colors.background.primary};
     border-radius: ${theme.shape.radius.default};
@@ -550,20 +645,19 @@ const getStyles = (theme: GrafanaTheme2) => ({
   actionBarButtons: css`
     display: flex;
     flex-wrap: wrap;
-    gap: ${theme.spacing(1)};
+    gap: ${theme.spacing(0.75)};
   `,
-  badgesCol: css`
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: ${theme.spacing(0.5)};
+  alertCell: css`
+    min-width: 220px;
+    max-width: 340px;
   `,
   alertNameBtn: css`
     background: none;
     border: none;
     padding: 0;
-    margin: 0 0 ${theme.spacing(0.25)} 0;
+    margin: 0;
     font-weight: ${theme.typography.fontWeightBold};
+    font-size: ${theme.typography.body.fontSize};
     color: ${theme.colors.text.link};
     cursor: pointer;
     text-align: left;
@@ -573,31 +667,42 @@ const getStyles = (theme: GrafanaTheme2) => ({
     }
   `,
   summaryText: css`
-    font-size: ${theme.typography.bodySmall.fontSize};
-    color: ${theme.colors.text.primary};
-    margin-bottom: ${theme.spacing(0.75)};
-    max-width: 440px;
-  `,
-  chipRow: css`
-    display: flex;
-    flex-wrap: wrap;
-    gap: ${theme.spacing(0.5)};
-    align-items: center;
+    font-size: 12px;
+    color: ${theme.colors.text.secondary};
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 320px;
   `,
   historyLinkBtn: css`
     background: none;
     border: none;
     padding: 0;
+    margin-top: 2px;
     font-size: 11px;
     color: ${theme.colors.text.link};
     cursor: pointer;
     text-decoration: underline;
   `,
+  metaPill: css`
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+    border: 1px solid ${theme.colors.border.weak};
+    font-family: ${theme.typography.fontFamilyMonospace};
+    font-size: 11px;
+  `,
+  untaggedText: css`
+    font-size: 11px;
+    font-style: italic;
+    color: ${theme.colors.text.disabled};
+  `,
   nowrapCell: css`
     white-space: nowrap;
   `,
   mutedText: css`
-    font-size: ${theme.typography.bodySmall.fontSize};
+    font-size: 11px;
     color: ${theme.colors.text.secondary};
   `,
   pendingSpan: css`
@@ -610,20 +715,24 @@ const getStyles = (theme: GrafanaTheme2) => ({
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: ${theme.spacing(0.5)};
+    gap: 3px;
   `,
   snowLinkRow: css`
     display: flex;
     align-items: center;
     gap: ${theme.spacing(0.75)};
+    white-space: nowrap;
   `,
   snowLink: css`
     font-weight: ${theme.typography.fontWeightMedium};
     color: ${theme.colors.text.link};
   `,
+  actionsCell: css`
+    white-space: nowrap;
+  `,
   actionsRow: css`
     display: flex;
-    flex-wrap: wrap;
-    gap: ${theme.spacing(0.75)};
+    flex-wrap: nowrap;
+    gap: ${theme.spacing(0.5)};
   `,
 });

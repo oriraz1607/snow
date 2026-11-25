@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -324,18 +325,21 @@ func reconcileOneAlert(ctx context.Context, tx pgx.Tx, logger *slog.Logger, inco
 	if incoming.EndsAt != nil {
 		resolvedAt = *incoming.EndsAt
 	}
+	assignedTeam, assignedTeamBy, assignedTeamAt := lookupFingerprintTeamTx(ctx, tx, incoming.Fingerprint, incoming.Labels)
 	var newID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO alerts (
 			fingerprint, starts_at, ends_at, state, version,
 			alert_name, severity, group_key, receiver,
-			labels, annotations, generator_url, external_url, resolved_at
+			labels, annotations, generator_url, external_url, resolved_at,
+			assigned_team, assigned_team_by, assigned_team_at
 		)
-		VALUES ($1, $2, $3, 'resolved', 1, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12)
+		VALUES ($1, $2, $3, 'resolved', 1, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15)
 		RETURNING id::text
 	`, incoming.Fingerprint, incoming.StartsAt, incoming.EndsAt,
 		incoming.AlertName, incoming.Severity, incoming.GroupKey, incoming.Receiver,
 		string(labelsJSON), string(annJSON), incoming.GeneratorURL, incoming.ExternalURL, resolvedAt,
+		assignedTeam, assignedTeamBy, assignedTeamAt,
 	).Scan(&newID); err != nil {
 		return out, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to insert resolved alert episode.").WithCause(err)
 	}
@@ -356,18 +360,21 @@ func reconcileOneAlert(ctx context.Context, tx pgx.Tx, logger *slog.Logger, inco
 }
 
 func insertNewFiringAlertTx(ctx context.Context, tx pgx.Tx, incoming model.NormalizedAlert, labelsJSON, annJSON []byte) error {
+	assignedTeam, assignedTeamBy, assignedTeamAt := lookupFingerprintTeamTx(ctx, tx, incoming.Fingerprint, incoming.Labels)
 	var newID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO alerts (
 			fingerprint, starts_at, ends_at, state, version,
 			alert_name, severity, group_key, receiver,
-			labels, annotations, generator_url, external_url
+			labels, annotations, generator_url, external_url,
+			assigned_team, assigned_team_by, assigned_team_at
 		)
-		VALUES ($1, $2, $3, 'firing', 1, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
+		VALUES ($1, $2, $3, 'firing', 1, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)
 		RETURNING id::text
 	`, incoming.Fingerprint, incoming.StartsAt, incoming.EndsAt,
 		incoming.AlertName, incoming.Severity, incoming.GroupKey, incoming.Receiver,
 		string(labelsJSON), string(annJSON), incoming.GeneratorURL, incoming.ExternalURL,
+		assignedTeam, assignedTeamBy, assignedTeamAt,
 	).Scan(&newID); err != nil {
 		return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to insert firing alert episode.").WithCause(err)
 	}
@@ -384,6 +391,23 @@ func insertNewFiringAlertTx(ctx context.Context, tx pgx.Tx, incoming model.Norma
 		return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to log firing alert.").WithCause(err)
 	}
 	return nil
+}
+
+func lookupFingerprintTeamTx(ctx context.Context, tx pgx.Tx, fingerprint string, labels map[string]string) (*string, *string, *time.Time) {
+	if labels != nil && strings.TrimSpace(labels["team"]) != "" {
+		return nil, nil, nil
+	}
+	var team, taggedBy string
+	var updatedAt time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT team, tagged_by, updated_at
+		FROM alert_fingerprint_teams
+		WHERE fingerprint = $1
+	`, fingerprint).Scan(&team, &taggedBy, &updatedAt)
+	if err != nil {
+		return nil, nil, nil
+	}
+	return &team, &taggedBy, &updatedAt
 }
 
 func alertHasOpenSnowIncidentTx(ctx context.Context, tx pgx.Tx, alertID string) (bool, error) {

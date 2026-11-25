@@ -6,23 +6,44 @@ import {
   Badge,
   Button,
   Drawer,
+  Input,
   Spinner,
   Tab,
   TabsBar,
   useTheme2,
 } from '@grafana/ui';
 import { alertApi, ApiClientError } from '../api/client';
-import { Alert, AlertDetail, AlertHistoryResponse } from '../types/api';
-import { formatRelativeTime, formatUtcTimestamp } from '../utils/format';
-import { GatedButton, severityColor, stateColor, stateLabel } from './AlertTable';
+import {
+  Alert,
+  AlertDetail,
+  AlertHistoryResponse,
+  ServiceNowMetadataResponse,
+} from '../types/api';
+import {
+  formatRelativeTime,
+  formatUtcTimestamp,
+  getAlertEnvironment,
+  getAlertSite,
+  getAlertTeam,
+} from '../utils/format';
+import {
+  displayStateColor,
+  displayStateLabel,
+  GatedButton,
+  severityColor,
+  stateColor,
+  stateLabel,
+} from './AlertTable';
 
 type DrawerTab = 'overview' | 'servicenow' | 'audit' | 'episodes';
 
 interface AlertDetailDrawerProps {
   alertId: string | null;
+  metadata: ServiceNowMetadataResponse | null;
   canTriage: boolean;
   canWriteIncidents: boolean;
   onClose: () => void;
+  onAlertUpdated: (updated: Alert) => void;
   onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
   onReopen: (alert: Alert) => void;
@@ -41,9 +62,11 @@ const DISABLED_INCIDENT_REASON = 'Requires Editor or Admin role (incidents:write
 
 export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   alertId,
+  metadata,
   canTriage,
   canWriteIncidents,
   onClose,
+  onAlertUpdated,
   onAcknowledge,
   onUnacknowledge,
   onReopen,
@@ -65,6 +88,11 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [editingTeam, setEditingTeam] = useState(false);
+  const [teamInput, setTeamInput] = useState('');
+  const [savingTeam, setSavingTeam] = useState(false);
+  const [teamError, setTeamError] = useState<string | null>(null);
 
   const loadDrawerData = useCallback(async (id: string, signal?: AbortSignal) => {
     setLoading(true);
@@ -96,8 +124,13 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
       setDetail(null);
       setHistory(null);
       setActiveTab('overview');
+      setEditingTeam(false);
+      setTeamInput('');
+      setTeamError(null);
       return;
     }
+    setEditingTeam(false);
+    setTeamError(null);
     const controller = new AbortController();
     void loadDrawerData(alertId, controller.signal);
     return () => controller.abort();
@@ -120,6 +153,30 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
     }
   };
 
+  const handleSaveTeam = async (teamValue: string) => {
+    if (!detail || savingTeam) {
+      return;
+    }
+    const trimmed = teamValue.trim();
+    if (!trimmed) {
+      return;
+    }
+    setSavingTeam(true);
+    setTeamError(null);
+    try {
+      const updated = await alertApi.tagAlertTeam(detail.id, { team: trimmed });
+      onAlertUpdated(updated);
+      setEditingTeam(false);
+      setTeamInput('');
+      await loadDrawerData(detail.id);
+    } catch (err) {
+      const apiErr = err as ApiClientError;
+      setTeamError(apiErr?.message || 'Failed to tag team on alert.');
+    } finally {
+      setSavingTeam(false);
+    }
+  };
+
   const inc = detail?.servicenow_incident ?? null;
   const hasLinkedIncident =
     Boolean(inc) && (inc?.sync_status === 'created' || inc?.sync_status === 'linked');
@@ -127,6 +184,17 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   const resolvedNudgeText = detail
     ? `Alert resolved in Prometheus at ${formatUtcTimestamp(detail.resolved_at || detail.ends_at)}. Please verify recovery and resolve/close this incident.`
     : '';
+
+  const teamInfo = detail ? getAlertTeam(detail) : { team: '', source: 'none' as const, taggedBy: null };
+  const suggestedTeams = Array.from(
+    new Set([
+      'observability',
+      ...(metadata?.assignment_groups.map((g) => g.name) ?? []),
+      'Platform Engineering',
+      'Database SRE',
+      'Infrastructure',
+    ])
+  );
 
   return (
     <Drawer
@@ -154,11 +222,123 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
         <div className={styles.container}>
           <div className={styles.statusHeader}>
             <Badge text={detail.severity} color={severityColor(detail.severity)} />
-            <Badge text={stateLabel(detail.state)} color={stateColor(detail.state)} />
+            <Badge text={displayStateLabel(detail)} color={displayStateColor(detail)} />
+            {getAlertEnvironment(detail) && (
+              <span className={styles.metaChip}>env: {getAlertEnvironment(detail)}</span>
+            )}
+            {getAlertSite(detail) && <span className={styles.metaChip}>site: {getAlertSite(detail)}</span>}
             {detail.acknowledged_by && (
               <span className={styles.metaText}>
                 Acked by <strong>{detail.acknowledged_by}</strong> ({formatRelativeTime(detail.acknowledged_at)} ago)
               </span>
+            )}
+          </div>
+
+          <div className={styles.teamCard} data-testid="drawer-team-section">
+            <div className={styles.teamHeaderRow}>
+              <div>
+                <div className={styles.teamLabel}>Connected Team</div>
+                {teamInfo.source === 'label' && (
+                  <div className={styles.teamValueRow}>
+                    <Badge text={teamInfo.team} color="blue" />
+                    <span className={styles.metaText}>
+                      From Prometheus label (<code>team={teamInfo.team}</code>)
+                    </span>
+                  </div>
+                )}
+                {teamInfo.source === 'operator' && (
+                  <div className={styles.teamValueRow}>
+                    <Badge text={teamInfo.team} color="purple" />
+                    <span className={styles.metaText}>
+                      Tagged by <strong>{teamInfo.taggedBy || 'operator'}</strong> · inherited on future re-fires
+                    </span>
+                  </div>
+                )}
+                {teamInfo.source === 'none' && (
+                  <div className={styles.teamMissingText}>
+                    No team connected via alert labels (<code>team=...</code> missing). Tag the owning team below:
+                  </div>
+                )}
+              </div>
+
+              {teamInfo.source === 'operator' && !editingTeam && (
+                <GatedButton
+                  allowed={canTriage}
+                  disabledReason={DISABLED_TRIAGE_REASON}
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setTeamInput(teamInfo.team);
+                    setEditingTeam(true);
+                  }}
+                >
+                  Change Team
+                </GatedButton>
+              )}
+            </div>
+
+            {(teamInfo.source === 'none' || editingTeam) && (
+              <div className={styles.teamFormBox}>
+                {teamError && (
+                  <div style={{ marginBottom: '8px' }}>
+                    <GrafanaAlert severity="error" title="Unable to save team">
+                      {teamError}
+                    </GrafanaAlert>
+                  </div>
+                )}
+                <div className={styles.teamInputRow}>
+                  <Input
+                    aria-label="Tag team"
+                    placeholder="Enter team name (e.g., observability)"
+                    value={teamInput}
+                    disabled={!canTriage || savingTeam}
+                    onChange={(e) => setTeamInput(e.currentTarget.value)}
+                    list="alert-team-suggestions"
+                  />
+                  <datalist id="alert-team-suggestions">
+                    {suggestedTeams.map((t) => (
+                      <option key={t} value={t} />
+                    ))}
+                  </datalist>
+                  <GatedButton
+                    allowed={canTriage}
+                    disabledReason={DISABLED_TRIAGE_REASON}
+                    variant="primary"
+                    size="sm"
+                    disabled={savingTeam || !teamInput.trim()}
+                    onClick={() => void handleSaveTeam(teamInput)}
+                  >
+                    {savingTeam ? 'Saving...' : 'Tag Team'}
+                  </GatedButton>
+                  {editingTeam && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={savingTeam}
+                      onClick={() => {
+                        setEditingTeam(false);
+                        setTeamError(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </div>
+                <div className={styles.quickTeamChips}>
+                  <span className={styles.metaText}>Quick select:</span>
+                  {suggestedTeams.slice(0, 5).map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      className={styles.quickTeamChip}
+                      disabled={!canTriage || savingTeam}
+                      onClick={() => setTeamInput(t)}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
 
@@ -336,6 +516,9 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
           {activeTab === 'overview' && (
             <div className={styles.tabBody}>
               <div className={styles.kvGrid}>
+                <KvRow label="Environment" value={getAlertEnvironment(detail) || '—'} />
+                <KvRow label="Site" value={getAlertSite(detail) || '—'} />
+                <KvRow label="Team" value={teamInfo.team || 'Untagged'} />
                 <KvRow label="Starts At (UTC)" value={formatUtcTimestamp(detail.starts_at)} />
                 <KvRow label="Resolved At (UTC)" value={formatUtcTimestamp(detail.resolved_at)} />
                 <KvRow label="Summary" value={detail.annotations?.summary || '—'} />
@@ -557,9 +740,80 @@ const getStyles = (theme: GrafanaTheme2) => ({
     align-items: center;
     gap: ${theme.spacing(1)};
   `,
+  metaChip: css`
+    padding: 2px 8px;
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+    border: 1px solid ${theme.colors.border.weak};
+    font-family: ${theme.typography.fontFamilyMonospace};
+    font-size: 11px;
+  `,
   metaText: css`
     font-size: ${theme.typography.bodySmall.fontSize};
     color: ${theme.colors.text.secondary};
+  `,
+  teamCard: css`
+    padding: ${theme.spacing(1.5)};
+    border: 1px solid ${theme.colors.border.medium};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+  `,
+  teamHeaderRow: css`
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: ${theme.spacing(1)};
+  `,
+  teamLabel: css`
+    font-size: 11px;
+    font-weight: ${theme.typography.fontWeightBold};
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: ${theme.colors.text.secondary};
+    margin-bottom: ${theme.spacing(0.5)};
+  `,
+  teamValueRow: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+  `,
+  teamMissingText: css`
+    font-size: ${theme.typography.bodySmall.fontSize};
+    color: ${theme.colors.warning.text};
+  `,
+  teamFormBox: css`
+    margin-top: ${theme.spacing(1)};
+  `,
+  teamInputRow: css`
+    display: flex;
+    gap: ${theme.spacing(1)};
+    align-items: center;
+  `,
+  quickTeamChips: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${theme.spacing(0.75)};
+    margin-top: ${theme.spacing(0.75)};
+  `,
+  quickTeamChip: css`
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid ${theme.colors.border.medium};
+    background: ${theme.colors.background.primary};
+    color: ${theme.colors.text.primary};
+    font-size: 11px;
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      border-color: ${theme.colors.primary.main};
+    }
+
+    &:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
   `,
   section: css`
     margin-bottom: ${theme.spacing(0.5)};

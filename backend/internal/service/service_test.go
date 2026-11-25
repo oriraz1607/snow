@@ -142,11 +142,12 @@ func TestAlertmanagerServiceIngestMetricsAndNotifier(t *testing.T) {
 }
 
 type fakeIncidentRepo struct {
-	reservation *store.IncidentReservation
-	finalized   bool
-	failedMsg   string
-	adoptedFlag bool
-	callerUsed  store.CallerResolution
+	reservation     *store.IncidentReservation
+	bulkReservation *store.BulkIncidentReservation
+	finalized       bool
+	failedMsg       string
+	adoptedFlag     bool
+	callerUsed      store.CallerResolution
 }
 
 func (f *fakeIncidentRepo) ReserveIncidentCreation(_ context.Context, _ string, _ auth.OperatorContext, _ model.CreateIncidentRequest, _ bool) (*store.IncidentReservation, error) {
@@ -170,6 +171,31 @@ func (f *fakeIncidentRepo) FinalizeIncidentCreated(_ context.Context, alertID, i
 }
 
 func (f *fakeIncidentRepo) FinalizeIncidentFailed(_ context.Context, _, _ string, _ model.AlertState, _ auth.OperatorContext, errMsg string) error {
+	f.failedMsg = errMsg
+	return nil
+}
+
+func (f *fakeIncidentRepo) ReserveBulkIncidentCreation(_ context.Context, _ []string, _ auth.OperatorContext, _ model.CreateBulkIncidentRequest, _ bool) (*store.BulkIncidentReservation, error) {
+	return f.bulkReservation, nil
+}
+
+func (f *fakeIncidentRepo) FinalizeBulkIncidentCreated(_ context.Context, resv *store.BulkIncidentReservation, _ auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool) (*model.ServiceNowIncident, error) {
+	f.finalized = true
+	f.adoptedFlag = adopted
+	f.callerUsed = caller
+	return &model.ServiceNowIncident{
+		ID:                     resv.IncidentIDs[resv.PrimaryAlertID],
+		AlertID:                resv.PrimaryAlertID,
+		SyncStatus:             model.SnowSyncCreated,
+		SnowSysID:              &res.SysID,
+		IncidentNumber:         &res.Number,
+		CallerResolutionStatus: caller.ResolutionStatus,
+		CallerSysID:            &caller.SysID,
+		CallerFallbackReason:   caller.FallbackReason,
+	}, nil
+}
+
+func (f *fakeIncidentRepo) FinalizeBulkIncidentFailed(_ context.Context, _ *store.BulkIncidentReservation, _ auth.OperatorContext, errMsg string) error {
 	f.failedMsg = errMsg
 	return nil
 }
@@ -313,4 +339,78 @@ func TestIncidentServiceRetryAdoptionAndCallerIDFallback(t *testing.T) {
 			t.Fatalf("expected 2 create calls and fallback warning, calls=%d resp=%+v", snow.createCalls, resp)
 		}
 	})
+}
+
+func TestIncidentServiceCreateBulkIncident(t *testing.T) {
+	cfg := &config.Config{
+		GrafanaPublicURL:       "https://grafana.example.com",
+		DefaultCallerSysID:     "noc_001",
+		DefaultCallerUsername:  "noc",
+		DefaultAssignmentGroup: "Infra",
+		DefaultCategory:        "Infrastructure",
+	}
+
+	id1 := "11111111-1111-4111-8111-111111111111"
+	id2 := "22222222-2222-4222-8222-222222222222"
+	teamObs := "observability"
+
+	repo := &fakeIncidentRepo{
+		bulkReservation: &store.BulkIncidentReservation{
+			PrimaryAlertID: id1,
+			IncidentIDs: map[string]string{
+				id1: "inc-rec-1",
+				id2: "inc-rec-2",
+			},
+			Alerts: []model.AlertDetail{
+				{
+					ID:           id1,
+					State:        model.AlertStateAcknowledged,
+					AlertName:    "HighLag",
+					Severity:     "critical",
+					Labels:       map[string]string{"environment": "production", "site": "eu-west-1"},
+					AssignedTeam: &teamObs,
+				},
+				{
+					ID:        id2,
+					State:     model.AlertStateAcknowledged,
+					AlertName: "ApiLatency",
+					Severity:  "warning",
+					Labels:    map[string]string{"environment": "production", "site": "eu-west-1", "team": "observability"},
+				},
+			},
+		},
+	}
+
+	snow := &fakeSnowClient{
+		createdRec: &servicenow.IncidentRecord{
+			SysID:  "snow-bulk-1",
+			Number: "INC0000123",
+			State:  1,
+		},
+	}
+
+	svc := NewIncidentService(repo, snow, fakeCallerLookup{
+		res: store.CallerResolution{SysID: "u_alice", ResolutionStatus: model.CallerResSSOMatched},
+	}, cfg, nil, nil)
+
+	resp, err := svc.CreateBulkIncident(
+		context.Background(),
+		auth.OperatorContext{Login: "alice", Email: "alice@corp.example", Role: "Editor"},
+		model.CreateBulkIncidentRequest{
+			AlertIDs:         []string{id1, id2},
+			ShortDescription: "Combined production incident",
+			Impact:           1,
+			Urgency:          1,
+			CallerMode:       model.CallerModeSSOUser,
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateBulkIncident returned error: %v", err)
+	}
+	if snow.createCalls != 1 {
+		t.Fatalf("expected exactly 1 ServiceNow POST call for bulk creation, got %d", snow.createCalls)
+	}
+	if !repo.finalized || len(resp.AlertIDs) != 2 || *resp.ServiceNowIncident.IncidentNumber != "INC0000123" {
+		t.Fatalf("unexpected bulk response: %+v", resp)
+	}
 }

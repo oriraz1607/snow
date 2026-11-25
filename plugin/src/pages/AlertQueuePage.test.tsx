@@ -6,7 +6,13 @@ import { config } from '@grafana/runtime';
 import { AlertQueuePage } from './AlertQueuePage';
 import { ConfigPage } from './ConfigPage';
 import { alertApi, ApiClientError } from '../api/client';
-import { Alert, ListAlertsResponse, RBAC_ACTIONS, ServiceNowMetadataResponse } from '../types/api';
+import {
+  Alert,
+  AlertDetail,
+  ListAlertsResponse,
+  RBAC_ACTIONS,
+  ServiceNowMetadataResponse,
+} from '../types/api';
 
 jest.mock('@grafana/runtime', () => {
   const actual = jest.requireActual('@grafana/runtime');
@@ -44,8 +50,10 @@ jest.mock('../api/client', () => {
       dismissAlert: jest.fn(),
       reopenAlert: jest.fn(),
       addNote: jest.fn(),
+      tagAlertTeam: jest.fn(),
       getServiceNowMetadata: jest.fn(),
       createIncident: jest.fn(),
+      createBulkIncident: jest.fn(),
       linkIncident: jest.fn(),
       syncIncident: jest.fn(),
       postWorkNote: jest.fn(),
@@ -80,11 +88,16 @@ function makeAlert(overrides: Partial<Alert> = {}): Alert {
     labels: {
       alertname: 'HighDatabaseReplicationLag',
       severity: 'critical',
-      cluster: 'prod-eu1',
+      environment: 'production',
+      site: 'eu-west-1',
     },
     annotations: {
       summary: 'Replication lag > 30s on replica-2',
     },
+    environment: 'production',
+    site: 'eu-west-1',
+    team: '',
+    team_source: 'none',
     generator_url: 'https://prom.example/graph',
     acknowledged_by: null,
     acknowledged_by_email: null,
@@ -97,6 +110,18 @@ function makeAlert(overrides: Partial<Alert> = {}): Alert {
     incident_drift_status: 'none',
     servicenow_incident: null,
     ...overrides,
+  };
+}
+
+function makeDetail(alert: Alert): AlertDetail {
+  return {
+    ...alert,
+    group_key: 'gk',
+    receiver: 'alert-api',
+    delivery_count: 1,
+    first_received_at: alert.starts_at,
+    last_received_at: alert.starts_at,
+    recent_audit_events: [],
   };
 }
 
@@ -120,23 +145,72 @@ function makeQueueResponse(items: Alert[]): ListAlertsResponse {
     summary: {
       firing: items.filter((a) => a.state === 'firing').length,
       acknowledged: items.filter((a) => a.state === 'acknowledged').length,
-      acknowledged_without_incident: items.filter((a) => a.state === 'acknowledged' && !a.servicenow_incident)
-        .length,
+      acknowledged_without_incident: items.filter(
+        (a) => a.state === 'acknowledged' && !a.servicenow_incident
+      ).length,
+      non_active_acknowledged: items.filter(
+        (a) => a.state === 'resolved' && Boolean(a.acknowledged_at)
+      ).length,
       dismissed: items.filter((a) => a.state === 'dismissed').length,
-      resolved_open_ticket: items.filter((a) => a.incident_drift_status === 'resolved_open_ticket').length,
+      resolved_open_ticket: items.filter((a) => a.incident_drift_status === 'resolved_open_ticket')
+        .length,
     },
     items,
   };
 }
 
-describe('AlertQueuePage triage, RBAC, 409 conflict, fallback banner, and modal resilience', () => {
+describe('AlertQueuePage triage, RBAC, bulk ticket creation, team tagging, and modal resilience', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockedApi.listAlerts.mockReset();
     mockedApi.acknowledgeAlert.mockReset();
     mockedApi.createIncident.mockReset();
+    mockedApi.createBulkIncident.mockReset();
+    mockedApi.tagAlertTeam.mockReset();
+    mockedApi.getAlert.mockReset();
+    mockedApi.getAlertHistory.mockReset();
     setMockGrafanaUser('Editor');
     mockedApi.getServiceNowMetadata.mockResolvedValue(makeMetadata());
+  });
+
+  it('renders the 4 KPI tabs and Environment, Site, Severity, and Team table columns', async () => {
+    const alert = makeAlert({
+      team: 'observability',
+      team_source: 'label',
+      labels: {
+        alertname: 'HighDatabaseReplicationLag',
+        severity: 'critical',
+        environment: 'production',
+        site: 'eu-west-1',
+        team: 'observability',
+      },
+    });
+    mockedApi.listAlerts.mockResolvedValueOnce(makeQueueResponse([alert]));
+
+    render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={null}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText('HighDatabaseReplicationLag')).toBeInTheDocument());
+
+    expect(screen.getByTestId('kpi-card-firing')).toBeInTheDocument();
+    expect(screen.getByTestId('kpi-card-acknowledged')).toBeInTheDocument();
+    expect(screen.getByTestId('kpi-card-non_active_acknowledged')).toBeInTheDocument();
+    expect(screen.getByTestId('kpi-card-dismissed')).toBeInTheDocument();
+
+    expect(screen.getByRole('columnheader', { name: 'Environment' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Site' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Severity' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Team' })).toBeInTheDocument();
+
+    const row = screen.getByTestId(`alert-row-${alert.id}`);
+    expect(row).toHaveTextContent('production');
+    expect(row).toHaveTextContent('eu-west-1');
+    expect(row).toHaveTextContent('observability');
   });
 
   it('displays 409 Conflict toast with latest actor details and refreshes the queue', async () => {
@@ -242,6 +316,134 @@ describe('AlertQueuePage triage, RBAC, 409 conflict, fallback banner, and modal 
     expect(screen.getByTestId('fallback-warning-banner')).toHaveTextContent('INC0000001');
   });
 
+  it('creates one ServiceNow ticket for multiple selected firing and acknowledged alerts', async () => {
+    const user = userEvent.setup();
+    const alertA = makeAlert({
+      id: '11111111-1111-4111-8111-111111111111',
+      alert_name: 'HighReplicationLag',
+      state: 'firing',
+      team: 'observability',
+      team_source: 'label',
+    });
+    const alertB = makeAlert({
+      id: '22222222-2222-4222-8222-222222222222',
+      alert_name: 'ApiLatencySpike',
+      state: 'acknowledged',
+      acknowledged_by: 'editor.user',
+      acknowledged_at: '2026-11-25T16:12:00Z',
+    });
+
+    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([alertA, alertB]));
+    mockedApi.createBulkIncident.mockResolvedValueOnce({
+      alert_ids: [alertA.id, alertB.id],
+      servicenow_incident: {
+        id: 'inc-bulk-1',
+        sync_status: 'created',
+        snow_sys_id: 'snow_bulk_1',
+        incident_number: 'INC0000099',
+        incident_url: 'http://mocksnow:8085/nav_to.do?uri=incident.do?sys_id=snow_bulk_1',
+        snow_state: 1,
+        snow_state_label: 'New',
+        priority: 1,
+        assignment_group: 'observability',
+        caller_mode: 'sso_user',
+        caller_resolution_status: 'sso_matched',
+        snow_state_synced_at: '2026-11-25T16:15:00Z',
+      },
+    });
+
+    render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={null}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByLabelText('Select HighReplicationLag')).toBeInTheDocument());
+
+    await user.click(screen.getByLabelText('Select HighReplicationLag'));
+    await user.click(screen.getByLabelText('Select ApiLatencySpike'));
+
+    const bulkBar = screen.getByTestId('bulk-selection-bar');
+    expect(bulkBar).toHaveTextContent('2 alerts selected');
+    expect(bulkBar).toHaveTextContent('1 firing alert will be auto-acknowledged');
+
+    await user.click(
+      within(bulkBar).getByRole('button', { name: 'Create Single ServiceNow Incident (2)' })
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByTestId('selected-alerts-summary')).toHaveTextContent('Included Alerts (2)');
+    await user.click(within(dialog).getByRole('button', { name: 'Create Single Incident (2)' }));
+
+    await waitFor(() => expect(mockedApi.createBulkIncident).toHaveBeenCalledTimes(1));
+    expect(mockedApi.createBulkIncident.mock.calls[0][0].alert_ids).toEqual([alertA.id, alertB.id]);
+  });
+
+  it('allows Editor to tag missing team in AlertDetailDrawer while disabling tagging for Viewer', async () => {
+    const user = userEvent.setup();
+    const untagged = makeAlert({
+      id: '33333333-3333-4333-8333-333333333333',
+      alert_name: 'UntaggedServiceAlert',
+      team: '',
+      team_source: 'none',
+    });
+    const tagged = makeAlert({
+      ...untagged,
+      team: 'observability',
+      team_source: 'operator',
+      assigned_team: 'observability',
+      assigned_team_by: 'editor.user',
+    });
+
+    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([untagged]));
+    mockedApi.getAlert
+      .mockResolvedValueOnce(makeDetail(untagged))
+      .mockResolvedValueOnce(makeDetail(tagged));
+    mockedApi.getAlertHistory.mockResolvedValue({
+      alert_id: untagged.id,
+      fingerprint: untagged.fingerprint,
+      audit_events: [],
+      previous_episodes: [],
+    });
+    mockedApi.tagAlertTeam.mockResolvedValueOnce(tagged);
+
+    const { unmount } = render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={untagged.id}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+
+    const teamSection = await screen.findByTestId('drawer-team-section');
+    expect(teamSection).toHaveTextContent('No team connected');
+
+    await user.type(within(teamSection).getByLabelText('Tag team'), 'observability');
+    await user.click(within(teamSection).getByRole('button', { name: 'Tag Team' }));
+
+    await waitFor(() =>
+      expect(mockedApi.tagAlertTeam).toHaveBeenCalledWith(untagged.id, { team: 'observability' })
+    );
+    unmount();
+
+    // Viewer sees tagging control disabled
+    setMockGrafanaUser('Viewer', { [RBAC_ACTIONS.ALERTS_READ]: true });
+    mockedApi.getAlert.mockResolvedValueOnce(makeDetail(untagged));
+    render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={untagged.id}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+
+    const viewerTeamSection = await screen.findByTestId('drawer-team-section');
+    expect(within(viewerTeamSection).getByLabelText('Tag team')).toBeDisabled();
+    expect(within(viewerTeamSection).getByRole('button', { name: 'Tag Team' })).toBeDisabled();
+  });
+
   it('preserves modal inputs across background polling and reuses Idempotency-Key on 503 retry', async () => {
     const user = userEvent.setup();
     const ackedAlert = makeAlert({
@@ -328,7 +530,6 @@ describe('AlertQueuePage triage, RBAC, 409 conflict, fallback banner, and modal 
     expect(screen.getByRole('button', { name: 'Dismiss' })).toBeDisabled();
     unmount();
 
-    // ConfigPage blocked for Viewer and Editor, allowed for Admin
     const fakeMeta = {
       id: 'noc-alert-manager-app',
       name: 'Alert Manager',

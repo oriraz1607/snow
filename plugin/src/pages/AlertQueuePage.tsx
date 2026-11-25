@@ -4,7 +4,7 @@ import { GrafanaTheme2 } from '@grafana/data';
 import { Alert as GrafanaAlert, Button, useTheme2 } from '@grafana/ui';
 import { alertApi, ApiClientError } from '../api/client';
 import { AlertDetailDrawer } from '../components/AlertDetailDrawer';
-import { AlertTable } from '../components/AlertTable';
+import { AlertTable, GatedButton } from '../components/AlertTable';
 import { CreateIncidentModal } from '../components/CreateIncidentModal';
 import { DismissAlertModal } from '../components/DismissAlertModal';
 import { FallbackBannerInfo, FallbackWarningBanner } from '../components/FallbackWarningBanner';
@@ -15,14 +15,14 @@ import { NoteModalMode, WorkNoteModal } from '../components/WorkNoteModal';
 import { useAlertQueue } from '../hooks/useAlertQueue';
 import {
   Alert,
-  AlertState,
+  AlertStateFilter,
   AppPluginSettings,
-  CreateIncidentResponse,
   IncidentSyncResponse,
   ListAlertsQuery,
+  ServiceNowIncident,
   ServiceNowMetadataResponse,
 } from '../types/api';
-import { clampPollIntervalSeconds } from '../utils/format';
+import { clampPollIntervalSeconds, isAlertSelectableForIncident } from '../utils/format';
 import { canTriageAlerts, canWriteIncidents, getCurrentUser } from '../utils/permissions';
 
 interface AlertQueuePageProps {
@@ -57,6 +57,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
   const [metadata, setMetadata] = useState<ServiceNowMetadataResponse | null>(null);
 
+  const [selectedAlertIds, setSelectedAlertIds] = useState<Set<string>>(new Set());
   const [busyAlertId, setBusyAlertId] = useState<string | null>(null);
   const [drawerRefreshTrigger, setDrawerRefreshTrigger] = useState<number>(0);
 
@@ -69,7 +70,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   const [fallbackBanner, setFallbackBanner] = useState<FallbackBannerInfo | null>(null);
 
   // Isolated modal state — background polling updates never clobber these.
-  const [createModalAlert, setCreateModalAlert] = useState<Alert | null>(null);
+  const [createModalAlerts, setCreateModalAlerts] = useState<Alert[]>([]);
   const [linkModalAlert, setLinkModalAlert] = useState<Alert | null>(null);
   const [dismissModalAlert, setDismissModalAlert] = useState<Alert | null>(null);
   const [noteModal, setNoteModal] = useState<{
@@ -95,21 +96,18 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   }, []);
 
   const query = useMemo<ListAlertsQuery>(() => {
-    let states: AlertState[] | undefined;
+    let states: AlertStateFilter[] | undefined;
     if (quickFilter === 'firing') {
       states = ['firing'];
     } else if (quickFilter === 'acknowledged') {
       states = ['acknowledged'];
+    } else if (quickFilter === 'non_active_acknowledged') {
+      states = ['non_active_acknowledged'];
     } else if (quickFilter === 'dismissed') {
       states = ['dismissed'];
-    } else if (quickFilter === 'resolved') {
-      states = ['resolved'];
     }
 
-    const snowParams =
-      quickFilter === 'resolved_open_ticket'
-        ? { incident_drift: 'resolved_open_ticket' as const }
-        : snowStatusToQueryParams(filters.snowStatus);
+    const snowParams = snowStatusToQueryParams(filters.snowStatus);
 
     return {
       states,
@@ -141,25 +139,77 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     autoRefresh,
   });
 
+  // Auto-prune selections that disappeared or gained a linked incident on background refresh.
+  useEffect(() => {
+    setSelectedAlertIds((prev) => {
+      if (prev.size === 0) {
+        return prev;
+      }
+      const eligible = new Set(items.filter(isAlertSelectableForIncident).map((a) => a.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (eligible.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [items]);
+
+  const selectedAlerts = useMemo(
+    () => items.filter((a) => selectedAlertIds.has(a.id)),
+    [items, selectedAlertIds]
+  );
+
+  const handleToggleSelectAlert = useCallback((alertId: string) => {
+    setSelectedAlertIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(alertId)) {
+        next.delete(alertId);
+      } else {
+        next.add(alertId);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleToggleSelectAll = useCallback((selectableIds: string[], selectAll: boolean) => {
+    setSelectedAlertIds((prev) => {
+      const next = new Set(prev);
+      if (selectAll) {
+        for (const id of selectableIds) {
+          next.add(id);
+        }
+      } else {
+        for (const id of selectableIds) {
+          next.delete(id);
+        }
+      }
+      return next;
+    });
+  }, []);
+
   const handleSelectQuickFilter = useCallback((nextKey: QuickFilterKey) => {
     setQuickFilter(nextKey);
-    if (nextKey === 'resolved_open_ticket') {
-      setFilters((prev) => ({ ...prev, snowStatus: 'resolved_open_ticket' }));
-    } else {
+    if (nextKey !== 'non_active_acknowledged') {
       setFilters((prev) =>
         prev.snowStatus === 'resolved_open_ticket' ? { ...prev, snowStatus: 'all' } : prev
       );
     }
   }, []);
 
-  const handleChangeFilters = useCallback((next: FilterState) => {
-    setFilters(next);
-    if (next.snowStatus === 'resolved_open_ticket') {
-      setQuickFilter('resolved_open_ticket');
-    } else if (quickFilter === 'resolved_open_ticket') {
-      setQuickFilter('all');
-    }
-  }, [quickFilter]);
+  const handleChangeFilters = useCallback(
+    (next: FilterState) => {
+      setFilters(next);
+      if (next.snowStatus === 'resolved_open_ticket') {
+        setQuickFilter('non_active_acknowledged');
+      }
+    },
+    []
+  );
 
   const handleResetFilters = useCallback(() => {
     setQuickFilter('all');
@@ -306,36 +356,49 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   );
 
   const handleIncidentCreated = useCallback(
-    (alert: Alert, resp: CreateIncidentResponse) => {
-      setCreateModalAlert(null);
-      upsertAlert({
-        ...alert,
-        servicenow_incident: resp.servicenow_incident,
-      });
+    (
+      alertIds: string[],
+      result: { servicenow_incident: ServiceNowIncident; warnings?: string[] }
+    ) => {
+      setCreateModalAlerts([]);
+      setSelectedAlertIds(new Set());
+      const idSet = new Set(alertIds);
+      for (const item of items) {
+        if (idSet.has(item.id)) {
+          upsertAlert({
+            ...item,
+            state: 'acknowledged',
+            servicenow_incident: result.servicenow_incident,
+          });
+        }
+      }
       setDrawerRefreshTrigger((n) => n + 1);
       void refresh();
 
-      const incNum = resp.servicenow_incident.incident_number || 'Incident';
+      const incNum = result.servicenow_incident.incident_number || 'Incident';
       if (
-        resp.servicenow_incident.caller_resolution_status === 'fallback_noc' ||
-        (resp.warnings && resp.warnings.length > 0)
+        result.servicenow_incident.caller_resolution_status === 'fallback_noc' ||
+        (result.warnings && result.warnings.length > 0)
       ) {
         const user = getCurrentUser();
         setFallbackBanner({
           incidentNumber: incNum,
           userEmail: user.email || user.login,
-          reason: resp.servicenow_incident.caller_fallback_reason,
-          warnings: resp.warnings,
+          reason: result.servicenow_incident.caller_fallback_reason,
+          warnings: result.warnings,
         });
       } else {
         setToast({
           severity: 'success',
           title: `Created ${incNum}`,
-          message: `ServiceNow incident ${incNum} linked to ${alert.alert_name}.`,
+          message:
+            alertIds.length > 1
+              ? `ServiceNow incident ${incNum} created and linked to ${alertIds.length} alerts.`
+              : `ServiceNow incident ${incNum} linked to alert.`,
         });
       }
     },
-    [refresh, upsertAlert]
+    [items, refresh, upsertAlert]
   );
 
   const handleIncidentLinked = useCallback(
@@ -360,13 +423,19 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     [linkModalAlert, refresh, upsertAlert]
   );
 
+  const selectedFiringCount = selectedAlerts.filter((a) => a.state === 'firing').length;
+  const canCreateBulk = canWriteSnow && (selectedFiringCount === 0 || canTriage);
+  const bulkDisabledReason = !canWriteSnow
+    ? 'Requires Editor or Admin role (incidents:write permission)'
+    : 'Requires triage permission to auto-acknowledge firing alerts';
+
   return (
     <div className={styles.page}>
       <div className={styles.header}>
         <div>
           <h1 className={styles.title}>Alert Queue</h1>
           <p className={styles.subtitle}>
-            Triage Prometheus Alertmanager episodes and track linked ServiceNow incidents.
+            Triage Prometheus Alertmanager episodes, assign owning teams, and manage ServiceNow incidents.
           </p>
         </div>
       </div>
@@ -419,18 +488,52 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         onResetAll={handleResetFilters}
       />
 
+      {selectedAlerts.length > 0 && (
+        <div className={styles.bulkBar} data-testid="bulk-selection-bar">
+          <div className={styles.bulkSummary}>
+            <strong>
+              {selectedAlerts.length} alert{selectedAlerts.length === 1 ? '' : 's'} selected
+            </strong>
+            {selectedFiringCount > 0 && (
+              <span className={styles.bulkNote}>
+                ({selectedFiringCount} firing alert{selectedFiringCount === 1 ? '' : 's'} will be auto-acknowledged)
+              </span>
+            )}
+          </div>
+          <div className={styles.bulkActions}>
+            <GatedButton
+              allowed={canCreateBulk}
+              disabledReason={bulkDisabledReason}
+              variant="primary"
+              size="sm"
+              onClick={() => setCreateModalAlerts(selectedAlerts)}
+            >
+              {selectedAlerts.length > 1
+                ? `Create Single ServiceNow Incident (${selectedAlerts.length})`
+                : 'Create ServiceNow Incident'}
+            </GatedButton>
+            <Button variant="secondary" size="sm" onClick={() => setSelectedAlertIds(new Set())}>
+              Clear Selection
+            </Button>
+          </div>
+        </div>
+      )}
+
       <AlertTable
         alerts={items}
         loading={loading}
         canTriage={canTriage}
         canWriteIncidents={canWriteSnow}
         busyAlertId={busyAlertId}
+        selectedAlertIds={selectedAlertIds}
+        onToggleSelectAlert={handleToggleSelectAlert}
+        onToggleSelectAll={handleToggleSelectAll}
         onSelectAlert={(alert) => onSelectAlertId(alert.id)}
         onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
         onOpenDismiss={(alert) => setDismissModalAlert(alert)}
-        onOpenCreateIncident={(alert) => setCreateModalAlert(alert)}
+        onOpenCreateIncident={(alert) => setCreateModalAlerts([alert])}
         onOpenLinkIncident={(alert) => setLinkModalAlert(alert)}
         onOpenAddNote={(alert) =>
           setNoteModal({
@@ -446,7 +549,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
             title: `Post ServiceNow Work Note — ${alert.servicenow_incident?.incident_number || alert.alert_name}`,
             initialText:
               alert.incident_drift_status === 'resolved_open_ticket'
-                ? `Alert resolved in Prometheus. Please verify recovery and resolve/close this incident.`
+                ? 'Alert resolved in Prometheus. Please verify recovery and resolve/close this incident.'
                 : '',
           })
         }
@@ -469,14 +572,19 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
 
       <AlertDetailDrawer
         alertId={selectedAlertId}
+        metadata={metadata}
         canTriage={canTriage}
         canWriteIncidents={canWriteSnow}
         onClose={() => onSelectAlertId(null)}
+        onAlertUpdated={(updated) => {
+          upsertAlert(updated);
+          void refresh();
+        }}
         onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
         onOpenDismiss={(alert) => setDismissModalAlert(alert)}
-        onOpenCreateIncident={(alert) => setCreateModalAlert(alert)}
+        onOpenCreateIncident={(alert) => setCreateModalAlerts([alert])}
         onOpenLinkIncident={(alert) => setLinkModalAlert(alert)}
         onOpenAddNote={(alert) =>
           setNoteModal({
@@ -499,11 +607,11 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       />
 
       <CreateIncidentModal
-        isOpen={Boolean(createModalAlert)}
-        alert={createModalAlert}
+        isOpen={createModalAlerts.length > 0}
+        alerts={createModalAlerts}
         metadata={metadata}
         pluginSettings={pluginSettings}
-        onClose={() => setCreateModalAlert(null)}
+        onClose={() => setCreateModalAlerts([])}
         onCreated={handleIncidentCreated}
       />
 
@@ -554,7 +662,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
 const getStyles = (theme: GrafanaTheme2) => ({
   page: css`
     padding: ${theme.spacing(3)};
-    max-width: 1600px;
+    max-width: 1720px;
     margin: 0 auto;
   `,
   header: css`
@@ -573,6 +681,32 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   bannerSpacing: css`
     margin-bottom: ${theme.spacing(1.5)};
+  `,
+  bulkBar: css`
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: ${theme.spacing(1.5)};
+    padding: ${theme.spacing(1.25)} ${theme.spacing(1.5)};
+    margin-bottom: ${theme.spacing(1.5)};
+    border: 1px solid ${theme.colors.primary.border};
+    border-left: 4px solid ${theme.colors.primary.main};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+  `,
+  bulkSummary: css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+  `,
+  bulkNote: css`
+    font-size: ${theme.typography.bodySmall.fontSize};
+    color: ${theme.colors.warning.text};
+  `,
+  bulkActions: css`
+    display: flex;
+    gap: ${theme.spacing(1)};
   `,
   loadMoreRow: css`
     display: flex;

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,6 +68,505 @@ type ServiceNowRepository struct {
 // NewServiceNowRepository constructs a ServiceNowRepository.
 func NewServiceNowRepository(pool *pgxpool.Pool) *ServiceNowRepository {
 	return &ServiceNowRepository{pool: pool}
+}
+
+// BulkIncidentReservation holds Tx 1 output for creating one ServiceNow incident across multiple alerts.
+type BulkIncidentReservation struct {
+	PrimaryAlertID string
+	IncidentIDs    map[string]string
+	Alerts         []model.AlertDetail
+	IsRetry        bool
+}
+
+// ReserveBulkIncidentCreation runs Tx 1 for multi-alert ServiceNow incident creation:
+// locks selected alerts deterministically, auto-acknowledges any firing alerts, and reserves
+// pending incident rows for every alert without holding DB locks during HTTP calls.
+func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
+	ctx context.Context,
+	alertIDs []string,
+	op auth.OperatorContext,
+	req model.CreateBulkIncidentRequest,
+	allowTriage bool,
+) (*BulkIncidentReservation, error) {
+	seen := make(map[string]struct{}, len(alertIDs))
+	sortedIDs := make([]string, 0, len(alertIDs))
+	for _, raw := range alertIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Strings(sortedIDs)
+	if len(sortedIDs) == 0 {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_ids must contain at least one alert ID.")
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Database unavailable.").WithCause(err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, fingerprint, starts_at, ends_at, state::text, version,
+		       alert_name, severity, group_key, receiver, labels, annotations,
+		       assigned_team, assigned_team_by, assigned_team_at,
+		       generator_url, external_url, acknowledged_by, acknowledged_by_email, acknowledged_at
+		FROM alerts
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id ASC
+		FOR UPDATE
+	`, sortedIDs)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock selected alert episodes.").WithCause(err)
+	}
+
+	alerts := make([]model.AlertDetail, 0, len(sortedIDs))
+	for rows.Next() {
+		var a model.AlertDetail
+		var stateStr string
+		var labelsRaw, annRaw []byte
+		if scanErr := rows.Scan(
+			&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
+			&a.AlertName, &a.Severity, &a.GroupKey, &a.Receiver, &labelsRaw, &annRaw,
+			&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt,
+			&a.GeneratorURL, &a.ExternalURL, &a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
+		); scanErr != nil {
+			rows.Close()
+			return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to scan locked alert.").WithCause(scanErr)
+		}
+		a.State = model.AlertState(stateStr)
+		a.Labels = unmarshalStringMap(labelsRaw)
+		a.Annotations = unmarshalStringMap(annRaw)
+		a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
+		alerts = append(alerts, a)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed reading selected alerts.").WithCause(err)
+	}
+	if len(alerts) != len(sortedIDs) {
+		return nil, apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "One or more selected alert episodes were not found.")
+	}
+
+	for i := range alerts {
+		a := &alerts[i]
+		if a.State != model.AlertStateFiring && a.State != model.AlertStateAcknowledged {
+			return nil, apierror.New(http.StatusConflict, apierror.CodeInvalidStateTransition,
+				fmt.Sprintf("Alert %s must be firing or acknowledged to attach an incident (current state: %s).", a.AlertName, a.State),
+			).WithDetails(map[string]any{"alert_id": a.ID, "current_state": string(a.State), "current_version": a.Version})
+		}
+		if a.State == model.AlertStateFiring && !allowTriage {
+			return nil, apierror.New(http.StatusForbidden, apierror.CodeForbiddenRBAC, "Triage permission is required to auto-acknowledge firing alerts.")
+		}
+	}
+
+	for i := range alerts {
+		a := &alerts[i]
+		if a.State == model.AlertStateFiring {
+			if _, err := tx.Exec(ctx, `
+				UPDATE alerts
+				SET state = 'acknowledged',
+					version = version + 1,
+					acknowledged_by = $2,
+					acknowledged_by_email = $3,
+					acknowledged_at = NOW()
+				WHERE id = $1::uuid
+			`, a.ID, op.Login, model.StringPtrOrNil(op.Email)); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to auto-acknowledge firing alert.").WithCause(err)
+			}
+			prev := model.AlertStateFiring
+			next := model.AlertStateAcknowledged
+			comment := "Auto-acknowledged while creating ServiceNow incident."
+			if err := insertAuditLogTx(ctx, tx, auditEntry{
+				AlertID:       a.ID,
+				EventType:     model.AuditAlertAcknowledged,
+				ActorType:     model.ActorOperator,
+				ActorLogin:    op.Login,
+				ActorEmail:    model.StringPtrOrNil(op.Email),
+				ActorRole:     model.StringPtrOrNil(op.Role),
+				PreviousState: &prev,
+				NewState:      &next,
+				Comment:       &comment,
+				Metadata:      map[string]any{"auto_acknowledged_by_incident": true},
+			}); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to log auto-acknowledgement.").WithCause(err)
+			}
+			a.State = model.AlertStateAcknowledged
+			a.Version++
+		}
+	}
+
+	type existingInc struct {
+		ID        string
+		Status    model.SnowSyncStatus
+		UpdatedAt time.Time
+		Number    *string
+		SysID     *string
+	}
+	existingByAlert := make(map[string]existingInc, len(sortedIDs))
+	incRows, err := tx.Query(ctx, `
+		SELECT id::text, alert_id::text, sync_status::text, updated_at, incident_number, snow_sys_id
+		FROM servicenow_incidents
+		WHERE alert_id = ANY($1::uuid[])
+		ORDER BY alert_id ASC
+		FOR UPDATE
+	`, sortedIDs)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to inspect existing ServiceNow links.").WithCause(err)
+	}
+	for incRows.Next() {
+		var alertID, stStr string
+		var ex existingInc
+		if scanErr := incRows.Scan(&ex.ID, &alertID, &stStr, &ex.UpdatedAt, &ex.Number, &ex.SysID); scanErr != nil {
+			incRows.Close()
+			return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to scan incident row.").WithCause(scanErr)
+		}
+		ex.Status = model.SnowSyncStatus(stStr)
+		existingByAlert[alertID] = ex
+	}
+	incRows.Close()
+	if err := incRows.Err(); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed iterating incident reservations.").WithCause(err)
+	}
+
+	primaryAlertID := sortedIDs[0]
+	isRetry := false
+	incidentIDs := make(map[string]string, len(sortedIDs))
+
+	for _, a := range alerts {
+		ex, exists := existingByAlert[a.ID]
+		if exists {
+			switch ex.Status {
+			case model.SnowSyncCreated, model.SnowSyncLinked:
+				return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentAlreadyLinked,
+					fmt.Sprintf("Alert %s already has a linked ServiceNow incident.", a.AlertName),
+				).WithDetails(map[string]any{
+					"alert_id":        a.ID,
+					"incident_id":     ex.ID,
+					"sync_status":     string(ex.Status),
+					"incident_number": ex.Number,
+					"snow_sys_id":     ex.SysID,
+				})
+			case model.SnowSyncPending:
+				if time.Since(ex.UpdatedAt) <= stalePendingThreshold {
+					return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentCreationInProgress,
+						fmt.Sprintf("ServiceNow incident creation is already in progress for alert %s.", a.AlertName),
+					).WithDetails(map[string]any{"alert_id": a.ID, "incident_id": ex.ID})
+				}
+				if a.ID == primaryAlertID {
+					isRetry = true
+				}
+			case model.SnowSyncFailed:
+				if a.ID == primaryAlertID {
+					isRetry = true
+				}
+			}
+
+			var updatedIncID string
+			if err := tx.QueryRow(ctx, `
+				UPDATE servicenow_incidents
+				SET sync_status = 'pending',
+					impact = $2,
+					urgency = $3,
+					short_description = $4,
+					description = $5,
+					assignment_group = $6,
+					category = $7,
+					caller_mode = $8::snow_caller_mode,
+					caller_resolution_status = 'pending',
+					caller_sys_id = NULL,
+					caller_fallback_reason = NULL,
+					last_error = NULL,
+					retry_count = retry_count + 1
+				WHERE id = $1::uuid
+				RETURNING id::text
+			`, ex.ID, req.Impact, req.Urgency, req.ShortDescription, model.StringPtrOrNil(req.Description),
+				model.StringPtrOrNil(req.AssignmentGroup), model.StringPtrOrNil(req.Category), string(req.CallerMode)).Scan(&updatedIncID); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update pending bulk reservation.").WithCause(err)
+			}
+			incidentIDs[a.ID] = updatedIncID
+		} else {
+			var newIncID string
+			if err := tx.QueryRow(ctx, `
+				INSERT INTO servicenow_incidents (
+					alert_id, correlation_id, sync_status, impact, urgency,
+					short_description, description, assignment_group, category,
+					caller_mode, caller_resolution_status, created_by_login, created_by_email
+				)
+				VALUES ($1::uuid, $1, 'pending', $2, $3, $4, $5, $6, $7, $8::snow_caller_mode, 'pending', $9, $10)
+				RETURNING id::text
+			`, a.ID, req.Impact, req.Urgency, req.ShortDescription, model.StringPtrOrNil(req.Description),
+				model.StringPtrOrNil(req.AssignmentGroup), model.StringPtrOrNil(req.Category),
+				string(req.CallerMode), op.Login, model.StringPtrOrNil(op.Email)).Scan(&newIncID); err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+					return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentCreationInProgress,
+						"ServiceNow incident creation is already in progress for one of the selected alerts.")
+				}
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to reserve bulk ServiceNow incident.").WithCause(err)
+			}
+			incidentIDs[a.ID] = newIncID
+		}
+
+		curState := a.State
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       a.ID,
+			EventType:     model.AuditSnowIncidentReq,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &curState,
+			NewState:      &curState,
+			Comment:       model.StringPtrOrNil(req.WorkNotes),
+			Metadata: map[string]any{
+				"caller_mode":     string(req.CallerMode),
+				"is_retry":        isRetry,
+				"bulk_alert_ids":  sortedIDs,
+				"primary_alert":   a.ID == primaryAlertID,
+			},
+		}); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record bulk incident request audit event.").WithCause(err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to commit bulk incident reservation.").WithCause(err)
+	}
+
+	return &BulkIncidentReservation{
+		PrimaryAlertID: primaryAlertID,
+		IncidentIDs:    incidentIDs,
+		Alerts:         alerts,
+		IsRetry:        isRetry,
+	}, nil
+}
+
+// FinalizeBulkIncidentCreated completes Tx 2 after creating or adopting a single ServiceNow
+// incident across multiple selected alerts.
+func (r *ServiceNowRepository) FinalizeBulkIncidentCreated(
+	ctx context.Context,
+	resv *BulkIncidentReservation,
+	op auth.OperatorContext,
+	res SnowCreateResult,
+	caller CallerResolution,
+	adopted bool,
+) (*model.ServiceNowIncident, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Database unavailable.").WithCause(err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	alertIDs := make([]string, 0, len(resv.Alerts))
+	for _, a := range resv.Alerts {
+		alertIDs = append(alertIDs, a.ID)
+	}
+	sort.Strings(alertIDs)
+
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, state::text
+		FROM alerts
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id ASC
+		FOR UPDATE
+	`, alertIDs)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alerts for bulk finalization.").WithCause(err)
+	}
+	lockedStates := make(map[string]model.AlertState, len(alertIDs))
+	for rows.Next() {
+		var id, st string
+		if scanErr := rows.Scan(&id, &st); scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		lockedStates[id] = model.AlertState(st)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var primaryInc *model.ServiceNowIncident
+	for _, aID := range alertIDs {
+		incID := resv.IncidentIDs[aID]
+		syncStatus := model.SnowSyncLinked
+		auditType := model.AuditSnowIncidentLinked
+		if aID == resv.PrimaryAlertID {
+			syncStatus = model.SnowSyncCreated
+			auditType = model.AuditSnowIncidentCreated
+		}
+
+		var inc model.ServiceNowIncident
+		var syncStatusStr, callerModeStr, callerResStr string
+		err := tx.QueryRow(ctx, `
+			UPDATE servicenow_incidents
+			SET sync_status = $2::snow_sync_status,
+				snow_sys_id = $3,
+				incident_number = $4,
+				incident_url = $5,
+				snow_state = $6,
+				snow_state_label = $7,
+				priority = $8,
+				assignment_group = COALESCE($9, assignment_group),
+				caller_resolution_status = $10::snow_caller_resolution_status,
+				caller_sys_id = $11,
+				caller_fallback_reason = $12,
+				snow_opened_at = $13,
+				snow_resolved_at = $14,
+				snow_closed_at = $15,
+				snow_state_synced_at = NOW(),
+				last_error = NULL
+			WHERE id = $1::uuid
+			RETURNING id::text, alert_id::text, correlation_id, sync_status::text,
+			          snow_sys_id, incident_number, incident_url,
+			          snow_state, snow_state_label, priority, assignment_group,
+			          caller_mode::text, caller_resolution_status::text, caller_sys_id, caller_fallback_reason,
+			          snow_opened_at, snow_resolved_at, snow_closed_at, snow_state_synced_at, resolution_note_posted_at
+		`, incID, string(syncStatus), res.SysID, res.Number, res.IncidentURL, res.State, res.StateLabel,
+			res.Priority, res.AssignmentGroup, string(caller.ResolutionStatus),
+			model.StringPtrOrNil(caller.SysID), caller.FallbackReason,
+			res.OpenedAt, res.ResolvedAt, res.ClosedAt,
+		).Scan(
+			&inc.ID, &inc.AlertID, &inc.CorrelationID, &syncStatusStr,
+			&inc.SnowSysID, &inc.IncidentNumber, &inc.IncidentURL,
+			&inc.SnowState, &inc.SnowStateLabel, &inc.Priority, &inc.AssignmentGroup,
+			&callerModeStr, &callerResStr, &inc.CallerSysID, &inc.CallerFallbackReason,
+			&inc.SnowOpenedAt, &inc.SnowResolvedAt, &inc.SnowClosedAt, &inc.SnowStateSyncedAt, &inc.ResolutionNotePostedAt,
+		)
+		if err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to finalize bulk incident record.").WithCause(err)
+		}
+		inc.SyncStatus = model.SnowSyncStatus(syncStatusStr)
+		inc.CallerMode = model.SnowCallerMode(callerModeStr)
+		inc.CallerResolutionStatus = model.SnowCallerResolutionStatus(callerResStr)
+		if aID == resv.PrimaryAlertID {
+			copyInc := inc
+			primaryInc = &copyInc
+		}
+
+		st := lockedStates[aID]
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       aID,
+			EventType:     auditType,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &st,
+			NewState:      &st,
+			Metadata: map[string]any{
+				"incident_number":          res.Number,
+				"snow_sys_id":              res.SysID,
+				"caller_resolution_status": string(caller.ResolutionStatus),
+				"adopted_existing":         adopted,
+				"bulk_count":               len(alertIDs),
+			},
+		}); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to log bulk incident creation.").WithCause(err)
+		}
+
+		if caller.ResolutionStatus == model.CallerResFallbackNOC {
+			if err := insertAuditLogTx(ctx, tx, auditEntry{
+				AlertID:       aID,
+				EventType:     model.AuditSnowCallerFallback,
+				ActorType:     model.ActorSystem,
+				ActorLogin:    "system",
+				ActorEmail:    model.StringPtrOrNil(op.Email),
+				PreviousState: &st,
+				NewState:      &st,
+				Comment:       caller.FallbackReason,
+				Metadata: map[string]any{
+					"incident_number":       res.Number,
+					"fallback_caller_sysid": caller.SysID,
+					"operator_email":        op.Email,
+				},
+			}); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record bulk caller fallback audit event.").WithCause(err)
+			}
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to commit finalized bulk incident.").WithCause(err)
+	}
+	return primaryInc, nil
+}
+
+// FinalizeBulkIncidentFailed records failed ServiceNow creation across all bulk-reserved rows.
+func (r *ServiceNowRepository) FinalizeBulkIncidentFailed(ctx context.Context, resv *BulkIncidentReservation, op auth.OperatorContext, errMsg string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	alertIDs := make([]string, 0, len(resv.Alerts))
+	for _, a := range resv.Alerts {
+		alertIDs = append(alertIDs, a.ID)
+	}
+	sort.Strings(alertIDs)
+
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, state::text
+		FROM alerts
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id ASC
+		FOR UPDATE
+	`, alertIDs)
+	if err != nil {
+		return err
+	}
+	lockedStates := make(map[string]model.AlertState, len(alertIDs))
+	for rows.Next() {
+		var id, st string
+		if scanErr := rows.Scan(&id, &st); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		lockedStates[id] = model.AlertState(st)
+	}
+	rows.Close()
+
+	for _, aID := range alertIDs {
+		incID := resv.IncidentIDs[aID]
+		if _, err := tx.Exec(ctx, `
+			UPDATE servicenow_incidents
+			SET sync_status = 'failed',
+				last_error = $2
+			WHERE id = $1::uuid
+		`, incID, errMsg); err != nil {
+			return err
+		}
+		st := lockedStates[aID]
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       aID,
+			EventType:     model.AuditSnowIncidentFailed,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &st,
+			NewState:      &st,
+			Comment:       &errMsg,
+		}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // ReserveIncidentCreation runs Phase 1 (Tx 1) of incident creation without holding locks across HTTP.
@@ -596,12 +1096,13 @@ func (r *ServiceNowRepository) UpdateIncidentForAlert(
 	}
 
 	var prevState *int16
+	var snowSysID *string
 	err = tx.QueryRow(ctx, `
-		SELECT s.snow_state
+		SELECT s.snow_state, s.snow_sys_id
 		FROM servicenow_incidents s
 		WHERE s.alert_id = $1::uuid
 		FOR UPDATE
-	`, alertID).Scan(&prevState)
+	`, alertID).Scan(&prevState, &snowSysID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, apierror.New(http.StatusNotFound, apierror.CodeIncidentNotFound, "Linked ServiceNow incident not found.")
@@ -610,18 +1111,34 @@ func (r *ServiceNowRepository) UpdateIncidentForAlert(
 	}
 	alertState := model.AlertState(alertStateStr)
 
-	if _, err := tx.Exec(ctx, `
-		UPDATE servicenow_incidents
-		SET snow_state = $2,
-			snow_state_label = $3,
-			priority = COALESCE($4, priority),
-			assignment_group = COALESCE($5, assignment_group),
-			snow_resolved_at = COALESCE($6, snow_resolved_at),
-			snow_closed_at = COALESCE($7, snow_closed_at),
-			snow_state_synced_at = NOW()
-		WHERE alert_id = $1::uuid
-	`, alertID, update.State, update.StateLabel, update.Priority, update.AssignmentGroup, update.ResolvedAt, update.ClosedAt); err != nil {
-		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update incident status.").WithCause(err)
+	if snowSysID != nil && *snowSysID != "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE servicenow_incidents
+			SET snow_state = $2,
+				snow_state_label = $3,
+				priority = COALESCE($4, priority),
+				assignment_group = COALESCE($5, assignment_group),
+				snow_resolved_at = COALESCE($6, snow_resolved_at),
+				snow_closed_at = COALESCE($7, snow_closed_at),
+				snow_state_synced_at = NOW()
+			WHERE snow_sys_id = $1 AND sync_status IN ('created', 'linked')
+		`, *snowSysID, update.State, update.StateLabel, update.Priority, update.AssignmentGroup, update.ResolvedAt, update.ClosedAt); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update incident status.").WithCause(err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE servicenow_incidents
+			SET snow_state = $2,
+				snow_state_label = $3,
+				priority = COALESCE($4, priority),
+				assignment_group = COALESCE($5, assignment_group),
+				snow_resolved_at = COALESCE($6, snow_resolved_at),
+				snow_closed_at = COALESCE($7, snow_closed_at),
+				snow_state_synced_at = NOW()
+			WHERE alert_id = $1::uuid
+		`, alertID, update.State, update.StateLabel, update.Priority, update.AssignmentGroup, update.ResolvedAt, update.ClosedAt); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update incident status.").WithCause(err)
+		}
 	}
 
 	if err := insertAuditLogTx(ctx, tx, auditEntry{
