@@ -1,0 +1,13 @@
+apiVersion: 1
+
+apps:
+  - type: noc-alert-manager-app
+    org_id: 1
+    disabled: false
+    jsonData:
+      apiBaseUrl: http://api:8080
+      pollIntervalSeconds: 15
+      defaultCallerMode: sso_user
+      genericNocDisplayLabel: Fallback Service Account (noc)
+    secureJsonData:
+      apiJwtSecret: $GRAFANA_PLUGIN_JWT_SECRET

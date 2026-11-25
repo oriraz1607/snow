@@ -1,0 +1,78 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "app",
+  "name": "Alert Manager",
+  "id": "noc-alert-manager-app",
+  "backend": true,
+  "executable": "gpx_noc_alert_manager",
+  "info": {
+    "description": "Alert triage console for Prometheus Alertmanager alerts with ServiceNow incident integration.",
+    "author": {
+      "name": "Platform Engineering"
+    },
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "version": "1.0.0",
+    "links": []
+  },
+  "dependencies": {
+    "grafanaDependency": ">=11.3.0",
+    "plugins": []
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "Alert Queue",
+      "path": "/a/noc-alert-manager-app/alerts",
+      "role": "Viewer",
+      "addToNav": true,
+      "defaultNav": true
+    },
+    {
+      "type": "page",
+      "name": "Configuration",
+      "path": "/a/noc-alert-manager-app/config",
+      "role": "Admin",
+      "addToNav": true
+    }
+  ],
+  "roles": [
+    {
+      "role": {
+        "name": "Alert Viewer",
+        "description": "View alert queue, incident links, and audit history.",
+        "permissions": [
+          { "action": "noc-alert-manager-app.alerts:read" }
+        ]
+      },
+      "grants": ["Viewer"]
+    },
+    {
+      "role": {
+        "name": "Alert Operator",
+        "description": "Acknowledge, dismiss, reopen alerts, and create or link ServiceNow incidents.",
+        "permissions": [
+          { "action": "noc-alert-manager-app.alerts:read" },
+          { "action": "noc-alert-manager-app.alerts:triage" },
+          { "action": "noc-alert-manager-app.incidents:write" }
+        ]
+      },
+      "grants": ["Editor"]
+    },
+    {
+      "role": {
+        "name": "Alert Administrator",
+        "description": "Configure plugin backend URL, defaults, and full alert administration.",
+        "permissions": [
+          { "action": "noc-alert-manager-app.alerts:read" },
+          { "action": "noc-alert-manager-app.alerts:triage" },
+          { "action": "noc-alert-manager-app.incidents:write" },
+          { "action": "noc-alert-manager-app.settings:write" }
+        ]
+      },
+      "grants": ["Admin"]
+    }
+  ]
+}

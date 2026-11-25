@@ -1,0 +1,150 @@
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-alert_api_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    entrypoint: ["/bin/migrate", "-dir", "/migrations", "up"]
+    environment:
+      MIGRATE_DATABASE_URL: ${MIGRATE_DATABASE_URL:?MIGRATE_DATABASE_URL is required}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-alert_api_app}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  mocksnow:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    entrypoint: ["/bin/mocksnow"]
+    environment:
+      MOCKSNOW_PORT: "8085"
+      SNOW_CLIENT_ID: ${SNOW_CLIENT_ID:-}
+      SNOW_CLIENT_SECRET: ${SNOW_CLIENT_SECRET:-}
+      SNOW_USERNAME: ${SNOW_USERNAME:-}
+      SNOW_PASSWORD: ${SNOW_PASSWORD:-}
+      SNOW_DEFAULT_NOC_CALLER_SYS_ID: ${SNOW_DEFAULT_NOC_CALLER_SYS_ID:?SNOW_DEFAULT_NOC_CALLER_SYS_ID is required}
+      SNOW_DEFAULT_NOC_CALLER_USERNAME: ${SNOW_DEFAULT_NOC_CALLER_USERNAME:-noc}
+      MOCKSNOW_WEBHOOK_URL: http://api:8080/api/v1/webhooks/servicenow
+      SNOW_INBOUND_WEBHOOK_SECRET: ${SNOW_INBOUND_WEBHOOK_SECRET:-}
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8085/healthz >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    entrypoint: ["/bin/api"]
+    environment:
+      PORT: ${PORT:-8080}
+      ADMIN_PORT: ${ADMIN_PORT:-9090}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      PG_MAX_CONNS: ${PG_MAX_CONNS:-25}
+      PG_MIN_CONNS: ${PG_MIN_CONNS:-5}
+      GRAFANA_PLUGIN_JWT_SECRET: ${GRAFANA_PLUGIN_JWT_SECRET:?GRAFANA_PLUGIN_JWT_SECRET is required}
+      GRAFANA_PLUGIN_JWT_SECRET_PREVIOUS: ${GRAFANA_PLUGIN_JWT_SECRET_PREVIOUS:-}
+      GRAFANA_PLUGIN_JWT_ISSUER: ${GRAFANA_PLUGIN_JWT_ISSUER:-noc-alert-manager-app}
+      GRAFANA_PUBLIC_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3000}
+      ALLOW_LEGACY_PROXY_HEADER_AUTH: ${ALLOW_LEGACY_PROXY_HEADER_AUTH:-false}
+      GRAFANA_PROXY_SHARED_TOKEN: ${GRAFANA_PROXY_SHARED_TOKEN:-}
+      ALERTMANAGER_WEBHOOK_TOKEN: ${ALERTMANAGER_WEBHOOK_TOKEN:?ALERTMANAGER_WEBHOOK_TOKEN is required}
+      ALERTMANAGER_MAX_PAYLOAD_BYTES: ${ALERTMANAGER_MAX_PAYLOAD_BYTES:-5242880}
+      SNOW_INSTANCE_URL: ${SNOW_INSTANCE_URL:-http://mocksnow:8085}
+      SNOW_AUTH_MODE: ${SNOW_AUTH_MODE:-oauth_client_credentials}
+      SNOW_TOKEN_URL: ${SNOW_TOKEN_URL:-http://mocksnow:8085/oauth_token.do}
+      SNOW_CLIENT_ID: ${SNOW_CLIENT_ID:-}
+      SNOW_CLIENT_SECRET: ${SNOW_CLIENT_SECRET:-}
+      SNOW_OAUTH_SCOPE: ${SNOW_OAUTH_SCOPE:-}
+      SNOW_USERNAME: ${SNOW_USERNAME:-}
+      SNOW_PASSWORD: ${SNOW_PASSWORD:-}
+      SNOW_DEFAULT_NOC_CALLER_SYS_ID: ${SNOW_DEFAULT_NOC_CALLER_SYS_ID:?SNOW_DEFAULT_NOC_CALLER_SYS_ID is required}
+      SNOW_DEFAULT_NOC_CALLER_USERNAME: ${SNOW_DEFAULT_NOC_CALLER_USERNAME:-noc}
+      SNOW_DEFAULT_ASSIGNMENT_GROUP: ${SNOW_DEFAULT_ASSIGNMENT_GROUP:-Infrastructure}
+      SNOW_DEFAULT_CATEGORY: ${SNOW_DEFAULT_CATEGORY:-Infrastructure}
+      SNOW_INBOUND_WEBHOOK_SECRET: ${SNOW_INBOUND_WEBHOOK_SECRET:-}
+      SNOW_HTTP_TIMEOUT_SECONDS: ${SNOW_HTTP_TIMEOUT_SECONDS:-15}
+      SNOW_POLL_INTERVAL_SECONDS: ${SNOW_POLL_INTERVAL_SECONDS:-120}
+      SNOW_AUTO_POST_RESOLVED_NOTE: ${SNOW_AUTO_POST_RESOLVED_NOTE:-true}
+      SNOW_NOTE_WORKER_INTERVAL_SECONDS: ${SNOW_NOTE_WORKER_INTERVAL_SECONDS:-15}
+      ALLOW_RETROSPECTIVE_INCIDENT_CREATE: ${ALLOW_RETROSPECTIVE_INCIDENT_CREATE:-false}
+    ports:
+      - "${PORT:-8080}:8080"
+      - "${ADMIN_PORT:-9090}:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/readyz >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  alertmanager:
+    image: docker.io/prom/alertmanager:v0.27.0
+    entrypoint:
+      - /bin/sh
+      - /etc/alertmanager/entrypoint.sh
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    environment:
+      ALERTMANAGER_WEBHOOK_TOKEN: ${ALERTMANAGER_WEBHOOK_TOKEN:?ALERTMANAGER_WEBHOOK_TOKEN is required}
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro,z
+      - ./alertmanager-entrypoint.sh:/etc/alertmanager/entrypoint.sh:ro,z
+    depends_on:
+      api:
+        condition: service_healthy
+
+  grafana:
+    image: docker.io/grafana/grafana:11.6.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: noc-alert-manager-app
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:?GF_SECURITY_ADMIN_PASSWORD is required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GRAFANA_PLUGIN_JWT_SECRET: ${GRAFANA_PLUGIN_JWT_SECRET:?GRAFANA_PLUGIN_JWT_SECRET is required}
+    volumes:
+      - ../plugin/dist:/var/lib/grafana/plugins/noc-alert-manager-app:ro,z
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro,z
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null || curl -sf http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pg_data:
