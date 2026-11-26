@@ -1,4 +1,4 @@
-import { Alert, PLUGIN_ID, TeamSource } from '../types/api';
+import { Alert, ConfluenceURLSource, PLUGIN_ID, TeamSource } from '../types/api';
 
 const PRIORITY_LABELS: Record<number, string> = {
   1: '1 - Critical',
@@ -65,6 +65,43 @@ export function getAlertTeam(alert: Alert): {
     };
   }
   return { team: '', source: 'none', taggedBy: null };
+}
+
+export function isValidHttpsUrl(raw?: string | null): boolean {
+  const trimmed = raw?.trim() ?? '';
+  if (!trimmed || trimmed.length > 2048 || /\s/.test(trimmed)) {
+    return false;
+  }
+  try {
+    const u = new URL(trimmed);
+    return u.protocol === 'https:' && Boolean(u.hostname) && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
+export function getAlertConfluenceDoc(alert: Alert): {
+  url: string | null;
+  source: ConfluenceURLSource;
+  updatedBy: string | null;
+} {
+  const backendUrl = alert.confluence_url?.trim();
+  if (backendUrl && isValidHttpsUrl(backendUrl)) {
+    return {
+      url: backendUrl,
+      source: alert.confluence_url_source ?? 'noc_override',
+      updatedBy: alert.confluence_url_updated_by ?? null,
+    };
+  }
+  const annConf = alert.annotations?.confluence_url?.trim();
+  if (annConf && isValidHttpsUrl(annConf)) {
+    return { url: annConf, source: 'annotation', updatedBy: null };
+  }
+  const runbook = alert.annotations?.runbook_url?.trim();
+  if (runbook && isValidHttpsUrl(runbook)) {
+    return { url: runbook, source: 'runbook_url', updatedBy: null };
+  }
+  return { url: null, source: 'none', updatedBy: null };
 }
 
 export function isAlertSelectableForIncident(alert: Alert): boolean {
@@ -229,6 +266,9 @@ export function buildDefaultDescription(alert: Alert): string {
   }
   if (alert.annotations?.runbook_url) {
     lines.push(`Runbook URL: ${alert.annotations.runbook_url}`);
+  }
+  if (alert.confluence_url && alert.confluence_url !== alert.annotations?.runbook_url) {
+    lines.push(`Confluence URL: ${alert.confluence_url}`);
   }
   if (alert.generator_url) {
     lines.push(`Prometheus Generator URL: ${alert.generator_url}`);

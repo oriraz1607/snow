@@ -86,6 +86,7 @@ func NewAPIRouter(
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/reopen", alerts.Reopen)
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/notes", alerts.AddNote)
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/team", alerts.TagTeam)
+			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/confluence", alerts.UpdateConfluenceURL)
 
 			op.With(auth.RequirePermission(auth.PermIncidentsWrite)).Post("/servicenow/incidents/bulk", snow.CreateBulkIncident)
 			op.With(auth.RequirePermission(auth.PermIncidentsWrite)).Post("/alerts/{alert_id}/servicenow/incident", snow.CreateIncident)

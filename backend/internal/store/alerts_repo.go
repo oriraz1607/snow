@@ -20,12 +20,20 @@ import (
 
 // AlertRepository manages PostgreSQL persistence for alert episodes, triage actions, and audit logs.
 type AlertRepository struct {
-	pool *pgxpool.Pool
+	pool                   *pgxpool.Pool
+	confluenceAllowedHosts []string
 }
 
 // NewAlertRepository constructs an AlertRepository.
 func NewAlertRepository(pool *pgxpool.Pool) *AlertRepository {
 	return &AlertRepository{pool: pool}
+}
+
+// SetConfluenceAllowedHosts configures optional allowed Confluence hostnames/suffixes for URL resolution.
+func (r *AlertRepository) SetConfluenceAllowedHosts(hosts []string) {
+	copied := make([]string, len(hosts))
+	copy(copied, hosts)
+	r.confluenceAllowedHosts = copied
 }
 
 // ListAlerts queries alert episodes with filters, keyset pagination, and live queue counters.
@@ -312,7 +320,9 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
 			a.alert_name, a.instance, a.severity, a.labels, a.annotations,
-			a.assigned_team, a.assigned_team_by, a.assigned_team_at, a.generator_url,
+			a.assigned_team, a.assigned_team_by, a.assigned_team_at,
+			cd.confluence_url, cd.updated_by, cd.updated_at,
+			a.generator_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
 			(SELECT COUNT(*) FROM alerts prev WHERE prev.fingerprint = a.fingerprint AND prev.starts_at < a.starts_at) AS previous_episode_count,
@@ -322,6 +332,7 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 			s.caller_fallback_reason, s.snow_state_synced_at, s.resolution_note_posted_at, s.last_error
 		FROM alerts a
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
+		LEFT JOIN alert_confluence_docs cd ON cd.alert_name = a.alert_name
 		%s
 		ORDER BY %s
 		LIMIT %s
@@ -335,7 +346,7 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 
 	items := make([]model.Alert, 0, limit)
 	for rows.Next() {
-		item, err := scanAlertItemRow(rows)
+		item, err := scanAlertItemRow(rows, r.confluenceAllowedHosts)
 		if err != nil {
 			return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to scan alert row.").WithCause(err)
 		}
@@ -482,6 +493,7 @@ func (r *AlertRepository) GetAlert(ctx context.Context, alertID string) (*model.
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
 			a.alert_name, a.instance, a.severity, a.group_key, a.receiver, a.labels, a.annotations,
 			a.assigned_team, a.assigned_team_by, a.assigned_team_at,
+			cd.confluence_url, cd.updated_by, cd.updated_at,
 			a.generator_url, a.external_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
@@ -493,10 +505,11 @@ func (r *AlertRepository) GetAlert(ctx context.Context, alertID string) (*model.
 			s.caller_fallback_reason, s.snow_state_synced_at, s.resolution_note_posted_at, s.last_error
 		FROM alerts a
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
+		LEFT JOIN alert_confluence_docs cd ON cd.alert_name = a.alert_name
 		WHERE a.id = $1::uuid
 	`, alertID)
 
-	detail, err := scanAlertDetailRow(row)
+	detail, err := scanAlertDetailRow(row, r.confluenceAllowedHosts)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")
@@ -617,7 +630,7 @@ func (r *AlertRepository) AcknowledgeAlert(ctx context.Context, alertID string, 
 		if locked.State == model.AlertStateAcknowledged &&
 			locked.AcknowledgedBy != nil && *locked.AcknowledgedBy == op.Login &&
 			locked.Version == version+1 {
-			result, err = getAlertItemTx(ctx, tx, alertID)
+			result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
 			return err
 		}
 
@@ -656,7 +669,7 @@ func (r *AlertRepository) AcknowledgeAlert(ctx context.Context, alertID string, 
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record audit log.").WithCause(err)
 		}
 
-		result, err = getAlertItemTx(ctx, tx, alertID)
+		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
 		return err
 	})
 	if err != nil {
@@ -709,7 +722,7 @@ func (r *AlertRepository) UnacknowledgeAlert(ctx context.Context, alertID string
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record audit log.").WithCause(err)
 		}
 
-		result, err = getAlertItemTx(ctx, tx, alertID)
+		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
 		return err
 	})
 	if err != nil {
@@ -795,7 +808,7 @@ func (r *AlertRepository) DismissAlert(ctx context.Context, alertID string, op a
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record audit log.").WithCause(err)
 		}
 
-		result, err = getAlertItemTx(ctx, tx, alertID)
+		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
 		return err
 	})
 	if err != nil {
@@ -1014,7 +1027,7 @@ func (r *AlertRepository) ReopenAlert(ctx context.Context, alertID string, op au
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record audit log.").WithCause(err)
 		}
 
-		result, err = getAlertItemTx(ctx, tx, alertID)
+		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
 		return err
 	})
 	if err != nil {
@@ -1148,7 +1161,77 @@ func (r *AlertRepository) TagAlertTeam(ctx context.Context, alertID string, op a
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record team tag audit event.").WithCause(err)
 		}
 
-		result, err = getAlertItemTx(ctx, tx, alertID)
+		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// UpsertAlertConfluenceURL persists a NOC-maintained Confluence documentation URL keyed by alert_name
+// and appends an immutable audit log entry on the target alert episode.
+func (r *AlertRepository) UpsertAlertConfluenceURL(ctx context.Context, alertID string, op auth.OperatorContext, confluenceURL string) (*model.Alert, error) {
+	trimmedURL := strings.TrimSpace(confluenceURL)
+	var result *model.Alert
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		var alertName, stateStr string
+		err := tx.QueryRow(ctx, `
+			SELECT alert_name, state::text
+			FROM alerts
+			WHERE id = $1::uuid
+			FOR UPDATE
+		`, alertID).Scan(&alertName, &stateStr)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")
+			}
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert episode.").WithCause(err)
+		}
+
+		var prevURL *string
+		if err := tx.QueryRow(ctx, `
+			SELECT confluence_url
+			FROM alert_confluence_docs
+			WHERE alert_name = $1
+		`, alertName).Scan(&prevURL); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to read existing Confluence mapping.").WithCause(err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO alert_confluence_docs (alert_name, confluence_url, updated_by, updated_by_email)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (alert_name) DO UPDATE
+			SET confluence_url = EXCLUDED.confluence_url,
+				updated_by = EXCLUDED.updated_by,
+				updated_by_email = EXCLUDED.updated_by_email,
+				updated_at = NOW()
+		`, alertName, trimmedURL, op.Login, model.StringPtrOrNil(op.Email)); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to save Confluence documentation URL.").WithCause(err)
+		}
+
+		st := model.AlertState(stateStr)
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       alertID,
+			EventType:     model.AuditAlertConfluenceURLUpdated,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &st,
+			NewState:      &st,
+			Comment:       &trimmedURL,
+			Metadata: map[string]any{
+				"alert_name":   alertName,
+				"previous_url": prevURL,
+				"new_url":      trimmedURL,
+			},
+		}); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record Confluence URL audit event.").WithCause(err)
+		}
+
+		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
 		return err
 	})
 	if err != nil {
@@ -1272,12 +1355,14 @@ func conflictSnapshotError(code, msg string, snap lockedAlertSnapshot) error {
 	return apierror.New(http.StatusConflict, code, msg).WithDetails(details)
 }
 
-func getAlertItemTx(ctx context.Context, tx pgx.Tx, alertID string) (*model.Alert, error) {
+func getAlertItemTx(ctx context.Context, tx pgx.Tx, alertID string, allowedHosts []string) (*model.Alert, error) {
 	row := tx.QueryRow(ctx, `
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
 			a.alert_name, a.instance, a.severity, a.labels, a.annotations,
-			a.assigned_team, a.assigned_team_by, a.assigned_team_at, a.generator_url,
+			a.assigned_team, a.assigned_team_by, a.assigned_team_at,
+			cd.confluence_url, cd.updated_by, cd.updated_at,
+			a.generator_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
 			(SELECT COUNT(*) FROM alerts prev WHERE prev.fingerprint = a.fingerprint AND prev.starts_at < a.starts_at) AS previous_episode_count,
@@ -1287,9 +1372,10 @@ func getAlertItemTx(ctx context.Context, tx pgx.Tx, alertID string) (*model.Aler
 			s.caller_fallback_reason, s.snow_state_synced_at, s.resolution_note_posted_at, s.last_error
 		FROM alerts a
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
+		LEFT JOIN alert_confluence_docs cd ON cd.alert_name = a.alert_name
 		WHERE a.id = $1::uuid
 	`, alertID)
-	item, err := scanAlertItemRow(row)
+	item, err := scanAlertItemRow(row, allowedHosts)
 	if err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to reload updated alert.").WithCause(err)
 	}
@@ -1337,10 +1423,12 @@ func insertAuditLogTx(ctx context.Context, tx pgx.Tx, entry auditEntry) error {
 	return err
 }
 
-func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
+func scanAlertItemRow(row pgx.Row, allowedHosts []string) (model.Alert, error) {
 	var a model.Alert
 	var stateStr string
 	var labelsRaw, annRaw []byte
+	var confOverrideURL, confUpdatedBy *string
+	var confUpdatedAt *time.Time
 
 	var snowID, snowSyncStatus, snowSysID, snowNum, snowURL *string
 	var snowState, snowPriority *int16
@@ -1350,7 +1438,9 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 	err := row.Scan(
 		&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
 		&a.AlertName, &a.Instance, &a.Severity, &labelsRaw, &annRaw,
-		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt, &a.GeneratorURL,
+		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt,
+		&confOverrideURL, &confUpdatedBy, &confUpdatedAt,
+		&a.GeneratorURL,
 		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
 		&a.DismissedBy, &a.DismissedAt, &a.DismissReason, &a.ResolvedAt,
 		&a.PreviousEpisodeCount,
@@ -1371,6 +1461,11 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 		a.Instance = model.ExtractInstance(a.Labels)
 	}
 	a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
+	a.ConfluenceURL, a.ConfluenceURLSource = model.ResolveConfluenceURL(confOverrideURL, a.Annotations, allowedHosts)
+	if a.ConfluenceURLSource == model.ConfluenceSourceOverride {
+		a.ConfluenceURLUpdatedBy = confUpdatedBy
+		a.ConfluenceURLUpdatedAt = confUpdatedAt
+	}
 
 	if snowID != nil && snowSyncStatus != nil && snowCallerMode != nil && snowCallerRes != nil {
 		a.ServiceNowIncident = &model.ServiceNowIncident{
@@ -1397,10 +1492,12 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 	return a, nil
 }
 
-func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
+func scanAlertDetailRow(row pgx.Row, allowedHosts []string) (*model.AlertDetail, error) {
 	var a model.AlertDetail
 	var stateStr string
 	var labelsRaw, annRaw []byte
+	var confOverrideURL, confUpdatedBy *string
+	var confUpdatedAt *time.Time
 
 	var snowID, snowSyncStatus, snowSysID, snowNum, snowURL *string
 	var snowState, snowPriority *int16
@@ -1411,6 +1508,7 @@ func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
 		&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
 		&a.AlertName, &a.Instance, &a.Severity, &a.GroupKey, &a.Receiver, &labelsRaw, &annRaw,
 		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt,
+		&confOverrideURL, &confUpdatedBy, &confUpdatedAt,
 		&a.GeneratorURL, &a.ExternalURL,
 		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
 		&a.DismissedBy, &a.DismissedAt, &a.DismissReason, &a.ResolvedAt,
@@ -1433,6 +1531,11 @@ func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
 		a.Instance = model.ExtractInstance(a.Labels)
 	}
 	a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
+	a.ConfluenceURL, a.ConfluenceURLSource = model.ResolveConfluenceURL(confOverrideURL, a.Annotations, allowedHosts)
+	if a.ConfluenceURLSource == model.ConfluenceSourceOverride {
+		a.ConfluenceURLUpdatedBy = confUpdatedBy
+		a.ConfluenceURLUpdatedAt = confUpdatedAt
+	}
 
 	if snowID != nil && snowSyncStatus != nil && snowCallerMode != nil && snowCallerRes != nil {
 		a.ServiceNowIncident = &model.ServiceNowIncident{

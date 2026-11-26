@@ -54,10 +54,11 @@ const (
 	AuditAlertResolved        AuditEventType = "alert_resolved"
 	AuditAlertAcknowledged    AuditEventType = "alert_acknowledged"
 	AuditAlertUnacknowledged  AuditEventType = "alert_unacknowledged"
-	AuditAlertDismissed       AuditEventType = "alert_dismissed"
-	AuditAlertReopened        AuditEventType = "alert_reopened"
-	AuditAlertTeamTagged      AuditEventType = "alert_team_tagged"
-	AuditOperatorNoteAdded    AuditEventType = "operator_note_added"
+	AuditAlertDismissed            AuditEventType = "alert_dismissed"
+	AuditAlertReopened             AuditEventType = "alert_reopened"
+	AuditAlertTeamTagged           AuditEventType = "alert_team_tagged"
+	AuditAlertConfluenceURLUpdated AuditEventType = "alert_confluence_url_updated"
+	AuditOperatorNoteAdded         AuditEventType = "operator_note_added"
 	AuditSnowIncidentReq      AuditEventType = "snow_incident_requested"
 	AuditSnowIncidentCreated  AuditEventType = "snow_incident_created"
 	AuditSnowIncidentFailed   AuditEventType = "snow_incident_failed"
@@ -116,10 +117,14 @@ type Alert struct {
 	Site                 string              `json:"site"`
 	Team                 string              `json:"team"`
 	TeamSource           string              `json:"team_source"`
-	AssignedTeam         *string             `json:"assigned_team,omitempty"`
-	AssignedTeamBy       *string             `json:"assigned_team_by,omitempty"`
-	AssignedTeamAt       *time.Time          `json:"assigned_team_at,omitempty"`
-	GeneratorURL         *string             `json:"generator_url"`
+	AssignedTeam           *string             `json:"assigned_team,omitempty"`
+	AssignedTeamBy         *string             `json:"assigned_team_by,omitempty"`
+	AssignedTeamAt         *time.Time          `json:"assigned_team_at,omitempty"`
+	ConfluenceURL          *string             `json:"confluence_url,omitempty"`
+	ConfluenceURLSource    string              `json:"confluence_url_source"`
+	ConfluenceURLUpdatedBy *string             `json:"confluence_url_updated_by,omitempty"`
+	ConfluenceURLUpdatedAt *time.Time          `json:"confluence_url_updated_at,omitempty"`
+	GeneratorURL           *string             `json:"generator_url"`
 	ExternalURL          *string             `json:"external_url,omitempty"`
 	AcknowledgedBy       *string             `json:"acknowledged_by"`
 	AcknowledgedByEmail  *string             `json:"acknowledged_by_email"`
@@ -156,10 +161,14 @@ type AlertDetail struct {
 	Site                 string              `json:"site"`
 	Team                 string              `json:"team"`
 	TeamSource           string              `json:"team_source"`
-	AssignedTeam         *string             `json:"assigned_team,omitempty"`
-	AssignedTeamBy       *string             `json:"assigned_team_by,omitempty"`
-	AssignedTeamAt       *time.Time          `json:"assigned_team_at,omitempty"`
-	GeneratorURL         *string             `json:"generator_url"`
+	AssignedTeam           *string             `json:"assigned_team,omitempty"`
+	AssignedTeamBy         *string             `json:"assigned_team_by,omitempty"`
+	AssignedTeamAt         *time.Time          `json:"assigned_team_at,omitempty"`
+	ConfluenceURL          *string             `json:"confluence_url,omitempty"`
+	ConfluenceURLSource    string              `json:"confluence_url_source"`
+	ConfluenceURLUpdatedBy *string             `json:"confluence_url_updated_by,omitempty"`
+	ConfluenceURLUpdatedAt *time.Time          `json:"confluence_url_updated_at,omitempty"`
+	GeneratorURL           *string             `json:"generator_url"`
 	ExternalURL          *string             `json:"external_url"`
 	AcknowledgedBy       *string             `json:"acknowledged_by"`
 	AcknowledgedByEmail  *string             `json:"acknowledged_by_email"`
@@ -405,6 +414,11 @@ type AddNoteRequest struct {
 // TagTeamRequest is the payload for POST /api/v1/alerts/{id}/team.
 type TagTeamRequest struct {
 	Team string `json:"team"`
+}
+
+// UpdateConfluenceURLRequest is the payload for POST /api/v1/alerts/{id}/confluence.
+type UpdateConfluenceURLRequest struct {
+	ConfluenceURL string `json:"confluence_url"`
 }
 
 // CreateIncidentRequest is the payload for POST /api/v1/alerts/{id}/servicenow/incident.

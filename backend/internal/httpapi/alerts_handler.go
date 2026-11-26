@@ -28,14 +28,24 @@ type AlertStore interface {
 	TagAlertTeam(ctx context.Context, alertID string, op auth.OperatorContext, team string) (*model.Alert, error)
 }
 
+// ConfluenceUpdater validates and persists NOC Confluence documentation links.
+type ConfluenceUpdater interface {
+	UpdateAlertConfluenceURL(ctx context.Context, alertID string, op auth.OperatorContext, rawURL string) (*model.Alert, error)
+}
+
 // AlertsHandler handles HTTP query and triage mutations for alerts.
 type AlertsHandler struct {
-	repo AlertStore
+	repo       AlertStore
+	confluence ConfluenceUpdater
 }
 
 // NewAlertsHandler constructs an AlertsHandler.
-func NewAlertsHandler(repo AlertStore) *AlertsHandler {
-	return &AlertsHandler{repo: repo}
+func NewAlertsHandler(repo AlertStore, confluence ...ConfluenceUpdater) *AlertsHandler {
+	var conf ConfluenceUpdater
+	if len(confluence) > 0 {
+		conf = confluence[0]
+	}
+	return &AlertsHandler{repo: repo, confluence: conf}
 }
 
 // List handles GET /api/v1/alerts.
@@ -295,6 +305,31 @@ func (h *AlertsHandler) TagTeam(w http.ResponseWriter, r *http.Request) {
 	}
 	op, _ := auth.OperatorFromContext(r.Context())
 	updated, err := h.repo.TagAlertTeam(r.Context(), alertID, op, team)
+	if err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	apierror.WriteJSON(w, http.StatusOK, updated)
+}
+
+// UpdateConfluenceURL handles POST /api/v1/alerts/{alert_id}/confluence.
+func (h *AlertsHandler) UpdateConfluenceURL(w http.ResponseWriter, r *http.Request) {
+	alertID := chi.URLParam(r, "alert_id")
+	if !model.IsValidUUID(alertID) {
+		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_id must be a valid UUID."))
+		return
+	}
+	var req model.UpdateConfluenceURLRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	if h.confluence == nil {
+		apierror.Write(w, r, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Confluence documentation service is not configured."))
+		return
+	}
+	op, _ := auth.OperatorFromContext(r.Context())
+	updated, err := h.confluence.UpdateAlertConfluenceURL(r.Context(), alertID, op, req.ConfluenceURL)
 	if err != nil {
 		apierror.Write(w, r, err)
 		return

@@ -82,6 +82,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   const [selectionCapHit, setSelectionCapHit] = useState<boolean>(false);
   const [busyAlertId, setBusyAlertId] = useState<string | null>(null);
   const [drawerRefreshTrigger, setDrawerRefreshTrigger] = useState<number>(0);
+  const [focusConfluenceOnOpen, setFocusConfluenceOnOpen] = useState<boolean>(false);
 
   const [toast, setToast] = useState<{
     severity: 'success' | 'warning' | 'error' | 'info';
@@ -706,7 +707,14 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         }
         onToggleSelectAlert={handleToggleSelectAlert}
         onToggleSelectAll={handleToggleSelectAll}
-        onSelectAlert={(alert) => onSelectAlertId(alert.id)}
+        onSelectAlert={(alert) => {
+          setFocusConfluenceOnOpen(false);
+          onSelectAlertId(alert.id);
+        }}
+        onOpenConfluenceEdit={(alert) => {
+          setFocusConfluenceOnOpen(true);
+          onSelectAlertId(alert.id);
+        }}
         onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
@@ -810,11 +818,16 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         metadata={metadata}
         canTriage={canTriage}
         canWriteIncidents={canWriteSnow}
-        onClose={() => onSelectAlertId(null)}
+        onClose={() => {
+          setFocusConfluenceOnOpen(false);
+          onSelectAlertId(null);
+        }}
         onAlertUpdated={(updated) => {
+          setFocusConfluenceOnOpen(false);
           upsertAlert(updated);
           void refresh();
         }}
+        focusConfluence={focusConfluenceOnOpen}
         onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}

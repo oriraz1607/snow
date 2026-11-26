@@ -63,6 +63,7 @@ func main() {
 	snowClient := servicenow.NewClient(cfg.SnowInstanceURL, cfg.SnowHTTPTimeout, authProvider, breaker, metrics)
 
 	alertRepo := store.NewAlertRepository(pool)
+	alertRepo.SetConfluenceAllowedHosts(cfg.ConfluenceAllowedHosts)
 	snowRepo := store.NewServiceNowRepository(pool)
 	callerResolver := servicenow.NewCallerResolver(snowRepo, snowClient, cfg.DefaultCallerSysID, metrics, logger)
 
@@ -71,6 +72,7 @@ func main() {
 	}
 
 	incSvc := service.NewIncidentService(snowRepo, snowClient, callerResolver, cfg, logWriter, logger)
+	confSvc := service.NewConfluenceService(alertRepo, cfg.ConfluenceAllowedHosts)
 	workers := service.NewBackgroundWorkers(pool, snowRepo, snowClient, incSvc, cfg, metrics, logger)
 	workers.Start(rootCtx)
 
@@ -78,7 +80,7 @@ func main() {
 
 	var shuttingDown atomic.Bool
 
-	alertsHandler := httpapi.NewAlertsHandler(alertRepo)
+	alertsHandler := httpapi.NewAlertsHandler(alertRepo, confSvc)
 	snowHandler := httpapi.NewServiceNowHandler(incSvc)
 	webhooksHandler := httpapi.NewWebhooksHandler(amSvc, incSvc, cfg.AlertmanagerMaxPayloadBytes, &shuttingDown)
 	healthHandler := httpapi.NewHealthHandler(pool)

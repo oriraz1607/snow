@@ -819,6 +819,10 @@ func formatDefaultDescription(grafanaPublicURL string, alert model.AlertDetail) 
 	if runbook := strings.TrimSpace(alert.Annotations["runbook_url"]); runbook != "" {
 		fmt.Fprintf(&b, "Runbook: %s\n", runbook)
 	}
+	if alert.ConfluenceURL != nil && strings.TrimSpace(*alert.ConfluenceURL) != "" &&
+		strings.TrimSpace(*alert.ConfluenceURL) != strings.TrimSpace(alert.Annotations["runbook_url"]) {
+		fmt.Fprintf(&b, "Confluence Doc: %s\n", strings.TrimSpace(*alert.ConfluenceURL))
+	}
 	if len(alert.Labels) > 0 {
 		b.WriteString("\nLabels:\n")
 		keys := make([]string, 0, len(alert.Labels))

@@ -22,6 +22,7 @@ import {
   ServiceNowMetadataResponse,
   StateMutationRequest,
   TagTeamRequest,
+  UpdateConfluenceURLRequest,
   WorkNoteRequest,
   WorkNoteResponse,
 } from '../types/api';
@@ -281,6 +282,13 @@ export const alertApi = {
 
   tagAlertTeam(alertId: string, payload: TagTeamRequest): Promise<Alert> {
     return requestResource<Alert>(`/alerts/${encodeURIComponent(alertId)}/team`, {
+      method: 'POST',
+      data: payload,
+    });
+  },
+
+  updateConfluenceUrl(alertId: string, payload: UpdateConfluenceURLRequest): Promise<Alert> {
+    return requestResource<Alert>(`/alerts/${encodeURIComponent(alertId)}/confluence`, {
       method: 'POST',
       data: payload,
     });

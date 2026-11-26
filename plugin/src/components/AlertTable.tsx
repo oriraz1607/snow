@@ -6,6 +6,7 @@ import { Alert, AlertSort } from '../types/api';
 import {
   formatDurationBetween,
   formatRelativeTime,
+  getAlertConfluenceDoc,
   getAlertEnvironment,
   getAlertInstance,
   getAlertSite,
@@ -28,6 +29,7 @@ interface AlertTableProps {
   onToggleSelectAlert: (alertId: string) => void;
   onToggleSelectAll: (selectableIds: string[], selectAll: boolean) => void;
   onSelectAlert: (alert: Alert) => void;
+  onOpenConfluenceEdit: (alert: Alert) => void;
   onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
   onReopen: (alert: Alert) => void;
@@ -57,6 +59,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
   onToggleSelectAlert,
   onToggleSelectAll,
   onSelectAlert,
+  onOpenConfluenceEdit,
   onAcknowledge,
   onUnacknowledge,
   onReopen,
@@ -187,6 +190,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
             const env = getAlertEnvironment(alert);
             const site = getAlertSite(alert);
             const teamInfo = getAlertTeam(alert);
+            const confluenceDoc = getAlertConfluenceDoc(alert);
             const isCritical = alert.severity.toLowerCase() === 'critical';
 
             return (
@@ -239,6 +243,29 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                         onClick={() => onFilterByFingerprint(alert.fingerprint)}
                       >
                         {alert.previous_episode_count} prior
+                      </button>
+                    )}
+                    {confluenceDoc.url ? (
+                      <a
+                        href={confluenceDoc.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={styles.confluenceLink}
+                        data-testid={`confluence-link-${alert.id}`}
+                        title={`Open Confluence documentation: ${confluenceDoc.url}`}
+                      >
+                        Docs ↗
+                      </a>
+                    ) : (
+                      <button
+                        type="button"
+                        className={styles.addDocBtn}
+                        disabled={!canTriage}
+                        title={canTriage ? 'Link NOC Confluence documentation' : DISABLED_TRIAGE_REASON}
+                        data-testid={`add-confluence-btn-${alert.id}`}
+                        onClick={() => onOpenConfluenceEdit(alert)}
+                      >
+                        + Add Doc
                       </button>
                     )}
                   </div>
@@ -335,7 +362,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                           <a
                             href={inc.incident_url}
                             target="_blank"
-                            rel="noreferrer"
+                            rel="noopener noreferrer"
                             className={styles.snowLink}
                             title={inc.incident_number || 'Incident'}
                           >
@@ -658,6 +685,38 @@ const getStyles = (theme: GrafanaTheme2) => ({
 
     &:hover {
       color: ${theme.colors.text.link};
+    }
+  `,
+  confluenceLink: css`
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: ${theme.typography.fontWeightMedium};
+    color: ${theme.colors.info.text};
+    text-decoration: none;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  `,
+  addDocBtn: css`
+    flex-shrink: 0;
+    background: none;
+    border: 1px dashed ${theme.colors.border.medium};
+    border-radius: ${theme.shape.radius.default};
+    padding: 0 5px;
+    font-size: 10px;
+    line-height: 16px;
+    color: ${theme.colors.text.secondary};
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      color: ${theme.colors.text.link};
+      border-color: ${theme.colors.primary.border};
+    }
+
+    &:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
   `,
   ellipsisCell: css`

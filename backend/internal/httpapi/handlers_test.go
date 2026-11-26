@@ -598,3 +598,71 @@ func TestHardeningMiddlewareAndLegacyAuthWarning(t *testing.T) {
 		}
 	})
 }
+
+type stubConfluenceUpdater struct {
+	ret *model.Alert
+	err error
+}
+
+func (s *stubConfluenceUpdater) UpdateAlertConfluenceURL(_ context.Context, _ string, _ auth.OperatorContext, _ string) (*model.Alert, error) {
+	return s.ret, s.err
+}
+
+func TestAlertsHandlerUpdateConfluenceURL(t *testing.T) {
+	const alertUUID = "11111111-1111-4111-8111-111111111111"
+	validURL := "https://confluence.corp.example/display/NOC/HighCPU"
+
+	repo := &stubAlertStore{}
+	conf := &stubConfluenceUpdater{
+		ret: &model.Alert{
+			ID:                  alertUUID,
+			AlertName:           "HighCPU",
+			ConfluenceURL:       &validURL,
+			ConfluenceURLSource: model.ConfluenceSourceOverride,
+		},
+	}
+	h := NewAlertsHandler(repo, conf)
+	r := chi.NewRouter()
+	r.With(auth.RequirePermission(auth.PermAlertsTriage)).
+		Post("/api/v1/alerts/{alert_id}/confluence", h.UpdateConfluenceURL)
+
+	t.Run("rejects Viewer with 403 FORBIDDEN_RBAC", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/"+alertUUID+"/confluence", bytes.NewReader([]byte(`{"confluence_url":"https://confluence.corp.example/page"}`)))
+		req = req.WithContext(auth.WithOperator(req.Context(), auth.OperatorContext{Login: "viewer", Role: "Viewer"}))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for Viewer, got %d (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("rejects invalid UUID and propagates service validation error", func(t *testing.T) {
+		badIDReq := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/not-a-uuid/confluence", bytes.NewReader([]byte(`{"confluence_url":"https://confluence.corp.example/page"}`)))
+		badIDReq = badIDReq.WithContext(auth.WithOperator(badIDReq.Context(), auth.OperatorContext{Login: "editor", Role: "Editor"}))
+		badIDRec := httptest.NewRecorder()
+		r.ServeHTTP(badIDRec, badIDReq)
+		if badIDRec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid UUID, got %d", badIDRec.Code)
+		}
+
+		conf.err = apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "confluence_url must use the https:// scheme")
+		badURLReq := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/"+alertUUID+"/confluence", bytes.NewReader([]byte(`{"confluence_url":"http://insecure.example"}`)))
+		badURLReq = badURLReq.WithContext(auth.WithOperator(badURLReq.Context(), auth.OperatorContext{Login: "editor", Role: "Editor"}))
+		badURLRec := httptest.NewRecorder()
+		r.ServeHTTP(badURLRec, badURLReq)
+		if badURLRec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for insecure URL, got %d", badURLRec.Code)
+		}
+	})
+
+	t.Run("allows Editor to save valid HTTPS Confluence URL", func(t *testing.T) {
+		conf.err = nil
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/"+alertUUID+"/confluence", bytes.NewReader([]byte(`{"confluence_url":"`+validURL+`"}`)))
+		req = req.WithContext(auth.WithOperator(req.Context(), auth.OperatorContext{Login: "editor", Role: "Editor"}))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), validURL) {
+			t.Fatalf("expected 200 OK with Confluence URL, got %d (%s)", rec.Code, rec.Body.String())
+		}
+	})
+}

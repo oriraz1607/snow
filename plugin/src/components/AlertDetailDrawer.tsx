@@ -24,11 +24,13 @@ import {
   formatDurationSeconds,
   formatRelativeTime,
   formatUtcTimestamp,
+  getAlertConfluenceDoc,
   getAlertEnvironment,
   getAlertInstance,
   getAlertSite,
   getAlertTeam,
   getOpenIncidentDismissBlockReason,
+  isValidHttpsUrl,
 } from '../utils/format';
 import {
   displayStateColor,
@@ -58,6 +60,7 @@ interface AlertDetailDrawerProps {
   onOpenWorkNote: (alert: Alert, initialText?: string) => void;
   onSyncIncident: (alert: Alert) => Promise<void>;
   onSelectEpisodeId: (alertId: string) => void;
+  focusConfluence?: boolean;
   refreshTrigger: number;
 }
 
@@ -81,6 +84,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   onOpenWorkNote,
   onSyncIncident,
   onSelectEpisodeId,
+  focusConfluence = false,
   refreshTrigger,
 }) => {
   const theme = useTheme2();
@@ -98,6 +102,11 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   const [teamInput, setTeamInput] = useState('');
   const [savingTeam, setSavingTeam] = useState(false);
   const [teamError, setTeamError] = useState<string | null>(null);
+
+  const [editingConfluence, setEditingConfluence] = useState(false);
+  const [confluenceInput, setConfluenceInput] = useState('');
+  const [savingConfluence, setSavingConfluence] = useState(false);
+  const [confluenceError, setConfluenceError] = useState<string | null>(null);
 
   const loadDrawerData = useCallback(async (id: string, signal?: AbortSignal) => {
     setLoading(true);
@@ -125,6 +134,11 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   }, []);
 
   useEffect(() => {
+    setEditingConfluence(Boolean(alertId && focusConfluence));
+    setConfluenceError(null);
+  }, [alertId, focusConfluence]);
+
+  useEffect(() => {
     if (!alertId) {
       setDetail(null);
       setHistory(null);
@@ -132,6 +146,9 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
       setEditingTeam(false);
       setTeamInput('');
       setTeamError(null);
+      setEditingConfluence(false);
+      setConfluenceInput('');
+      setConfluenceError(null);
       return;
     }
     setEditingTeam(false);
@@ -182,6 +199,31 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
     }
   };
 
+  const handleSaveConfluenceUrl = async (rawUrl: string) => {
+    if (!detail || savingConfluence) {
+      return;
+    }
+    const trimmed = rawUrl.trim();
+    if (!isValidHttpsUrl(trimmed)) {
+      setConfluenceError('Please enter a valid https:// Confluence URL.');
+      return;
+    }
+    setSavingConfluence(true);
+    setConfluenceError(null);
+    try {
+      const updated = await alertApi.updateConfluenceUrl(detail.id, { confluence_url: trimmed });
+      onAlertUpdated(updated);
+      setEditingConfluence(false);
+      setConfluenceInput('');
+      await loadDrawerData(detail.id);
+    } catch (err) {
+      const apiErr = err as ApiClientError;
+      setConfluenceError(apiErr?.message || 'Failed to save Confluence documentation URL.');
+    } finally {
+      setSavingConfluence(false);
+    }
+  };
+
   const handleLoadMoreEpisodes = async () => {
     if (!detail || !history || loadingMoreEpisodes || !history.has_more) {
       return;
@@ -224,6 +266,9 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
     : '';
 
   const teamInfo = detail ? getAlertTeam(detail) : { team: '', source: 'none' as const, taggedBy: null };
+  const confluenceDoc = detail
+    ? getAlertConfluenceDoc(detail)
+    : { url: null, source: 'none' as const, updatedBy: null };
   const suggestedTeams = Array.from(
     new Set([
       'observability',
@@ -388,6 +433,106 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
             )}
           </div>
 
+          <div className={styles.teamCard} data-testid="drawer-confluence-section">
+            <div className={styles.teamHeaderRow}>
+              <div>
+                <div className={styles.teamLabel}>Confluence Documentation</div>
+                {confluenceDoc.url ? (
+                  <div className={styles.teamValueRow}>
+                    <a
+                      href={confluenceDoc.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={styles.externalLinkBtn}
+                      data-testid="drawer-confluence-link"
+                    >
+                      Open Confluence Doc ↗
+                    </a>
+                    <Badge
+                      text={
+                        confluenceDoc.source === 'noc_override'
+                          ? 'NOC Link'
+                          : confluenceDoc.source === 'annotation'
+                            ? 'Annotation'
+                            : 'Runbook'
+                      }
+                      color={confluenceDoc.source === 'noc_override' ? 'purple' : 'blue'}
+                    />
+                    {confluenceDoc.updatedBy && (
+                      <span className={styles.metaText}>
+                        Updated by <strong>{confluenceDoc.updatedBy}</strong>
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <div className={styles.teamMissingText}>
+                    No Confluence documentation linked for <code>{detail.alert_name}</code>. Add a valid <code>https://</code> Confluence URL below:
+                  </div>
+                )}
+              </div>
+
+              {confluenceDoc.url && !editingConfluence && (
+                <GatedButton
+                  allowed={canTriage}
+                  disabledReason={DISABLED_TRIAGE_REASON}
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setConfluenceInput(confluenceDoc.url ?? '');
+                    setConfluenceError(null);
+                    setEditingConfluence(true);
+                  }}
+                >
+                  Update Link
+                </GatedButton>
+              )}
+            </div>
+
+            {(!confluenceDoc.url || editingConfluence) && (
+              <div className={styles.teamFormBox}>
+                {confluenceError && (
+                  <div style={{ marginBottom: '8px' }} data-testid="drawer-confluence-error">
+                    <GrafanaAlert severity="error" title="Unable to save Confluence URL">
+                      {confluenceError}
+                    </GrafanaAlert>
+                  </div>
+                )}
+                <div className={styles.teamInputRow}>
+                  <Input
+                    aria-label="Confluence documentation URL"
+                    placeholder="https://confluence.example.com/display/NOC/..."
+                    value={confluenceInput}
+                    disabled={!canTriage || savingConfluence}
+                    onChange={(e) => setConfluenceInput(e.currentTarget.value)}
+                  />
+                  <GatedButton
+                    allowed={canTriage}
+                    disabledReason={DISABLED_TRIAGE_REASON}
+                    variant="primary"
+                    size="sm"
+                    disabled={savingConfluence || !confluenceInput.trim()}
+                    onClick={() => void handleSaveConfluenceUrl(confluenceInput)}
+                  >
+                    {savingConfluence ? 'Saving...' : 'Save Confluence URL'}
+                  </GatedButton>
+                  {editingConfluence && confluenceDoc.url && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={savingConfluence}
+                      onClick={() => {
+                        setEditingConfluence(false);
+                        setConfluenceError(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
           {detail.incident_drift_status === 'resolved_open_ticket' && inc && (
             <div className={styles.section} data-testid="drawer-drift-banner">
               <GrafanaAlert severity="warning" title="Alert Resolved — ServiceNow Incident Still Open">
@@ -422,7 +567,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                     <a
                       href={inc.incident_url}
                       target="_blank"
-                      rel="noreferrer"
+                      rel="noopener noreferrer"
                       className={styles.externalLinkBtn}
                     >
                       Open in ServiceNow ↗
@@ -631,15 +776,21 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
 
               <div className={styles.linksRow}>
                 {detail.generator_url && (
-                  <a href={detail.generator_url} target="_blank" rel="noreferrer">
+                  <a href={detail.generator_url} target="_blank" rel="noopener noreferrer">
                     Open in Prometheus ↗
                   </a>
                 )}
-                {detail.annotations?.runbook_url && (
-                  <a href={detail.annotations.runbook_url} target="_blank" rel="noreferrer">
-                    Open Runbook ↗
+                {confluenceDoc.url && (
+                  <a href={confluenceDoc.url} target="_blank" rel="noopener noreferrer">
+                    Open Confluence Doc ↗
                   </a>
                 )}
+                {detail.annotations?.runbook_url &&
+                  detail.annotations.runbook_url !== confluenceDoc.url && (
+                    <a href={detail.annotations.runbook_url} target="_blank" rel="noopener noreferrer">
+                      Open Runbook ↗
+                    </a>
+                  )}
               </div>
 
               <h4 className={styles.subheading}>Labels</h4>
@@ -703,7 +854,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                             {ep.incident_number && (
                               <span>
                                 {ep.incident_url ? (
-                                  <a href={ep.incident_url} target="_blank" rel="noreferrer">
+                                  <a href={ep.incident_url} target="_blank" rel="noopener noreferrer">
                                     {ep.incident_number} ↗
                                   </a>
                                 ) : (
@@ -800,7 +951,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                       Post Work Note
                     </GatedButton>
                     {inc.incident_url && (
-                      <a href={inc.incident_url} target="_blank" rel="noreferrer" className={styles.externalLinkBtn}>
+                      <a href={inc.incident_url} target="_blank" rel="noopener noreferrer" className={styles.externalLinkBtn}>
                         Open in ServiceNow ↗
                       </a>
                     )}
@@ -892,7 +1043,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                             <div className={styles.metaText}>
                               Ticket:{' '}
                               {ep.incident_url ? (
-                                <a href={ep.incident_url} target="_blank" rel="noreferrer">
+                                <a href={ep.incident_url} target="_blank" rel="noopener noreferrer">
                                   {ep.incident_number} ↗
                                 </a>
                               ) : (

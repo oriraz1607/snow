@@ -52,6 +52,7 @@ jest.mock('../api/client', () => {
       reopenAlert: jest.fn(),
       addNote: jest.fn(),
       tagAlertTeam: jest.fn(),
+      updateConfluenceUrl: jest.fn(),
       getServiceNowMetadata: jest.fn(),
       createIncident: jest.fn(),
       createBulkIncident: jest.fn(),
@@ -203,6 +204,7 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     mockedApi.createIncident.mockReset();
     mockedApi.createBulkIncident.mockReset();
     mockedApi.tagAlertTeam.mockReset();
+    mockedApi.updateConfluenceUrl.mockReset();
     mockedApi.getAlert.mockReset();
     mockedApi.getAlertHistory.mockReset();
     setMockGrafanaUser('Editor');
@@ -1392,5 +1394,112 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
         expect.any(AbortSignal)
       )
     );
+  });
+
+  it('supports one-click Confluence doc links, unlinked fallback creation, URL validation, and Viewer RBAC', async () => {
+    const user = userEvent.setup();
+    const linkedAlert = makeAlert({
+      id: '11111111-1111-4111-8111-111111111111',
+      alert_name: 'LinkedDocAlert',
+      confluence_url: 'https://confluence.corp.example/display/NOC/LinkedDoc',
+      confluence_url_source: 'noc_override',
+      confluence_url_updated_by: 'alice.smith',
+    });
+    const unlinkedAlert = makeAlert({
+      id: '22222222-2222-4222-8222-222222222222',
+      alert_name: 'UnlinkedDocAlert',
+      confluence_url: null,
+      confluence_url_source: 'none',
+    });
+    const newlyLinked = makeAlert({
+      ...unlinkedAlert,
+      confluence_url: 'https://confluence.corp.example/display/NOC/UnlinkedDoc',
+      confluence_url_source: 'noc_override',
+      confluence_url_updated_by: 'editor.user',
+    });
+
+    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([linkedAlert, unlinkedAlert]));
+    mockedApi.getAlert
+      .mockResolvedValueOnce(makeDetail(unlinkedAlert))
+      .mockResolvedValueOnce(makeDetail(newlyLinked))
+      .mockResolvedValueOnce(makeDetail(unlinkedAlert));
+    mockedApi.getAlertHistory.mockResolvedValue({
+      alert_id: unlinkedAlert.id,
+      fingerprint: unlinkedAlert.fingerprint,
+      audit_events: [],
+      previous_episodes: [],
+    });
+    mockedApi.updateConfluenceUrl.mockResolvedValueOnce(newlyLinked);
+
+    const Wrapper: React.FC = () => {
+      const [selectedId, setSelectedId] = React.useState<string | null>(null);
+      return (
+        <AlertQueuePage
+          pluginSettings={{ pollIntervalSeconds: 60 }}
+          selectedAlertId={selectedId}
+          onSelectAlertId={setSelectedId}
+        />
+      );
+    };
+
+    const { unmount } = render(<Wrapper />);
+    await waitFor(() => expect(screen.getByText('LinkedDocAlert')).toBeInTheDocument());
+
+    // Linked alert exposes direct validated link with target="_blank" and rel="noopener noreferrer"
+    const directLink = screen.getByTestId(`confluence-link-${linkedAlert.id}`);
+    expect(directLink).toHaveAttribute('href', 'https://confluence.corp.example/display/NOC/LinkedDoc');
+    expect(directLink).toHaveAttribute('target', '_blank');
+    expect(directLink).toHaveAttribute('rel', 'noopener noreferrer');
+
+    // Unlinked alert shows + Add Doc fallback -> opens drawer Confluence form
+    const addBtn = screen.getByTestId(`add-confluence-btn-${unlinkedAlert.id}`);
+    await user.click(addBtn);
+
+    const confSection = await screen.findByTestId('drawer-confluence-section');
+    const urlInput = within(confSection).getByLabelText('Confluence documentation URL');
+
+    // Rejects insecure http:// URL client-side before sending
+    await user.type(urlInput, 'http://insecure.example/page');
+    await user.click(within(confSection).getByRole('button', { name: 'Save Confluence URL' }));
+    expect(await within(confSection).findByTestId('drawer-confluence-error')).toHaveTextContent(
+      'https://'
+    );
+    expect(mockedApi.updateConfluenceUrl).not.toHaveBeenCalled();
+
+    // Accepts valid https:// URL and persists via API
+    await user.clear(urlInput);
+    await user.type(urlInput, 'https://confluence.corp.example/display/NOC/UnlinkedDoc');
+    await user.click(within(confSection).getByRole('button', { name: 'Save Confluence URL' }));
+
+    await waitFor(() =>
+      expect(mockedApi.updateConfluenceUrl).toHaveBeenCalledWith(unlinkedAlert.id, {
+        confluence_url: 'https://confluence.corp.example/display/NOC/UnlinkedDoc',
+      })
+    );
+    const savedLink = await within(confSection).findByTestId('drawer-confluence-link');
+    expect(savedLink).toHaveAttribute(
+      'href',
+      'https://confluence.corp.example/display/NOC/UnlinkedDoc'
+    );
+    expect(savedLink).toHaveAttribute('rel', 'noopener noreferrer');
+    unmount();
+
+    // Viewer cannot add/update Confluence URLs
+    setMockGrafanaUser('Viewer', { [RBAC_ACTIONS.ALERTS_READ]: true });
+    render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={unlinkedAlert.id}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId(`add-confluence-btn-${unlinkedAlert.id}`)).toBeDisabled()
+    );
+    const viewerSection = await screen.findByTestId('drawer-confluence-section');
+    expect(within(viewerSection).getByLabelText('Confluence documentation URL')).toBeDisabled();
+    expect(
+      within(viewerSection).getByRole('button', { name: 'Save Confluence URL' })
+    ).toBeDisabled();
   });
 });
