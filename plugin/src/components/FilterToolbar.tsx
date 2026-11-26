@@ -12,6 +12,7 @@ export interface FilterState {
   environment: string;
   site: string;
   team: string;
+  instance: string;
   labels: string[];
   sort: AlertSort;
   fingerprint: string;
@@ -36,8 +37,13 @@ const SEVERITY_OPTIONS = ['critical', 'warning'];
 
 const SORT_OPTIONS: Array<SelectableValue<AlertSort>> = [
   { label: 'Highest Severity First', value: 'severity_desc' },
+  { label: 'Lowest Severity First', value: 'severity_asc' },
   { label: 'Newest Firing First', value: 'starts_at_desc' },
   { label: 'Oldest Firing First', value: 'starts_at_asc' },
+  { label: 'Alert Name (A → Z)', value: 'alert_name_asc' },
+  { label: 'Alert Name (Z → A)', value: 'alert_name_desc' },
+  { label: 'Instance (A → Z)', value: 'instance_asc' },
+  { label: 'Instance (Z → A)', value: 'instance_desc' },
   { label: 'Recently Resolved First', value: 'resolved_at_desc' },
 ];
 
@@ -121,6 +127,17 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
     [filterOptions.teams, filters.team]
   );
 
+  const instanceOptions = useMemo(
+    () =>
+      buildSelectOptions(
+        'Instance: All',
+        'Instance: ',
+        filterOptions.instances ?? [],
+        filters.instance
+      ),
+    [filterOptions.instances, filters.instance]
+  );
+
   const toggleSeverity = (sev: string) => {
     const exists = filters.severities.includes(sev);
     const next = exists ? filters.severities.filter((s) => s !== sev) : [...filters.severities, sev];
@@ -148,6 +165,7 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
     Boolean(filters.environment) ||
     Boolean(filters.site) ||
     Boolean(filters.team) ||
+    Boolean(filters.instance) ||
     filters.labels.length > 0 ||
     Boolean(filters.fingerprint) ||
     Boolean(filters.timeRange);
@@ -157,7 +175,7 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
       <div className={styles.row}>
         <div className={styles.searchBox}>
           <Input
-            placeholder="Search alert name, team, summary, fingerprint, or INC..."
+            placeholder="Search alert name, instance, team, summary, fingerprint, or INC..."
             value={searchInput}
             onChange={(e) => setSearchInput(e.currentTarget.value)}
             onKeyDown={(e) => {
@@ -209,6 +227,21 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
               onChangeFilters({
                 ...filters,
                 team: opt.value ?? '',
+              })
+            }
+          />
+        </div>
+
+        <div className={styles.instanceSelectBox}>
+          <Select
+            aria-label="Filter by instance"
+            options={instanceOptions}
+            value={filters.instance}
+            isSearchable
+            onChange={(opt) =>
+              onChangeFilters({
+                ...filters,
+                instance: opt.value ?? '',
               })
             }
           />
@@ -372,11 +405,15 @@ const getStyles = (theme: GrafanaTheme2) => ({
     min-width: 135px;
   `,
   teamSelectBox: css`
-    flex: 0 1 180px;
-    min-width: 150px;
+    flex: 0 1 175px;
+    min-width: 145px;
+  `,
+  instanceSelectBox: css`
+    flex: 0 1 195px;
+    min-width: 160px;
   `,
   sortSelectBox: css`
-    flex: 0 1 195px;
+    flex: 0 1 200px;
     min-width: 170px;
   `,
   labelInputGroup: css`

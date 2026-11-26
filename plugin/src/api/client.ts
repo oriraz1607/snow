@@ -168,6 +168,9 @@ export function buildAlertsQueryString(query: ListAlertsQuery): string {
   if (query.teams && query.teams.length > 0) {
     params.set('team', query.teams.join(','));
   }
+  if (query.instances && query.instances.length > 0) {
+    params.set('instance', query.instances.join(','));
+  }
   if (query.incident_drift && query.incident_drift !== 'all') {
     params.set('incident_drift', query.incident_drift);
   }

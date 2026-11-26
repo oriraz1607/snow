@@ -271,8 +271,8 @@ func TestAlertsHandlerListDefaultsAndSeverityFilter(t *testing.T) {
 		})
 	}
 
-	t.Run("parses env, site, team, and search query filters", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?state=firing&env=prod,staging&site=eu-west-1&team=core-db,__untagged__&search=observability", nil)
+	t.Run("parses env, site, team, instance, sort, and search query filters", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?state=firing&env=prod,staging&site=eu-west-1&team=core-db,__untagged__&instance=web-01:9100,db-02:9100&sort=instance_asc&search=observability", nil)
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 
@@ -288,8 +288,35 @@ func TestAlertsHandlerListDefaultsAndSeverityFilter(t *testing.T) {
 		if len(repo.lastFilter.Teams) != 2 || repo.lastFilter.Teams[0] != "core-db" || repo.lastFilter.Teams[1] != "__untagged__" {
 			t.Fatalf("expected teams [core-db __untagged__], got %+v", repo.lastFilter.Teams)
 		}
+		if len(repo.lastFilter.Instances) != 2 || repo.lastFilter.Instances[0] != "web-01:9100" || repo.lastFilter.Instances[1] != "db-02:9100" {
+			t.Fatalf("expected instances [web-01:9100 db-02:9100], got %+v", repo.lastFilter.Instances)
+		}
+		if repo.lastFilter.Sort != model.SortInstanceAsc {
+			t.Fatalf("expected sort %q, got %q", model.SortInstanceAsc, repo.lastFilter.Sort)
+		}
 		if repo.lastFilter.Search != "observability" {
 			t.Fatalf("expected search 'observability', got %q", repo.lastFilter.Search)
+		}
+
+		for _, sortOpt := range []string{
+			model.SortSeverityAsc,
+			model.SortAlertNameAsc,
+			model.SortAlertNameDesc,
+			model.SortInstanceDesc,
+		} {
+			sReq := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?sort="+sortOpt, nil)
+			sRec := httptest.NewRecorder()
+			r.ServeHTTP(sRec, sReq)
+			if sRec.Code != http.StatusOK || repo.lastFilter.Sort != sortOpt {
+				t.Fatalf("expected 200 OK for sort=%s, got code=%d sort=%q", sortOpt, sRec.Code, repo.lastFilter.Sort)
+			}
+		}
+
+		badReq := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?sort=invalid_sort", nil)
+		badRec := httptest.NewRecorder()
+		r.ServeHTTP(badRec, badReq)
+		if badRec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for unsupported sort, got %d", badRec.Code)
 		}
 	})
 }

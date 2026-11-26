@@ -315,7 +315,15 @@ func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 		filter.Sort = model.SortSeverityDesc
 	}
 	switch filter.Sort {
-	case model.SortStartsAtDesc, model.SortStartsAtAsc, model.SortSeverityDesc, model.SortResolvedAtDesc:
+	case model.SortStartsAtDesc,
+		model.SortStartsAtAsc,
+		model.SortSeverityDesc,
+		model.SortSeverityAsc,
+		model.SortAlertNameAsc,
+		model.SortAlertNameDesc,
+		model.SortInstanceAsc,
+		model.SortInstanceDesc,
+		model.SortResolvedAtDesc:
 	default:
 		return filter, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Unsupported sort parameter.")
 	}
@@ -364,6 +372,7 @@ func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 	filter.Environments = parseCSVFilterValues(q["env"], q["environment"])
 	filter.Sites = parseCSVFilterValues(q["site"])
 	filter.Teams = parseCSVFilterValues(q["team"])
+	filter.Instances = parseCSVFilterValues(q["instance"])
 
 	if rawHas := strings.TrimSpace(q.Get("has_incident")); rawHas != "" {
 		b, err := strconv.ParseBool(rawHas)

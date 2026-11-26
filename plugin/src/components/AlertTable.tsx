@@ -2,11 +2,12 @@ import React from 'react';
 import { css } from '@emotion/css';
 import { GrafanaTheme2 } from '@grafana/data';
 import { Button, Spinner, Tooltip, useTheme2 } from '@grafana/ui';
-import { Alert } from '../types/api';
+import { Alert, AlertSort } from '../types/api';
 import {
   formatDurationBetween,
   formatRelativeTime,
   getAlertEnvironment,
+  getAlertInstance,
   getAlertSite,
   getAlertTeam,
   isAlertSelectableForBulk,
@@ -22,6 +23,8 @@ interface AlertTableProps {
   selectedAlertIds: Set<string>;
   maxBulkSelection?: number;
   showServiceNowColumn: boolean;
+  sort: AlertSort;
+  onChangeSort: (nextSort: AlertSort) => void;
   onToggleSelectAlert: (alertId: string) => void;
   onToggleSelectAll: (selectableIds: string[], selectAll: boolean) => void;
   onSelectAlert: (alert: Alert) => void;
@@ -49,6 +52,8 @@ export const AlertTable: React.FC<AlertTableProps> = ({
   selectedAlertIds,
   maxBulkSelection = 50,
   showServiceNowColumn,
+  sort,
+  onChangeSort,
   onToggleSelectAlert,
   onToggleSelectAll,
   onSelectAlert,
@@ -90,18 +95,52 @@ export const AlertTable: React.FC<AlertTableProps> = ({
     (selectableIds.every((id) => selectedAlertIds.has(id)) ||
       (atSelectionCap && selectableIds.some((id) => selectedAlertIds.has(id))));
 
+  const getSortDirection = (ascSort: AlertSort, descSort: AlertSort): 'ascending' | 'descending' | 'none' => {
+    if (sort === ascSort) {
+      return 'ascending';
+    }
+    if (sort === descSort) {
+      return 'descending';
+    }
+    return 'none';
+  };
+
+  const renderSortButton = (
+    label: string,
+    ascSort: AlertSort,
+    descSort: AlertSort,
+    defaultSort: AlertSort
+  ) => {
+    const dir = getSortDirection(ascSort, descSort);
+    const nextSort = sort === defaultSort ? (defaultSort === ascSort ? descSort : ascSort) : defaultSort;
+    return (
+      <button
+        type="button"
+        className={`${styles.sortHeaderBtn} ${dir !== 'none' ? styles.sortHeaderBtnActive : ''}`}
+        onClick={() => onChangeSort(nextSort)}
+        data-testid={`sort-header-${label.toLowerCase()}`}
+      >
+        <span>{label}</span>
+        <span aria-hidden="true" className={styles.sortIndicator}>
+          {dir === 'ascending' ? '↑' : dir === 'descending' ? '↓' : '⇅'}
+        </span>
+      </button>
+    );
+  };
+
   return (
     <div className={styles.tableWrapper}>
       <table className={styles.table} aria-label="Alert queue table">
         <colgroup>
           <col style={{ width: '36px' }} />
-          <col style={{ width: '92px' }} />
+          <col style={{ width: '96px' }} />
           <col />
+          <col style={{ width: '160px' }} />
           <col style={{ width: '76px' }} />
-          <col style={{ width: '104px' }} />
-          <col style={{ width: '124px' }} />
-          <col style={{ width: '92px' }} />
-          {showServiceNowColumn && <col style={{ width: '152px' }} />}
+          <col style={{ width: '100px' }} />
+          <col style={{ width: '118px' }} />
+          <col style={{ width: '96px' }} />
+          {showServiceNowColumn && <col style={{ width: '148px' }} />}
           <col style={{ width: '48px' }} />
         </colgroup>
         <thead>
@@ -115,12 +154,21 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                 onChange={(e) => onToggleSelectAll(selectableIds, e.currentTarget.checked)}
               />
             </th>
-            <th>Severity</th>
-            <th>Alert</th>
+            <th aria-sort={getSortDirection('severity_asc', 'severity_desc')}>
+              {renderSortButton('Severity', 'severity_asc', 'severity_desc', 'severity_desc')}
+            </th>
+            <th aria-sort={getSortDirection('alert_name_asc', 'alert_name_desc')}>
+              {renderSortButton('Alert', 'alert_name_asc', 'alert_name_desc', 'alert_name_asc')}
+            </th>
+            <th aria-sort={getSortDirection('instance_asc', 'instance_desc')}>
+              {renderSortButton('Instance', 'instance_asc', 'instance_desc', 'instance_asc')}
+            </th>
             <th>Env</th>
             <th>Site</th>
             <th>Team</th>
-            <th>Duration</th>
+            <th aria-sort={getSortDirection('starts_at_asc', 'starts_at_desc')}>
+              {renderSortButton('Duration', 'starts_at_asc', 'starts_at_desc', 'starts_at_desc')}
+            </th>
             {showServiceNowColumn && <th>ServiceNow</th>}
             <th className={styles.actionsHeaderCell}>
               <span className={styles.srOnly}>Actions</span>
@@ -135,6 +183,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
             const isBusy = busyAlertId === alert.id;
             const selectable = isAlertSelectableForBulk(alert);
             const checked = selectedAlertIds.has(alert.id);
+            const instance = getAlertInstance(alert);
             const env = getAlertEnvironment(alert);
             const site = getAlertSite(alert);
             const teamInfo = getAlertTeam(alert);
@@ -197,6 +246,16 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                     <div className={styles.summaryText} title={alert.annotations.summary}>
                       {alert.annotations.summary}
                     </div>
+                  )}
+                </td>
+
+                <td className={styles.ellipsisCell}>
+                  {instance ? (
+                    <span className={styles.metaText} title={instance}>
+                      {instance}
+                    </span>
+                  ) : (
+                    <span className={styles.mutedDash}>—</span>
                   )}
                 </td>
 
@@ -437,12 +496,13 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   tableWrapper: css`
     width: 100%;
+    max-width: 100%;
     border: 1px solid ${theme.colors.border.medium};
     border-radius: ${theme.shape.radius.default};
     background: ${theme.colors.background.primary};
     overflow-x: visible;
 
-    @media (max-width: 920px) {
+    @media (max-width: 1080px) {
       overflow-x: auto;
     }
   `,
@@ -452,8 +512,8 @@ const getStyles = (theme: GrafanaTheme2) => ({
     border-collapse: collapse;
     font-size: ${theme.typography.bodySmall.fontSize};
 
-    @media (max-width: 920px) {
-      min-width: 820px;
+    @media (max-width: 1080px) {
+      min-width: 980px;
     }
 
     th {
@@ -479,6 +539,32 @@ const getStyles = (theme: GrafanaTheme2) => ({
       border-bottom: 1px solid ${theme.colors.border.weak};
       vertical-align: middle;
     }
+  `,
+  sortHeaderBtn: css`
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    cursor: pointer;
+    max-width: 100%;
+
+    &:hover {
+      color: ${theme.colors.text.primary};
+    }
+  `,
+  sortHeaderBtnActive: css`
+    color: ${theme.colors.text.primary};
+  `,
+  sortIndicator: css`
+    font-size: 10px;
+    opacity: 0.75;
   `,
   checkboxCell: css`
     text-align: center !important;

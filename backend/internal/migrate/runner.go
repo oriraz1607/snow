@@ -14,7 +14,7 @@ import (
 )
 
 // ExpectedSchemaVersion is verified by /readyz against schema_migrations.
-const ExpectedSchemaVersion = 5
+const ExpectedSchemaVersion = 6
 
 const migrationAdvisoryLockID int64 = 728394015
 

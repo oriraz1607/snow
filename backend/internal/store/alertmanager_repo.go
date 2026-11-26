@@ -111,15 +111,16 @@ func reconcileOneAlert(ctx context.Context, tx pgx.Tx, logger *slog.Logger, inco
 					SET labels = $2::jsonb,
 						annotations = $3::jsonb,
 						alert_name = $4,
-						severity = $5,
-						group_key = $6,
-						receiver = $7,
-						generator_url = $8,
-						external_url = $9,
+						instance = $5,
+						severity = $6,
+						group_key = $7,
+						receiver = $8,
+						generator_url = $9,
+						external_url = $10,
 						last_received_at = NOW(),
 						delivery_count = delivery_count + 1
 					WHERE id = $1::uuid
-				`, exactID, string(labelsJSON), string(annJSON), incoming.AlertName, incoming.Severity,
+				`, exactID, string(labelsJSON), string(annJSON), incoming.AlertName, incoming.Instance, incoming.Severity,
 					incoming.GroupKey, incoming.Receiver, incoming.GeneratorURL, incoming.ExternalURL); err != nil {
 					return out, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update alert episode.").WithCause(err)
 				}
@@ -330,14 +331,14 @@ func reconcileOneAlert(ctx context.Context, tx pgx.Tx, logger *slog.Logger, inco
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO alerts (
 			fingerprint, starts_at, ends_at, state, version,
-			alert_name, severity, group_key, receiver,
+			alert_name, instance, severity, group_key, receiver,
 			labels, annotations, generator_url, external_url, resolved_at,
 			assigned_team, assigned_team_by, assigned_team_at
 		)
-		VALUES ($1, $2, $3, 'resolved', 1, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, 'resolved', 1, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15, $16)
 		RETURNING id::text
 	`, incoming.Fingerprint, incoming.StartsAt, incoming.EndsAt,
-		incoming.AlertName, incoming.Severity, incoming.GroupKey, incoming.Receiver,
+		incoming.AlertName, incoming.Instance, incoming.Severity, incoming.GroupKey, incoming.Receiver,
 		string(labelsJSON), string(annJSON), incoming.GeneratorURL, incoming.ExternalURL, resolvedAt,
 		assignedTeam, assignedTeamBy, assignedTeamAt,
 	).Scan(&newID); err != nil {
@@ -365,14 +366,14 @@ func insertNewFiringAlertTx(ctx context.Context, tx pgx.Tx, incoming model.Norma
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO alerts (
 			fingerprint, starts_at, ends_at, state, version,
-			alert_name, severity, group_key, receiver,
+			alert_name, instance, severity, group_key, receiver,
 			labels, annotations, generator_url, external_url,
 			assigned_team, assigned_team_by, assigned_team_at
 		)
-		VALUES ($1, $2, $3, 'firing', 1, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, 'firing', 1, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15)
 		RETURNING id::text
 	`, incoming.Fingerprint, incoming.StartsAt, incoming.EndsAt,
-		incoming.AlertName, incoming.Severity, incoming.GroupKey, incoming.Receiver,
+		incoming.AlertName, incoming.Instance, incoming.Severity, incoming.GroupKey, incoming.Receiver,
 		string(labelsJSON), string(annJSON), incoming.GeneratorURL, incoming.ExternalURL,
 		assignedTeam, assignedTeamBy, assignedTeamAt,
 	).Scan(&newID); err != nil {

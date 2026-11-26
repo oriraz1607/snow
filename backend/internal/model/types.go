@@ -89,6 +89,11 @@ const (
 	SortStartsAtDesc   = "starts_at_desc"
 	SortStartsAtAsc    = "starts_at_asc"
 	SortSeverityDesc   = "severity_desc"
+	SortSeverityAsc    = "severity_asc"
+	SortAlertNameAsc   = "alert_name_asc"
+	SortAlertNameDesc  = "alert_name_desc"
+	SortInstanceAsc    = "instance_asc"
+	SortInstanceDesc   = "instance_desc"
 	SortResolvedAtDesc = "resolved_at_desc"
 )
 
@@ -100,8 +105,9 @@ type Alert struct {
 	EndsAt              *time.Time        `json:"ends_at"`
 	State               AlertState        `json:"state"`
 	Version             int               `json:"version"`
-	AlertName           string            `json:"alert_name"`
-	Severity            string            `json:"severity"`
+	AlertName            string              `json:"alert_name"`
+	Instance             string              `json:"instance"`
+	Severity             string              `json:"severity"`
 	GroupKey            string            `json:"group_key,omitempty"`
 	Receiver            string            `json:"receiver,omitempty"`
 	Labels               map[string]string   `json:"labels"`
@@ -140,6 +146,7 @@ type AlertDetail struct {
 	State                AlertState          `json:"state"`
 	Version              int                 `json:"version"`
 	AlertName            string              `json:"alert_name"`
+	Instance             string              `json:"instance"`
 	Severity             string              `json:"severity"`
 	GroupKey             string              `json:"group_key"`
 	Receiver             string              `json:"receiver"`
@@ -283,11 +290,12 @@ type SummaryCounts struct {
 	ActiveClosedTicket          int64 `json:"active_closed_ticket"`
 }
 
-// FilterOptions holds distinct environment, site, and team filter choices present in the alert store.
+// FilterOptions holds distinct environment, site, team, and instance filter choices present in the alert store.
 type FilterOptions struct {
 	Environments []string `json:"environments"`
 	Sites        []string `json:"sites"`
 	Teams        []string `json:"teams"`
+	Instances    []string `json:"instances"`
 }
 
 // ListAlertsResponse is returned by GET /api/v1/alerts.
@@ -307,6 +315,7 @@ type ListAlertsFilter struct {
 	Environments          []string
 	Sites                 []string
 	Teams                 []string
+	Instances             []string
 	IncidentDrift         string
 	HasIncident           *bool
 	Fingerprint           string
@@ -326,6 +335,9 @@ type PageCursor struct {
 	ResolvedAt   *time.Time `json:"resolved_at,omitempty"`
 	ResolvedNull bool       `json:"resolved_null,omitempty"`
 	SeverityRank *int       `json:"severity_rank,omitempty"`
+	Instance     *string    `json:"instance,omitempty"`
+	InstanceNull bool       `json:"instance_null,omitempty"`
+	AlertName    *string    `json:"alert_name,omitempty"`
 	ID           string     `json:"id"`
 }
 
@@ -547,6 +559,7 @@ type NormalizedAlert struct {
 	EndsAt       *time.Time
 	Status       AlertState
 	AlertName    string
+	Instance     string
 	Severity     string
 	GroupKey     string
 	Receiver     string
@@ -664,4 +677,18 @@ func PopulateDerivedMetadata(labels map[string]string, assignedTeam *string) (en
 		}
 	}
 	return env, site, "", "none"
+}
+
+// ExtractInstance returns the canonical instance identifier from Alertmanager labels
+// using a deterministic fallback chain: instance -> host -> hostname -> node -> pod.
+func ExtractInstance(labels map[string]string) string {
+	if labels == nil {
+		return ""
+	}
+	for _, key := range []string{"instance", "host", "hostname", "node", "pod"} {
+		if v := strings.TrimSpace(labels[key]); v != "" {
+			return v
+		}
+	}
+	return ""
 }

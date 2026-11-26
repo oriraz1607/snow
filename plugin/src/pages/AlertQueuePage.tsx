@@ -45,6 +45,7 @@ const DEFAULT_FILTERS: FilterState = {
   environment: '',
   site: '',
   team: '',
+  instance: '',
   labels: [],
   sort: 'severity_desc',
   fingerprint: '',
@@ -133,6 +134,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       environments: filters.environment ? [filters.environment] : undefined,
       sites: filters.site ? [filters.site] : undefined,
       teams: filters.team ? [filters.team] : undefined,
+      instances: filters.instance ? [filters.instance] : undefined,
       labels: filters.labels.length > 0 ? filters.labels : undefined,
       search: filters.search.trim() || undefined,
       from,
@@ -694,6 +696,13 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
           viewMode === 'history' ||
           quickFilter === 'acknowledged' ||
           quickFilter === 'non_active_acknowledged'
+        }
+        sort={filters.sort}
+        onChangeSort={(nextSort) =>
+          setFilters((prev) => ({
+            ...prev,
+            sort: nextSort,
+          }))
         }
         onToggleSelectAlert={handleToggleSelectAlert}
         onToggleSelectAll={handleToggleSelectAll}

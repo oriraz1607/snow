@@ -179,6 +179,7 @@ func ValidateAndNormalizeAlertmanagerPayload(payload *model.AlertmanagerWebhookP
 		if alertName == "" {
 			alertName = "UnnamedAlert"
 		}
+		instance := model.ExtractInstance(labels)
 		severity := NormalizeSeverity(labels["severity"])
 
 		norm := model.NormalizedAlert{
@@ -187,6 +188,7 @@ func ValidateAndNormalizeAlertmanagerPayload(payload *model.AlertmanagerWebhookP
 			EndsAt:       endsAt,
 			Status:       status,
 			AlertName:    alertName,
+			Instance:     instance,
 			Severity:     severity,
 			GroupKey:     payload.GroupKey,
 			Receiver:     payload.Receiver,

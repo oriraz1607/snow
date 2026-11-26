@@ -48,6 +48,7 @@ const EMPTY_FILTER_OPTIONS: AlertFilterOptions = {
   environments: [],
   sites: [],
   teams: [],
+  instances: [],
 };
 
 export function useAlertQueue({
@@ -147,6 +148,7 @@ export function useAlertQueue({
             environments: resp.filter_options.environments ?? [],
             sites: resp.filter_options.sites ?? [],
             teams: resp.filter_options.teams ?? [],
+            instances: resp.filter_options.instances ?? [],
           });
         }
         setFilteredTotal(nextTotal);

@@ -118,6 +118,11 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 		}
 	}
 
+	if len(filter.Instances) > 0 {
+		ph := addArg(filter.Instances)
+		where = append(where, fmt.Sprintf("a.instance = ANY(%s::text[])", ph))
+	}
+
 	switch filter.IncidentDrift {
 	case string(model.DriftResolvedOpenTicket):
 		where = append(where, "a.state = 'resolved' AND s.sync_status IN ('created', 'linked') AND s.snow_state IN (1, 2, 3)")
@@ -160,7 +165,7 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	if filter.Search != "" {
 		pattern := "%" + escapeLikePattern(filter.Search) + "%"
 		ph := addArg(pattern)
-		where = append(where, fmt.Sprintf("(a.alert_name ILIKE %s ESCAPE '\\' OR COALESCE(a.annotations->>'summary', '') ILIKE %s ESCAPE '\\' OR a.fingerprint ILIKE %s ESCAPE '\\' OR COALESCE(s.incident_number, '') ILIKE %s ESCAPE '\\' OR COALESCE(a.labels->>'team', '') ILIKE %s ESCAPE '\\' OR COALESCE(a.assigned_team, '') ILIKE %s ESCAPE '\\')", ph, ph, ph, ph, ph, ph))
+		where = append(where, fmt.Sprintf("(a.alert_name ILIKE %s ESCAPE '\\' OR a.instance ILIKE %s ESCAPE '\\' OR COALESCE(a.annotations->>'summary', '') ILIKE %s ESCAPE '\\' OR a.fingerprint ILIKE %s ESCAPE '\\' OR COALESCE(s.incident_number, '') ILIKE %s ESCAPE '\\' OR COALESCE(a.labels->>'team', '') ILIKE %s ESCAPE '\\' OR COALESCE(a.assigned_team, '') ILIKE %s ESCAPE '\\')", ph, ph, ph, ph, ph, ph, ph))
 	}
 
 	if filter.From != nil {
@@ -173,6 +178,8 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	}
 
 	const severityRankExpr = `CASE a.severity WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END`
+	const instanceSortExpr = `NULLIF(LOWER(a.instance), '')`
+	const alertNameSortExpr = `LOWER(a.alert_name)`
 
 	countWhereSQL := ""
 	if len(where) > 0 {
@@ -215,6 +222,49 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 			pID := addArg(c.ID)
 			where = append(where, fmt.Sprintf("(%s > %s OR (%s = %s AND (a.starts_at < %s OR (a.starts_at = %s AND a.id < %s::uuid))))",
 				severityRankExpr, pRank, severityRankExpr, pRank, pTS, pTS, pID))
+		case model.SortSeverityAsc:
+			if c.SeverityRank == nil || c.StartsAt == nil {
+				return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Invalid pagination cursor.")
+			}
+			pRank := addArg(*c.SeverityRank)
+			pTS := addArg(*c.StartsAt)
+			pID := addArg(c.ID)
+			where = append(where, fmt.Sprintf("(%s < %s OR (%s = %s AND (a.starts_at > %s OR (a.starts_at = %s AND a.id > %s::uuid))))",
+				severityRankExpr, pRank, severityRankExpr, pRank, pTS, pTS, pID))
+		case model.SortAlertNameAsc:
+			if c.AlertName == nil {
+				return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Invalid pagination cursor.")
+			}
+			pName := addArg(strings.ToLower(strings.TrimSpace(*c.AlertName)))
+			pID := addArg(c.ID)
+			where = append(where, fmt.Sprintf("(%s > %s OR (%s = %s AND a.id > %s::uuid))",
+				alertNameSortExpr, pName, alertNameSortExpr, pName, pID))
+		case model.SortAlertNameDesc:
+			if c.AlertName == nil {
+				return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Invalid pagination cursor.")
+			}
+			pName := addArg(strings.ToLower(strings.TrimSpace(*c.AlertName)))
+			pID := addArg(c.ID)
+			where = append(where, fmt.Sprintf("(%s < %s OR (%s = %s AND a.id < %s::uuid))",
+				alertNameSortExpr, pName, alertNameSortExpr, pName, pID))
+		case model.SortInstanceAsc:
+			pID := addArg(c.ID)
+			if c.InstanceNull || c.Instance == nil || strings.TrimSpace(*c.Instance) == "" {
+				where = append(where, fmt.Sprintf("(%s IS NULL AND a.id > %s::uuid)", instanceSortExpr, pID))
+			} else {
+				pInst := addArg(strings.ToLower(strings.TrimSpace(*c.Instance)))
+				where = append(where, fmt.Sprintf("(%s IS NULL OR %s > %s OR (%s = %s AND a.id > %s::uuid))",
+					instanceSortExpr, instanceSortExpr, pInst, instanceSortExpr, pInst, pID))
+			}
+		case model.SortInstanceDesc:
+			pID := addArg(c.ID)
+			if c.InstanceNull || c.Instance == nil || strings.TrimSpace(*c.Instance) == "" {
+				where = append(where, fmt.Sprintf("(%s IS NULL AND a.id < %s::uuid)", instanceSortExpr, pID))
+			} else {
+				pInst := addArg(strings.ToLower(strings.TrimSpace(*c.Instance)))
+				where = append(where, fmt.Sprintf("(%s IS NULL OR %s < %s OR (%s = %s AND a.id < %s::uuid))",
+					instanceSortExpr, instanceSortExpr, pInst, instanceSortExpr, pInst, pID))
+			}
 		case model.SortResolvedAtDesc:
 			pID := addArg(c.ID)
 			if c.ResolvedNull || c.ResolvedAt == nil {
@@ -234,6 +284,16 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 		orderClause = "a.starts_at ASC, a.id ASC"
 	case model.SortSeverityDesc:
 		orderClause = severityRankExpr + " ASC, a.starts_at DESC, a.id DESC"
+	case model.SortSeverityAsc:
+		orderClause = severityRankExpr + " DESC, a.starts_at ASC, a.id ASC"
+	case model.SortAlertNameAsc:
+		orderClause = alertNameSortExpr + " ASC, a.id ASC"
+	case model.SortAlertNameDesc:
+		orderClause = alertNameSortExpr + " DESC, a.id DESC"
+	case model.SortInstanceAsc:
+		orderClause = instanceSortExpr + " ASC NULLS LAST, a.id ASC"
+	case model.SortInstanceDesc:
+		orderClause = instanceSortExpr + " DESC NULLS LAST, a.id DESC"
 	case model.SortResolvedAtDesc:
 		orderClause = "a.resolved_at DESC NULLS LAST, a.id DESC"
 	default:
@@ -251,7 +311,7 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	query := fmt.Sprintf(`
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
-			a.alert_name, a.severity, a.labels, a.annotations,
+			a.alert_name, a.instance, a.severity, a.labels, a.annotations,
 			a.assigned_team, a.assigned_team_by, a.assigned_team_at, a.generator_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
@@ -291,12 +351,21 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 		last := items[len(items)-1]
 		rank := model.SeverityRank(last.Severity)
 		startsAt := last.StartsAt
+		inst := strings.TrimSpace(last.Instance)
+		var instPtr *string
+		if inst != "" {
+			instPtr = &inst
+		}
+		alertName := last.AlertName
 		cursor := model.PageCursor{
 			Sort:         sortOrder,
 			StartsAt:     &startsAt,
 			ResolvedAt:   last.ResolvedAt,
 			ResolvedNull: last.ResolvedAt == nil,
 			SeverityRank: &rank,
+			Instance:     instPtr,
+			InstanceNull: inst == "",
+			AlertName:    &alertName,
 			ID:           last.ID,
 		}
 		if encoded, err := model.EncodeCursor(cursor); err == nil {
@@ -318,6 +387,7 @@ func (r *AlertRepository) getFilterOptions(ctx context.Context) (model.FilterOpt
 		Environments: []string{},
 		Sites:        []string{},
 		Teams:        []string{},
+		Instances:    []string{},
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT 'env' AS kind, val
@@ -343,6 +413,17 @@ func (r *AlertRepository) getFilterOptions(ctx context.Context) (model.FilterOpt
 			WHERE severity IN ('critical', 'warning')
 		) t
 		WHERE val IS NOT NULL
+		UNION ALL
+		SELECT 'instance' AS kind, val
+		FROM (
+			SELECT DISTINCT NULLIF(BTRIM(instance), '') AS val
+			FROM alerts
+			WHERE severity IN ('critical', 'warning')
+			  AND instance <> ''
+			ORDER BY val
+			LIMIT 200
+		) i
+		WHERE val IS NOT NULL
 		ORDER BY kind, val
 	`)
 	if err != nil {
@@ -362,6 +443,8 @@ func (r *AlertRepository) getFilterOptions(ctx context.Context) (model.FilterOpt
 			opts.Sites = append(opts.Sites, val)
 		case "team":
 			opts.Teams = append(opts.Teams, val)
+		case "instance":
+			opts.Instances = append(opts.Instances, val)
 		}
 	}
 	return opts, rows.Err()
@@ -397,7 +480,7 @@ func (r *AlertRepository) GetAlert(ctx context.Context, alertID string) (*model.
 	row := r.pool.QueryRow(ctx, `
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
-			a.alert_name, a.severity, a.group_key, a.receiver, a.labels, a.annotations,
+			a.alert_name, a.instance, a.severity, a.group_key, a.receiver, a.labels, a.annotations,
 			a.assigned_team, a.assigned_team_by, a.assigned_team_at,
 			a.generator_url, a.external_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
@@ -1193,7 +1276,7 @@ func getAlertItemTx(ctx context.Context, tx pgx.Tx, alertID string) (*model.Aler
 	row := tx.QueryRow(ctx, `
 		SELECT
 			a.id::text, a.fingerprint, a.starts_at, a.ends_at, a.state::text, a.version,
-			a.alert_name, a.severity, a.labels, a.annotations,
+			a.alert_name, a.instance, a.severity, a.labels, a.annotations,
 			a.assigned_team, a.assigned_team_by, a.assigned_team_at, a.generator_url,
 			a.acknowledged_by, a.acknowledged_by_email, a.acknowledged_at,
 			a.dismissed_by, a.dismissed_at, a.dismiss_reason, a.resolved_at,
@@ -1266,7 +1349,7 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 
 	err := row.Scan(
 		&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
-		&a.AlertName, &a.Severity, &labelsRaw, &annRaw,
+		&a.AlertName, &a.Instance, &a.Severity, &labelsRaw, &annRaw,
 		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt, &a.GeneratorURL,
 		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
 		&a.DismissedBy, &a.DismissedAt, &a.DismissReason, &a.ResolvedAt,
@@ -1283,6 +1366,10 @@ func scanAlertItemRow(row pgx.Row) (model.Alert, error) {
 	a.State = model.AlertState(stateStr)
 	a.Labels = unmarshalStringMap(labelsRaw)
 	a.Annotations = unmarshalStringMap(annRaw)
+	a.Instance = strings.TrimSpace(a.Instance)
+	if a.Instance == "" {
+		a.Instance = model.ExtractInstance(a.Labels)
+	}
 	a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
 
 	if snowID != nil && snowSyncStatus != nil && snowCallerMode != nil && snowCallerRes != nil {
@@ -1322,7 +1409,7 @@ func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
 
 	err := row.Scan(
 		&a.ID, &a.Fingerprint, &a.StartsAt, &a.EndsAt, &stateStr, &a.Version,
-		&a.AlertName, &a.Severity, &a.GroupKey, &a.Receiver, &labelsRaw, &annRaw,
+		&a.AlertName, &a.Instance, &a.Severity, &a.GroupKey, &a.Receiver, &labelsRaw, &annRaw,
 		&a.AssignedTeam, &a.AssignedTeamBy, &a.AssignedTeamAt,
 		&a.GeneratorURL, &a.ExternalURL,
 		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt,
@@ -1341,6 +1428,10 @@ func scanAlertDetailRow(row pgx.Row) (*model.AlertDetail, error) {
 	a.State = model.AlertState(stateStr)
 	a.Labels = unmarshalStringMap(labelsRaw)
 	a.Annotations = unmarshalStringMap(annRaw)
+	a.Instance = strings.TrimSpace(a.Instance)
+	if a.Instance == "" {
+		a.Instance = model.ExtractInstance(a.Labels)
+	}
 	a.Environment, a.Site, a.Team, a.TeamSource = model.PopulateDerivedMetadata(a.Labels, a.AssignedTeam)
 
 	if snowID != nil && snowSyncStatus != nil && snowCallerMode != nil && snowCallerRes != nil {

@@ -16,7 +16,16 @@ export type SnowCallerResolutionStatus =
 
 export type IncidentDriftStatus = 'none' | 'resolved_open_ticket' | 'active_closed_ticket';
 
-export type AlertSort = 'starts_at_desc' | 'starts_at_asc' | 'severity_desc' | 'resolved_at_desc';
+export type AlertSort =
+  | 'starts_at_desc'
+  | 'starts_at_asc'
+  | 'severity_desc'
+  | 'severity_asc'
+  | 'alert_name_asc'
+  | 'alert_name_desc'
+  | 'instance_asc'
+  | 'instance_desc'
+  | 'resolved_at_desc';
 
 export type AuditEventType =
   | 'alert_fired'
@@ -69,6 +78,7 @@ export interface Alert {
   state: AlertState;
   version: number;
   alert_name: string;
+  instance?: string;
   severity: string;
   group_key?: string;
   receiver?: string;
@@ -169,6 +179,7 @@ export interface AlertFilterOptions {
   environments: string[];
   sites: string[];
   teams: string[];
+  instances?: string[];
 }
 
 export interface ListAlertsResponse {
@@ -185,6 +196,7 @@ export interface ListAlertsQuery {
   environments?: string[];
   sites?: string[];
   teams?: string[];
+  instances?: string[];
   incident_drift?: 'all' | IncidentDriftStatus;
   has_incident?: boolean;
   fingerprint?: string;

@@ -111,4 +111,47 @@ func TestUUIDAndCursorRoundTrip(t *testing.T) {
 	if decoded.ID != id || decoded.Sort != SortSeverityDesc || decoded.SeverityRank == nil || *decoded.SeverityRank != 1 {
 		t.Fatalf("unexpected decoded cursor: %+v", decoded)
 	}
+
+	inst := "web-01.prod:9100"
+	alertName := "HighCPU"
+	encodedInst, err := EncodeCursor(PageCursor{
+		Sort:         SortInstanceAsc,
+		Instance:     &inst,
+		InstanceNull: false,
+		AlertName:    &alertName,
+		ID:           id,
+	})
+	if err != nil {
+		t.Fatalf("EncodeCursor instance error: %v", err)
+	}
+	decodedInst, err := DecodeCursor(encodedInst)
+	if err != nil {
+		t.Fatalf("DecodeCursor instance error: %v", err)
+	}
+	if decodedInst.Sort != SortInstanceAsc || decodedInst.Instance == nil || *decodedInst.Instance != inst || decodedInst.InstanceNull || decodedInst.AlertName == nil || *decodedInst.AlertName != alertName {
+		t.Fatalf("unexpected decoded instance cursor: %+v", decodedInst)
+	}
+}
+
+func TestExtractInstance(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels map[string]string
+		want   string
+	}{
+		{"nil labels", nil, ""},
+		{"prefers instance", map[string]string{"instance": " db-01:9100 ", "host": "h1"}, "db-01:9100"},
+		{"falls back to host", map[string]string{"instance": "   ", "host": "web-02", "node": "n1"}, "web-02"},
+		{"falls back to hostname", map[string]string{"hostname": "app-03", "pod": "p1"}, "app-03"},
+		{"falls back to node", map[string]string{"node": "worker-1", "pod": "p1"}, "worker-1"},
+		{"falls back to pod", map[string]string{"pod": "api-7f8b9"}, "api-7f8b9"},
+		{"empty when absent", map[string]string{"alertname": "HighCPU"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ExtractInstance(tc.labels); got != tc.want {
+				t.Fatalf("ExtractInstance() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

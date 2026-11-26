@@ -25,6 +25,7 @@ import {
   formatRelativeTime,
   formatUtcTimestamp,
   getAlertEnvironment,
+  getAlertInstance,
   getAlertSite,
   getAlertTeam,
   getOpenIncidentDismissBlockReason,
@@ -260,6 +261,9 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
           <div className={styles.statusHeader}>
             <Badge text={detail.severity} color={severityColor(detail.severity)} />
             <Badge text={displayStateLabel(detail)} color={displayStateColor(detail)} />
+            {getAlertInstance(detail) && (
+              <span className={styles.metaChip}>instance: {getAlertInstance(detail)}</span>
+            )}
             {getAlertEnvironment(detail) && (
               <span className={styles.metaChip}>env: {getAlertEnvironment(detail)}</span>
             )}
@@ -613,6 +617,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
           {activeTab === 'overview' && (
             <div className={styles.tabBody}>
               <div className={styles.kvGrid}>
+                <KvRow label="Instance" value={getAlertInstance(detail) || '—'} />
                 <KvRow label="Environment" value={getAlertEnvironment(detail) || '—'} />
                 <KvRow label="Site" value={getAlertSite(detail) || '—'} />
                 <KvRow label="Team" value={teamInfo.team || 'Untagged'} />

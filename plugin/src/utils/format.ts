@@ -28,6 +28,21 @@ export function getAlertSite(alert: Alert): string {
   return alert.site?.trim() || alert.labels?.site?.trim() || '';
 }
 
+export function getAlertInstance(alert: Alert): string {
+  const direct = alert.instance?.trim();
+  if (direct) {
+    return direct;
+  }
+  const labels = alert.labels ?? {};
+  for (const key of ['instance', 'host', 'hostname', 'node', 'pod']) {
+    const val = labels[key]?.trim();
+    if (val) {
+      return val;
+    }
+  }
+  return '';
+}
+
 export function getAlertTeam(alert: Alert): {
   team: string;
   source: TeamSource;

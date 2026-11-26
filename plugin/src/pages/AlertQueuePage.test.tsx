@@ -158,6 +158,9 @@ function makeQueueResponse(
   const teams = Array.from(
     new Set(items.map((a) => a.labels?.team || a.assigned_team || a.team || '').filter(Boolean))
   ).sort();
+  const instances = Array.from(
+    new Set(items.map((a) => a.instance || a.labels?.instance || a.labels?.host || '').filter(Boolean))
+  ).sort();
 
   return {
     summary: {
@@ -182,6 +185,7 @@ function makeQueueResponse(
       environments: envs,
       sites,
       teams,
+      instances,
     },
     filtered_total: items.length,
     items,
@@ -246,6 +250,7 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     // Fixed columns without State, Owner, or ServiceNow on Firing
     expect(screen.getByRole('columnheader', { name: 'Severity' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Alert' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Instance' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Env' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Site' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Team' })).toBeInTheDocument();
@@ -262,13 +267,14 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     expect(screen.queryByRole('button', { name: 'info' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'unknown' })).not.toBeInTheDocument();
 
-    // Env, Site, Team filters present; ServiceNow status dropdown removed
+    // Env, Site, Team, Instance filters present; ServiceNow status dropdown removed
     expect(screen.getByLabelText('Filter by environment')).toBeInTheDocument();
     expect(screen.getByLabelText('Filter by site')).toBeInTheDocument();
     expect(screen.getByLabelText('Filter by team')).toBeInTheDocument();
+    expect(screen.getByLabelText('Filter by instance')).toBeInTheDocument();
     expect(screen.queryByLabelText('ServiceNow status filter')).not.toBeInTheDocument();
     expect(
-      screen.getByPlaceholderText('Search alert name, team, summary, fingerprint, or INC...')
+      screen.getByPlaceholderText('Search alert name, instance, team, summary, fingerprint, or INC...')
     ).toBeInTheDocument();
 
     const row = screen.getByTestId(`alert-row-${alert.id}`);
@@ -1293,6 +1299,96 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
           states: ['resolved'],
           from: expect.any(String),
         }),
+        expect.any(AbortSignal)
+      )
+    );
+  });
+
+  it('renders Instance column, filters by Instance dropdown, and toggles interactive column-header sorting', async () => {
+    const user = userEvent.setup();
+    const alertA = makeAlert({
+      id: '11111111-1111-4111-8111-111111111111',
+      alert_name: 'CpuThrottlingHigh',
+      instance: 'app-01.eu1:9100',
+      labels: {
+        alertname: 'CpuThrottlingHigh',
+        severity: 'critical',
+        instance: 'app-01.eu1:9100',
+      },
+    });
+    const alertB = makeAlert({
+      id: '22222222-2222-4222-8222-222222222222',
+      alert_name: 'DiskLatencyHigh',
+      instance: 'db-02.eu1:9100',
+      labels: {
+        alertname: 'DiskLatencyHigh',
+        severity: 'warning',
+        instance: 'db-02.eu1:9100',
+      },
+    });
+
+    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([alertA, alertB]));
+
+    render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={null}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText('CpuThrottlingHigh')).toBeInTheDocument());
+    expect(screen.getByTestId(`alert-row-${alertA.id}`)).toHaveTextContent('app-01.eu1:9100');
+    expect(screen.getByTestId(`alert-row-${alertB.id}`)).toHaveTextContent('db-02.eu1:9100');
+
+    // Interactive column-header sorting: Instance -> instance_asc -> instance_desc
+    await user.click(screen.getByTestId('sort-header-instance'));
+    await waitFor(() =>
+      expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sort: 'instance_asc' }),
+        expect.any(AbortSignal)
+      )
+    );
+    expect(screen.getByRole('columnheader', { name: 'Instance' })).toHaveAttribute(
+      'aria-sort',
+      'ascending'
+    );
+
+    await user.click(screen.getByTestId('sort-header-instance'));
+    await waitFor(() =>
+      expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sort: 'instance_desc' }),
+        expect.any(AbortSignal)
+      )
+    );
+    expect(screen.getByRole('columnheader', { name: 'Instance' })).toHaveAttribute(
+      'aria-sort',
+      'descending'
+    );
+
+    // Interactive column-header sorting: Alert -> alert_name_asc; Severity -> severity_desc
+    await user.click(screen.getByTestId('sort-header-alert'));
+    await waitFor(() =>
+      expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sort: 'alert_name_asc' }),
+        expect.any(AbortSignal)
+      )
+    );
+
+    await user.click(screen.getByTestId('sort-header-severity'));
+    await waitFor(() =>
+      expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sort: 'severity_desc' }),
+        expect.any(AbortSignal)
+      )
+    );
+
+    // Instance dropdown filtering
+    await user.click(screen.getByLabelText('Filter by instance'));
+    await user.click(await screen.findByText('Instance: db-02.eu1:9100'));
+    await waitFor(() =>
+      expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
+        expect.objectContaining({ instances: ['db-02.eu1:9100'] }),
         expect.any(AbortSignal)
       )
     );
