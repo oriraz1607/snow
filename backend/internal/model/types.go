@@ -65,6 +65,7 @@ const (
 	AuditSnowCallerFallback   AuditEventType = "snow_caller_fallback"
 	AuditSnowStateSynced      AuditEventType = "snow_state_synced"
 	AuditSnowWorkNotePosted   AuditEventType = "snow_work_note_posted"
+	AuditSnowIncidentReopened AuditEventType = "snow_incident_reopened"
 )
 
 type ActorType string
@@ -221,37 +222,81 @@ type AuditEvent struct {
 
 // PreviousEpisodeSummary summarizes prior episodes sharing a fingerprint.
 type PreviousEpisodeSummary struct {
-	ID             string     `json:"id"`
-	StartsAt       time.Time  `json:"starts_at"`
-	ResolvedAt     *time.Time `json:"resolved_at"`
-	State          AlertState `json:"state"`
-	IncidentNumber *string    `json:"incident_number"`
-	SnowStateLabel *string    `json:"snow_state_label"`
+	ID              string     `json:"id"`
+	StartsAt        time.Time  `json:"starts_at"`
+	EndsAt          *time.Time `json:"ends_at,omitempty"`
+	ResolvedAt      *time.Time `json:"resolved_at"`
+	DurationSeconds int64      `json:"duration_seconds"`
+	State           AlertState `json:"state"`
+	Severity        string     `json:"severity"`
+	AcknowledgedBy  *string    `json:"acknowledged_by,omitempty"`
+	AcknowledgedAt  *time.Time `json:"acknowledged_at,omitempty"`
+	DismissedBy     *string    `json:"dismissed_by,omitempty"`
+	DismissedAt     *time.Time `json:"dismissed_at,omitempty"`
+	DismissReason   *string    `json:"dismiss_reason,omitempty"`
+	IncidentNumber  *string    `json:"incident_number"`
+	SnowStateLabel  *string    `json:"snow_state_label"`
+	IncidentURL     *string    `json:"incident_url,omitempty"`
+	AssignmentGroup *string    `json:"assignment_group,omitempty"`
 }
 
 // AlertHistoryResponse is returned by GET /api/v1/alerts/{alert_id}/history.
 type AlertHistoryResponse struct {
-	AlertID          string                   `json:"alert_id"`
-	Fingerprint      string                   `json:"fingerprint"`
-	AuditEvents      []AuditEvent             `json:"audit_events"`
-	PreviousEpisodes []PreviousEpisodeSummary `json:"previous_episodes"`
+	AlertID               string                   `json:"alert_id"`
+	Fingerprint           string                   `json:"fingerprint"`
+	AuditEvents           []AuditEvent             `json:"audit_events"`
+	PreviousEpisodes      []PreviousEpisodeSummary `json:"previous_episodes"`
+	PreviousEpisodesTotal int64                    `json:"previous_episodes_total"`
+	Limit                 int                      `json:"limit"`
+	Offset                int                      `json:"offset"`
+	HasMore               bool                     `json:"has_more"`
+}
+
+// ActiveAlertSummary describes an active alert linked to a ServiceNow incident.
+type ActiveAlertSummary struct {
+	ID        string     `json:"id"`
+	AlertName string     `json:"alert_name"`
+	Severity  string     `json:"severity"`
+	State     AlertState `json:"state"`
+	StartsAt  time.Time  `json:"starts_at"`
+}
+
+// IncidentActiveStatusResponse is returned by GET /api/v1/integrations/servicenow/incidents/{snow_sys_id}/active-status.
+type IncidentActiveStatusResponse struct {
+	SnowSysID        string               `json:"snow_sys_id"`
+	HasActiveAlerts  bool                 `json:"has_active_alerts"`
+	ActiveAlertCount int                  `json:"active_alert_count"`
+	ActiveAlerts     []ActiveAlertSummary `json:"active_alerts"`
 }
 
 // SummaryCounts holds global alert queue counters.
 type SummaryCounts struct {
 	Firing                      int64 `json:"firing"`
+	FiringCritical              int64 `json:"firing_critical"`
+	FiringWarning               int64 `json:"firing_warning"`
 	Acknowledged                int64 `json:"acknowledged"`
 	AcknowledgedWithoutIncident int64 `json:"acknowledged_without_incident"`
 	NonActiveAcknowledged       int64 `json:"non_active_acknowledged"`
 	Dismissed                   int64 `json:"dismissed"`
+	Resolved                    int64 `json:"resolved"`
 	ResolvedOpenTicket          int64 `json:"resolved_open_ticket"`
+	ActiveClosedTicket          int64 `json:"active_closed_ticket"`
+}
+
+// FilterOptions holds distinct environment, site, and team filter choices present in the alert store.
+type FilterOptions struct {
+	Environments []string `json:"environments"`
+	Sites        []string `json:"sites"`
+	Teams        []string `json:"teams"`
 }
 
 // ListAlertsResponse is returned by GET /api/v1/alerts.
 type ListAlertsResponse struct {
-	Summary    SummaryCounts `json:"summary"`
-	Items      []Alert       `json:"items"`
-	NextCursor *string       `json:"next_cursor,omitempty"`
+	Summary       SummaryCounts `json:"summary"`
+	FilterOptions FilterOptions `json:"filter_options"`
+	FilteredTotal int64         `json:"filtered_total"`
+	Items         []Alert       `json:"items"`
+	NextCursor    *string       `json:"next_cursor,omitempty"`
 }
 
 // ListAlertsFilter defines supported filters and pagination for GET /api/v1/alerts.
@@ -259,6 +304,9 @@ type ListAlertsFilter struct {
 	States                []AlertState
 	NonActiveAcknowledged bool
 	Severities            []string
+	Environments          []string
+	Sites                 []string
+	Teams                 []string
 	IncidentDrift         string
 	HasIncident           *bool
 	Fingerprint           string
@@ -325,6 +373,18 @@ type DismissRequest struct {
 	Reason  string `json:"reason"`
 }
 
+// BulkDismissRequest is the payload for POST /api/v1/alerts/bulk/dismiss.
+type BulkDismissRequest struct {
+	AlertIDs []string `json:"alert_ids"`
+	Reason   string   `json:"reason"`
+}
+
+// BulkDismissResponse is returned by POST /api/v1/alerts/bulk/dismiss.
+type BulkDismissResponse struct {
+	DismissedCount int      `json:"dismissed_count"`
+	AlertIDs       []string `json:"alert_ids"`
+}
+
 // AddNoteRequest is the payload for POST /api/v1/alerts/{id}/notes.
 type AddNoteRequest struct {
 	Comment string `json:"comment"`
@@ -352,6 +412,7 @@ type CreateIncidentResponse struct {
 	AlertID            string              `json:"alert_id"`
 	ServiceNowIncident *ServiceNowIncident `json:"servicenow_incident"`
 	Warnings           []string            `json:"warnings,omitempty"`
+	Replayed           bool                `json:"-"`
 }
 
 // CreateBulkIncidentRequest is the payload for POST /api/v1/servicenow/incidents/bulk.
@@ -372,6 +433,7 @@ type CreateBulkIncidentResponse struct {
 	AlertIDs           []string            `json:"alert_ids"`
 	ServiceNowIncident *ServiceNowIncident `json:"servicenow_incident"`
 	Warnings           []string            `json:"warnings,omitempty"`
+	Replayed           bool                `json:"-"`
 }
 
 // LinkIncidentRequest is the payload for POST /api/v1/alerts/{id}/servicenow/link.
@@ -400,6 +462,7 @@ type ServiceNowMetadataResponse struct {
 	DefaultCallerMode      SnowCallerMode        `json:"default_caller_mode"`
 	DefaultCallerUsername  string                `json:"default_caller_username"`
 	AssignmentGroups       []AssignmentGroupInfo `json:"assignment_groups"`
+	TeamAssignmentGroups   map[string]string     `json:"team_assignment_groups"`
 	SnowReachable          bool                  `json:"snow_reachable"`
 }
 
@@ -421,12 +484,14 @@ type SnowUserCacheEntry struct {
 
 // PendingResolutionNote represents a resolved alert whose open ServiceNow ticket still needs a work note.
 type PendingResolutionNote struct {
-	IncidentID     string
-	AlertID        string
-	SnowSysID      string
-	IncidentNumber string
-	AlertName      string
-	ResolvedAt     time.Time
+	IncidentID              string
+	AlertID                 string
+	SnowSysID               string
+	IncidentNumber          string
+	AlertName               string
+	ResolvedAt              time.Time
+	TotalLinkedAlerts       int
+	RemainingActiveSiblings int
 }
 
 // GaugeCounts carries current DB counts for Prometheus gauges.

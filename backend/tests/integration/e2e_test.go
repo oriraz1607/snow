@@ -134,7 +134,7 @@ func (e *testEnv) resetState(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	if _, err := conn.Exec(ctx, `TRUNCATE TABLE alerts, snow_user_cache, webhook_ingestion_log RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := conn.Exec(ctx, `TRUNCATE TABLE alerts, snow_user_cache, webhook_ingestion_log, alert_fingerprint_teams, idempotency_keys, team_assignment_group_mappings RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
 
@@ -171,16 +171,16 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		if err := ownerConn.QueryRow(ctx, `
 			SELECT COUNT(*) FROM information_schema.tables
 			WHERE table_schema = 'public'
-			  AND table_name IN ('alerts','servicenow_incidents','alert_audit_log','snow_user_cache','webhook_ingestion_log')
-		`).Scan(&tableCount); err != nil || tableCount != 5 {
-			t.Fatalf("expected 5 tables, got %d (err=%v)", tableCount, err)
+			  AND table_name IN ('alerts','servicenow_incidents','alert_audit_log','snow_user_cache','webhook_ingestion_log','alert_fingerprint_teams','idempotency_keys','team_assignment_group_mappings')
+		`).Scan(&tableCount); err != nil || tableCount != 8 {
+			t.Fatalf("expected 8 tables, got %d (err=%v)", tableCount, err)
 		}
 
 		if err := ownerConn.QueryRow(ctx, `
 			SELECT COUNT(*) FROM pg_trigger
-			WHERE tgname IN ('trg_alerts_updated_at','trg_servicenow_incidents_updated_at')
-		`).Scan(&triggerCount); err != nil || triggerCount != 2 {
-			t.Fatalf("expected 2 triggers, got %d (err=%v)", triggerCount, err)
+			WHERE tgname IN ('trg_alerts_updated_at','trg_servicenow_incidents_updated_at','trg_alert_fingerprint_teams_updated_at','trg_idempotency_keys_updated_at','trg_team_assignment_group_mappings_updated_at')
+		`).Scan(&triggerCount); err != nil || triggerCount != 5 {
+			t.Fatalf("expected 5 triggers, got %d (err=%v)", triggerCount, err)
 		}
 
 		if err := ownerConn.QueryRow(ctx, `
@@ -190,10 +190,12 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			    'uq_alerts_active_fingerprint','idx_alerts_state_starts_at','idx_alerts_active_severity',
 			    'idx_alerts_fingerprint_starts_at_desc','idx_alerts_labels_gin','idx_snow_incidents_open_sync',
 			    'idx_snow_incidents_sys_id','idx_snow_incidents_number','idx_audit_log_alert_id_created',
-			    'idx_snow_user_cache_expires_at','idx_webhook_ingestion_log_received_at'
+			    'idx_snow_user_cache_expires_at','idx_webhook_ingestion_log_received_at',
+			    'idx_alerts_non_active_ack','idx_idempotency_keys_expires_at','idx_alerts_active_severity_rank',
+			    'idx_alerts_resolved_at_desc'
 			  )
-		`).Scan(&indexCount); err != nil || indexCount != 11 {
-			t.Fatalf("expected 11 indexes, got %d (err=%v)", indexCount, err)
+		`).Scan(&indexCount); err != nil || indexCount != 15 {
+			t.Fatalf("expected 15 indexes, got %d (err=%v)", indexCount, err)
 		}
 
 		// Verify alert_api_app cannot UPDATE or DELETE alert_audit_log
@@ -778,7 +780,7 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 					Fingerprint: fp,
 					StartsAt:    t0,
 					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
-					Labels:      map[string]string{"alertname": "ExtraAlert", "severity": "info"},
+					Labels:      map[string]string{"alertname": "ExtraAlert", "severity": "warning"},
 				},
 			},
 		})
@@ -853,7 +855,7 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 					Fingerprint: fp,
 					StartsAt:    tNew,
 					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
-					Labels:      map[string]string{"alertname": "ExtraAlert", "severity": "info"},
+					Labels:      map[string]string{"alertname": "ExtraAlert", "severity": "warning"},
 				},
 			},
 		})
@@ -886,7 +888,7 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 					Fingerprint: fp,
 					StartsAt:    t0,
 					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
-					Labels:      map[string]string{"alertname": "ExtraAlert", "severity": "info"},
+					Labels:      map[string]string{"alertname": "ExtraAlert", "severity": "warning"},
 				},
 			},
 		})
@@ -934,6 +936,334 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			!strings.Contains(string(metricsRaw), "noc_alertmanager_truncated_alerts_total 1") ||
 			!strings.Contains(string(metricsRaw), "noc_db_pool_acquired_conns") {
 			t.Fatalf("unexpected /metrics output: status=%d body=%s", st, string(metricsRaw))
+		}
+	})
+
+	t.Run("Flow8_TeamTagsBulkIncidentsIdempotencyAndReopenSemantics", func(t *testing.T) {
+		doJSONWithHeaders := func(method, urlStr, bearer string, headers map[string]string, body any) (int, http.Header, []byte) {
+			var reader io.Reader
+			if body != nil {
+				raw, err := json.Marshal(body)
+				if err != nil {
+					t.Fatalf("marshal request body: %v", err)
+				}
+				reader = bytes.NewReader(raw)
+			}
+			req, err := http.NewRequest(method, urlStr, reader)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			if bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+bearer)
+			}
+			if body != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			resp, err := env.httpClient.Do(req)
+			if err != nil {
+				t.Fatalf("http %s %s failed: %v", method, urlStr, err)
+			}
+			defer resp.Body.Close()
+			respBytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			return resp.StatusCode, resp.Header, respBytes
+		}
+
+		const labeledFP = "fp_labeled_team_e2e_08"
+		const untaggedFP = "fp_untagged_team_e2e_08"
+		const dismissFP = "fp_dismiss_reopen_e2e_08"
+		tStart := time.Now().UTC().Add(-4 * time.Minute).Truncate(time.Second)
+
+		st, body := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "firing",
+					Fingerprint: labeledFP,
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels:      map[string]string{"alertname": "LabeledServiceAlert", "severity": "critical", "team": "core-db"},
+				},
+				{
+					Status:      "firing",
+					Fingerprint: untaggedFP,
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels:      map[string]string{"alertname": "UntaggedServiceAlert", "severity": "critical"},
+				},
+				{
+					Status:      "firing",
+					Fingerprint: dismissFP,
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels:      map[string]string{"alertname": "DismissThenResolveAlert", "severity": "warning"},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("ingest flow8 alerts failed: %d (%s)", st, string(body))
+		}
+
+		// Low/Info severities are excluded from queue listings and summary counts
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8-low",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "firing",
+					Fingerprint: "fp_ignored_info_e2e_08",
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels:      map[string]string{"alertname": "LowNoiseAlert", "severity": "info"},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("ingest low/info alert failed: %d", st)
+		}
+		_, infoListRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?fingerprint=fp_ignored_info_e2e_08", aliceJWT, nil)
+		var infoList model.ListAlertsResponse
+		_ = json.Unmarshal(infoListRaw, &infoList)
+		if len(infoList.Items) != 0 {
+			t.Fatalf("expected info/low severity alerts to be hidden from list, got %+v", infoList.Items)
+		}
+
+		// REV-08: severity=critical returns the two critical alerts
+		st, critRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?severity=critical", aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("severity filter failed: %d", st)
+		}
+		var critList model.ListAlertsResponse
+		_ = json.Unmarshal(critRaw, &critList)
+		var labeledID, untaggedID string
+		for _, item := range critList.Items {
+			if item.Fingerprint == labeledFP {
+				labeledID = item.ID
+			} else if item.Fingerprint == untaggedFP {
+				untaggedID = item.ID
+			}
+		}
+		if labeledID == "" || untaggedID == "" {
+			t.Fatalf("expected both flow8 critical alerts in severity=critical list, got %+v", critList.Items)
+		}
+
+		// REV-09: tagging an alert with Prometheus labels["team"] returns 409 TEAM_MANAGED_BY_LABEL
+		st, tagErrRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+labeledID+"/team", aliceJWT, map[string]any{"team": "override"})
+		if st != http.StatusConflict || !strings.Contains(string(tagErrRaw), "TEAM_MANAGED_BY_LABEL") {
+			t.Fatalf("expected 409 TEAM_MANAGED_BY_LABEL for labeled alert, got %d (%s)", st, string(tagErrRaw))
+		}
+
+		// Tag untagged alert -> sets assigned_team and persists fingerprint inheritance
+		st, taggedRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+untaggedID+"/team", aliceJWT, map[string]any{"team": "observability"})
+		if st != http.StatusOK {
+			t.Fatalf("tag untagged alert failed: %d (%s)", st, string(taggedRaw))
+		}
+
+		// Resolve untagged episode and re-fire -> future episode inherits assigned_team
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "resolved",
+					Fingerprint: untaggedFP,
+					StartsAt:    tStart,
+					EndsAt:      tStart.Add(1 * time.Minute),
+					Labels:      map[string]string{"alertname": "UntaggedServiceAlert", "severity": "critical"},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("resolve untagged episode failed: %d", st)
+		}
+		tRefire := tStart.Add(2 * time.Minute)
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "firing",
+					Fingerprint: untaggedFP,
+					StartsAt:    tRefire,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels:      map[string]string{"alertname": "UntaggedServiceAlert", "severity": "critical"},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("re-fire untagged episode failed: %d", st)
+		}
+		_, refireListRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?fingerprint="+untaggedFP+"&state=firing", aliceJWT, nil)
+		var refireList model.ListAlertsResponse
+		_ = json.Unmarshal(refireListRaw, &refireList)
+		if len(refireList.Items) != 1 || refireList.Items[0].Team != "observability" || refireList.Items[0].TeamSource != "operator" {
+			t.Fatalf("expected re-fired episode to inherit operator team 'observability', got %+v", refireList.Items)
+		}
+		inheritedID := refireList.Items[0].ID
+
+		// REV-05: ack -> dismiss -> reopen clears ack; ack -> dismiss -> resolve is NOT non_active_acknowledged
+		_, dismissListRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?fingerprint="+dismissFP, aliceJWT, nil)
+		var dl model.ListAlertsResponse
+		_ = json.Unmarshal(dismissListRaw, &dl)
+		dismissID := dl.Items[0].ID
+
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/acknowledge", aliceJWT, map[string]any{"version": 1})
+		if st != http.StatusOK {
+			t.Fatalf("ack dismissID failed: %d", st)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/dismiss", aliceJWT, map[string]any{"version": 2, "reason": "testing reopen"})
+		if st != http.StatusOK {
+			t.Fatalf("dismiss dismissID failed: %d", st)
+		}
+		st, reopenedRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/reopen", aliceJWT, map[string]any{"version": 3})
+		if st != http.StatusOK {
+			t.Fatalf("reopen dismissID failed: %d", st)
+		}
+		var reopened model.Alert
+		_ = json.Unmarshal(reopenedRaw, &reopened)
+		if reopened.AcknowledgedBy != nil || reopened.AcknowledgedAt != nil {
+			t.Fatalf("expected reopen to clear acknowledged_by/acknowledged_at, got %+v", reopened)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/acknowledge", aliceJWT, map[string]any{"version": 4})
+		if st != http.StatusOK {
+			t.Fatalf("re-ack dismissID failed: %d", st)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/dismiss", aliceJWT, map[string]any{"version": 5, "reason": "noise"})
+		if st != http.StatusOK {
+			t.Fatalf("second dismiss dismissID failed: %d", st)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "resolved",
+					Fingerprint: dismissFP,
+					StartsAt:    tStart,
+					EndsAt:      tStart.Add(3 * time.Minute),
+					Labels:      map[string]string{"alertname": "DismissThenResolveAlert", "severity": "warning"},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("resolve dismissed alert failed: %d", st)
+		}
+		_, naaRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?state=non_active_acknowledged&fingerprint="+dismissFP, aliceJWT, nil)
+		var naaList model.ListAlertsResponse
+		_ = json.Unmarshal(naaRaw, &naaList)
+		if len(naaList.Items) != 0 {
+			t.Fatalf("dismissed-then-resolved alert must NOT appear in non_active_acknowledged, got %+v", naaList.Items)
+		}
+
+		// REV-03 + REV-02 + REV-11: Bulk create with Idempotency-Key replay, sibling sync audit, and sibling-aware resolution notes
+		bulkPayload := map[string]any{
+			"alert_ids":         []string{labeledID, inheritedID},
+			"short_description": "[CRITICAL] Bulk flow8 incident",
+			"impact":            1,
+			"urgency":           1,
+			"caller_mode":       "sso_user",
+		}
+		st, _, bulkRaw1 := doJSONWithHeaders(http.MethodPost, env.apiURL+"/api/v1/servicenow/incidents/bulk", aliceJWT, map[string]string{
+			"Idempotency-Key": "e2e-bulk-idem-001",
+		}, bulkPayload)
+		if st != http.StatusCreated {
+			t.Fatalf("bulk create failed: %d (%s)", st, string(bulkRaw1))
+		}
+		var bulkResp1 model.CreateBulkIncidentResponse
+		_ = json.Unmarshal(bulkRaw1, &bulkResp1)
+		bulkSysID := *bulkResp1.ServiceNowIncident.SnowSysID
+
+		// Replay with identical Idempotency-Key must return 201 + Idempotency-Replayed: true
+		st, hdrs2, bulkRaw2 := doJSONWithHeaders(http.MethodPost, env.apiURL+"/api/v1/servicenow/incidents/bulk", aliceJWT, map[string]string{
+			"Idempotency-Key": "e2e-bulk-idem-001",
+		}, bulkPayload)
+		if st != http.StatusCreated || hdrs2.Get("Idempotency-Replayed") != "true" || !bytes.Contains(bulkRaw2, []byte(*bulkResp1.ServiceNowIncident.IncidentNumber)) {
+			t.Fatalf("expected 201 replay with Idempotency-Replayed: true, got st=%d hdr=%q body=%s", st, hdrs2.Get("Idempotency-Replayed"), string(bulkRaw2))
+		}
+
+		// Transition in mocksnow silently -> manual /sync on labeledID updates sibling inheritedID and logs audit on both
+		st, _ = env.doJSON(t, http.MethodPost, env.mockSnowURL+"/_mock/incidents/"+bulkSysID+"/transition", "", map[string]any{
+			"state":        2,
+			"send_webhook": false,
+		})
+		if st != http.StatusOK {
+			t.Fatalf("mocksnow transition bulkSysID failed: %d", st)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+labeledID+"/servicenow/sync", aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("manual sync on bulk alert failed: %d", st)
+		}
+		_, sibHistRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+inheritedID+"/history", aliceJWT, nil)
+		var sibHist model.AlertHistoryResponse
+		_ = json.Unmarshal(sibHistRaw, &sibHist)
+		foundSibSync := false
+		for _, ev := range sibHist.AuditEvents {
+			if ev.EventType == model.AuditSnowStateSynced {
+				foundSibSync = true
+				break
+			}
+		}
+		if !foundSibSync {
+			t.Fatalf("expected snow_state_synced audit event on sibling alert %s", inheritedID)
+		}
+
+		// Resolve first bulk sibling -> partial recovery note posted (NOT resolve/close)
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "resolved",
+					Fingerprint: labeledFP,
+					StartsAt:    tStart,
+					EndsAt:      tStart.Add(4 * time.Minute),
+					Labels:      map[string]string{"alertname": "LabeledServiceAlert", "severity": "critical", "team": "core-db"},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("resolve first bulk sibling failed: %d", st)
+		}
+
+		deadlinePartial := time.Now().Add(10 * time.Second)
+		gotPartial := false
+		for time.Now().Before(deadlinePartial) {
+			st, mockRaw := env.doJSON(t, http.MethodGet, env.mockSnowURL+"/_mock/incidents", "", nil)
+			if st == http.StatusOK {
+				var list struct {
+					Incidents []mocksnow.MockIncident `json:"incidents"`
+				}
+				_ = json.Unmarshal(mockRaw, &list)
+				for _, inc := range list.Incidents {
+					if inc.SysID == bulkSysID {
+						for _, note := range inc.WorkNotes {
+							if strings.Contains(note, "remain active") {
+								gotPartial = true
+								break
+							}
+						}
+					}
+				}
+			}
+			if gotPartial {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !gotPartial {
+			t.Fatalf("timed out waiting for partial sibling resolution note on bulk ticket")
 		}
 	})
 }

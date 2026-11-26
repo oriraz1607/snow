@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,28 @@ import (
 )
 
 const userLookupTimeout = 3 * time.Second
+
+var incidentNumberPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{3,40}$`)
+
+// ValidateIncidentNumber ensures incident_number conforms to a strict safe allowlist before querying ServiceNow.
+func ValidateIncidentNumber(number string) (string, error) {
+	trimmed := strings.TrimSpace(number)
+	if !incidentNumberPattern.MatchString(trimmed) {
+		return "", apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "incident_number must be 3-40 alphanumeric, underscore, or hyphen characters.")
+	}
+	return trimmed, nil
+}
+
+func sanitizeEncodedQueryValue(field, val string) (string, error) {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return "", apierror.New(http.StatusBadRequest, apierror.CodeValidationError, fmt.Sprintf("%s must not be empty.", field))
+	}
+	if strings.ContainsAny(trimmed, "^\r\n\x00") {
+		return "", apierror.New(http.StatusBadRequest, apierror.CodeValidationError, fmt.Sprintf("%s contains disallowed ServiceNow query operator characters.", field))
+	}
+	return trimmed, nil
+}
 
 // SnowError wraps an APIError with raw ServiceNow HTTP status/body for targeted retry inspection.
 type SnowError struct {
@@ -156,13 +179,21 @@ func (c *Client) CircuitState() BreakerState {
 
 // LookupUserByEmail queries ServiceNow sys_user for an active user matching email (3s timeout).
 func (c *Client) LookupUserByEmail(ctx context.Context, email string) (*SysUser, error) {
-	q := fmt.Sprintf("email=%s^active=true", strings.TrimSpace(email))
+	cleanEmail, err := sanitizeEncodedQueryValue("email", email)
+	if err != nil {
+		return nil, err
+	}
+	q := fmt.Sprintf("email=%s^active=true", cleanEmail)
 	return c.lookupUser(ctx, q)
 }
 
 // LookupUserByUsername queries ServiceNow sys_user for an active user matching user_name (3s timeout).
 func (c *Client) LookupUserByUsername(ctx context.Context, username string) (*SysUser, error) {
-	q := fmt.Sprintf("user_name=%s^active=true", strings.TrimSpace(username))
+	cleanUser, err := sanitizeEncodedQueryValue("user_name", username)
+	if err != nil {
+		return nil, err
+	}
+	q := fmt.Sprintf("user_name=%s^active=true", cleanUser)
 	return c.lookupUser(ctx, q)
 }
 
@@ -203,8 +234,12 @@ func (c *Client) lookupUser(ctx context.Context, sysparmQuery string) (*SysUser,
 
 // FindIncidentByCorrelationID looks up an incident by correlation_id.
 func (c *Client) FindIncidentByCorrelationID(ctx context.Context, correlationID string) (*IncidentRecord, error) {
+	cleanCorr, err := sanitizeEncodedQueryValue("correlation_id", correlationID)
+	if err != nil {
+		return nil, err
+	}
 	params := url.Values{}
-	params.Set("sysparm_query", "correlation_id="+correlationID)
+	params.Set("sysparm_query", "correlation_id="+cleanCorr)
 	params.Set("sysparm_fields", "sys_id,number,state,priority,assignment_group,opened_at,resolved_at,closed_at")
 	params.Set("sysparm_display_value", "all")
 	params.Set("sysparm_limit", "1")
@@ -213,8 +248,12 @@ func (c *Client) FindIncidentByCorrelationID(ctx context.Context, correlationID 
 
 // FindIncidentByNumber looks up an incident by number (e.g. INC0012345).
 func (c *Client) FindIncidentByNumber(ctx context.Context, number string) (*IncidentRecord, error) {
+	cleanNum, err := ValidateIncidentNumber(number)
+	if err != nil {
+		return nil, err
+	}
 	params := url.Values{}
-	params.Set("sysparm_query", "number="+strings.TrimSpace(number))
+	params.Set("sysparm_query", "number="+cleanNum)
 	params.Set("sysparm_fields", "sys_id,number,state,priority,assignment_group,opened_at,resolved_at,closed_at")
 	params.Set("sysparm_display_value", "all")
 	params.Set("sysparm_limit", "1")
@@ -226,8 +265,19 @@ func (c *Client) GetIncidentsBySysIDs(ctx context.Context, operation string, sys
 	if len(sysIDs) == 0 {
 		return nil, nil
 	}
+	cleanIDs := make([]string, 0, len(sysIDs))
+	for _, id := range sysIDs {
+		clean, err := sanitizeEncodedQueryValue("sys_id", id)
+		if err != nil {
+			return nil, err
+		}
+		if strings.Contains(clean, ",") {
+			return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "sys_id contains disallowed comma separator.")
+		}
+		cleanIDs = append(cleanIDs, clean)
+	}
 	params := url.Values{}
-	params.Set("sysparm_query", "sys_idIN"+strings.Join(sysIDs, ","))
+	params.Set("sysparm_query", "sys_idIN"+strings.Join(cleanIDs, ","))
 	params.Set("sysparm_fields", "sys_id,number,state,priority,assignment_group,opened_at,resolved_at,closed_at,sys_updated_on")
 	params.Set("sysparm_display_value", "all")
 	endpoint := c.instanceURL + "/api/now/table/incident?" + params.Encode()
@@ -305,6 +355,51 @@ func (c *Client) PostWorkNote(ctx context.Context, snowSysID, workNotes string) 
 
 	_, err = c.doWithAuthAndRetry(callCtx, "patch", http.MethodPatch, endpoint, rawPayload, false)
 	return err
+}
+
+// ReopenIncident moves an incident back to state 2 (In Progress) with an explanatory work note.
+func (c *Client) ReopenIncident(ctx context.Context, snowSysID, workNotes string) (*IncidentRecord, error) {
+	cleanSysID, err := sanitizeEncodedQueryValue("sys_id", snowSysID)
+	if err != nil {
+		return nil, err
+	}
+	rawPayload, err := json.Marshal(struct {
+		State     int16  `json:"state"`
+		WorkNotes string `json:"work_notes"`
+	}{
+		State:     2,
+		WorkNotes: workNotes,
+	})
+	if err != nil {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Failed to encode reopen payload.").WithCause(err)
+	}
+
+	params := url.Values{}
+	params.Set("sysparm_fields", "sys_id,number,state,priority,assignment_group,opened_at,resolved_at,closed_at,sys_updated_on")
+	params.Set("sysparm_display_value", "all")
+	endpoint := fmt.Sprintf("%s/api/now/table/incident/%s?%s", c.instanceURL, url.PathEscape(cleanSysID), params.Encode())
+
+	callCtx, cancel := context.WithTimeout(ctx, c.httpTimeout)
+	defer cancel()
+
+	body, err := c.doWithAuthAndRetry(callCtx, "patch", http.MethodPatch, endpoint, rawPayload, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Result rawIncident `json:"result"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, apierror.New(http.StatusBadGateway, apierror.CodeSnowUpstreamError, "Invalid JSON from ServiceNow reopen incident response.").WithCause(err)
+	}
+	rec := parsed.Result.toRecord(c.instanceURL)
+	if rec.SysID == "" {
+		rec.SysID = cleanSysID
+		rec.State = 2
+		rec.StateLabel = model.SnowStateLabel(2)
+	}
+	return &rec, nil
 }
 
 // ListAssignmentGroups fetches active assignment groups from ServiceNow sys_user_group.

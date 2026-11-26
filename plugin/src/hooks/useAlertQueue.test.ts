@@ -16,15 +16,20 @@ jest.mock('../api/client', () => {
 
 const mockedListAlerts = alertApi.listAlerts as jest.MockedFunction<typeof alertApi.listAlerts>;
 
-function makeListResponse(firingCount = 1): ListAlertsResponse {
+function makeListResponse(firingCount = 1, nextCursor: string | null = null, filteredTotal?: number): ListAlertsResponse {
   return {
     summary: {
       firing: firingCount,
+      firing_critical: firingCount,
+      firing_warning: 0,
       acknowledged: 0,
       acknowledged_without_incident: 0,
+      non_active_acknowledged: 0,
       dismissed: 0,
       resolved_open_ticket: 0,
     },
+    filtered_total: filteredTotal ?? firingCount,
+    next_cursor: nextCursor,
     items: [
       {
         id: '11111111-1111-4111-8111-111111111111',
@@ -185,5 +190,56 @@ describe('useAlertQueue', () => {
     expect(mockedListAlerts).toHaveBeenCalledTimes(3);
     expect(result.current.apiDegraded).toBe(false);
     expect(result.current.summary.firing).toBe(4);
+  });
+
+  it('supports keyset page navigation and preserves Page 2 during background polling', async () => {
+    mockedListAlerts
+      .mockResolvedValueOnce(makeListResponse(100, 'cur_page_2', 100))
+      .mockResolvedValueOnce(makeListResponse(100, 'cur_page_3', 100))
+      .mockResolvedValueOnce(makeListResponse(102, 'cur_page_3', 102))
+      .mockResolvedValueOnce(makeListResponse(102, 'cur_page_2', 102));
+
+    const { result } = renderHook(() =>
+      useAlertQueue({
+        query: { states: ['firing'], sort: 'severity_desc', limit: 50 },
+        pollIntervalSeconds: 10,
+        autoRefresh: true,
+      })
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.pageIndex).toBe(0);
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.filteredTotal).toBe(100);
+
+    await act(async () => {
+      await result.current.goNextPage();
+    });
+    expect(result.current.pageIndex).toBe(1);
+    expect(result.current.hasPrevPage).toBe(true);
+    expect(mockedListAlerts).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: 'cur_page_2' }),
+      expect.any(AbortSignal)
+    );
+
+    // Background poll on Page 2 keeps Page 2 active with cur_page_2 and marks staleOnLaterPage
+    await act(async () => {
+      jest.advanceTimersByTime(10000);
+      await Promise.resolve();
+    });
+    expect(result.current.pageIndex).toBe(1);
+    expect(result.current.staleOnLaterPage).toBe(true);
+    expect(mockedListAlerts).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: 'cur_page_2' }),
+      expect.any(AbortSignal)
+    );
+
+    // Navigate back to Page 1 -> drops cursor and clears stale flag
+    await act(async () => {
+      await result.current.goPrevPage();
+    });
+    expect(result.current.pageIndex).toBe(0);
+    expect(result.current.hasPrevPage).toBe(false);
+    expect(result.current.staleOnLaterPage).toBe(false);
   });
 });

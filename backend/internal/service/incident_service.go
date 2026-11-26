@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -22,19 +24,27 @@ import (
 
 const metadataCacheTTL = 5 * time.Minute
 
+var snowSysIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 // IncidentRepository abstracts PostgreSQL operations needed by IncidentService.
 type IncidentRepository interface {
-	ReserveIncidentCreation(ctx context.Context, alertID string, op auth.OperatorContext, req model.CreateIncidentRequest, allowRetrospective bool) (*store.IncidentReservation, error)
-	FinalizeIncidentCreated(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool) (*model.ServiceNowIncident, error)
-	FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg string) error
-	ReserveBulkIncidentCreation(ctx context.Context, alertIDs []string, op auth.OperatorContext, req model.CreateBulkIncidentRequest, allowTriage bool) (*store.BulkIncidentReservation, error)
-	FinalizeBulkIncidentCreated(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool) (*model.ServiceNowIncident, error)
+	ReserveIncidentCreation(ctx context.Context, alertID string, op auth.OperatorContext, req model.CreateIncidentRequest, allowRetrospective bool, idem store.IdempotencyMeta) (*store.IncidentReservation, error)
+	FinalizeIncidentCreated(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool, idemKey string, warnings []string) (*model.ServiceNowIncident, error)
+	FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg, idemKey string) error
+	ReserveBulkIncidentCreation(ctx context.Context, alertIDs []string, op auth.OperatorContext, req model.CreateBulkIncidentRequest, allowTriage bool, idem store.IdempotencyMeta) (*store.BulkIncidentReservation, error)
+	FinalizeBulkIncidentCreated(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool, warnings []string) (*model.ServiceNowIncident, error)
 	FinalizeBulkIncidentFailed(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, errMsg string) error
 	SaveLinkedIncident(ctx context.Context, alertID string, op auth.OperatorContext, snowInc store.SnowCreateResult, allowRetrospective bool) (*model.IncidentSyncResponse, error)
 	GetAlertAndIncident(ctx context.Context, alertID string) (model.AlertState, *model.ServiceNowIncident, error)
 	UpdateIncidentForAlert(ctx context.Context, alertID string, op auth.OperatorContext, update store.SnowSyncUpdate) (*model.IncidentSyncResponse, error)
 	UpdateIncidentsBySysID(ctx context.Context, sysID string, update store.SnowSyncUpdate, actorType model.ActorType, actorLogin string, logOnlyOnChange bool) (int, error)
 	RecordWorkNotePosted(ctx context.Context, alertID string, alertState model.AlertState, op auth.OperatorContext, noteText string, incidentNumber *string) (*model.AuditEvent, error)
+	GetIncidentActiveStatus(ctx context.Context, snowSysID string) (*model.IncidentActiveStatusResponse, error)
+	GetAutoReopenState(ctx context.Context, snowSysID string) (*store.AutoReopenState, error)
+	RecordIncidentAutoReopened(ctx context.Context, snowSysID string, update store.SnowSyncUpdate, workNote, triggerSource string, activeAlertCount int) error
+	UpsertTeamAssignmentGroup(ctx context.Context, team, assignmentGroup string, op auth.OperatorContext) error
+	LookupTeamAssignmentGroup(ctx context.Context, team string) (string, error)
+	ListTeamAssignmentGroups(ctx context.Context) (map[string]string, error)
 }
 
 // SnowTableClient abstracts ServiceNow Table API methods needed by IncidentService.
@@ -44,6 +54,7 @@ type SnowTableClient interface {
 	GetIncidentsBySysIDs(ctx context.Context, operation string, sysIDs []string) ([]servicenow.IncidentRecord, error)
 	CreateIncident(ctx context.Context, payload servicenow.CreateIncidentPayload) (*servicenow.IncidentRecord, error)
 	PostWorkNote(ctx context.Context, snowSysID, workNotes string) error
+	ReopenIncident(ctx context.Context, snowSysID, workNotes string) (*servicenow.IncidentRecord, error)
 	ListAssignmentGroups(ctx context.Context) ([]model.AssignmentGroupInfo, error)
 }
 
@@ -64,6 +75,9 @@ type IncidentService struct {
 	metaMu          sync.Mutex
 	cachedGroups    []model.AssignmentGroupInfo
 	groupsFetchedAt time.Time
+
+	reopenMu    sync.Mutex
+	reopenLocks map[string]*sync.Mutex
 }
 
 // NewIncidentService constructs an IncidentService.
@@ -76,21 +90,24 @@ func NewIncidentService(
 	logger *slog.Logger,
 ) *IncidentService {
 	return &IncidentService{
-		repo:       repo,
-		snowClient: snowClient,
-		caller:     caller,
-		cfg:        cfg,
-		logWriter:  logWriter,
-		logger:     logger,
+		repo:        repo,
+		snowClient:  snowClient,
+		caller:      caller,
+		cfg:         cfg,
+		logWriter:   logWriter,
+		logger:      logger,
+		reopenLocks: make(map[string]*sync.Mutex),
 	}
 }
 
-// CreateIncident executes two-phase incident reservation + ServiceNow Table API creation.
+// CreateIncident executes two-phase incident reservation + ServiceNow Table API creation,
+// honoring Idempotency-Key replays when provided.
 func (s *IncidentService) CreateIncident(
 	ctx context.Context,
 	alertID string,
 	op auth.OperatorContext,
 	req model.CreateIncidentRequest,
+	idempotencyKey string,
 ) (*model.CreateIncidentResponse, error) {
 	req.ShortDescription = strings.TrimSpace(req.ShortDescription)
 	if len(req.ShortDescription) < 5 || len(req.ShortDescription) > 160 {
@@ -113,10 +130,16 @@ func (s *IncidentService) CreateIncident(
 		req.Category = s.cfg.DefaultCategory
 	}
 
+	idemMeta := buildSingleIdempotencyMeta(idempotencyKey, alertID, req)
+
 	// Phase 1: Tx 1 reserve pending row (no HTTP inside DB transaction).
-	resv, err := s.repo.ReserveIncidentCreation(ctx, alertID, op, req, s.cfg.AllowRetrospectiveIncident)
+	resv, err := s.repo.ReserveIncidentCreation(ctx, alertID, op, req, s.cfg.AllowRetrospectiveIncident, idemMeta)
 	if err != nil {
 		return nil, err
+	}
+	if resv.Replayed && resv.ReplayResponse != nil {
+		resv.ReplayResponse.Replayed = true
+		return resv.ReplayResponse, nil
 	}
 
 	// Phase 2: External ServiceNow calls outside DB transaction.
@@ -125,18 +148,20 @@ func (s *IncidentService) CreateIncident(
 	if resv.IsRetry {
 		existing, lookupErr := s.snowClient.FindIncidentByCorrelationID(ctx, alertID)
 		if lookupErr != nil {
-			_ = s.repo.FinalizeIncidentFailed(ctx, alertID, resv.IncidentID, resv.Alert.State, op, lookupErr.Error())
+			_ = s.repo.FinalizeIncidentFailed(ctx, alertID, resv.IncidentID, resv.Alert.State, op, lookupErr.Error(), idemMeta.Key)
 			return nil, lookupErr
 		}
 		if existing != nil {
-			inc, finErr := s.repo.FinalizeIncidentCreated(ctx, alertID, resv.IncidentID, resv.Alert.State, op, existing.ToCreateResult(), callerRes, true)
+			warnings := buildCallerWarnings(callerRes, op)
+			inc, finErr := s.repo.FinalizeIncidentCreated(ctx, alertID, resv.IncidentID, resv.Alert.State, op, existing.ToCreateResult(), callerRes, true, idemMeta.Key, warnings)
 			if finErr != nil {
 				return nil, finErr
 			}
+			s.recordLearnedTeamGroup(ctx, []model.AlertDetail{resv.Alert}, req.AssignmentGroup, existing.AssignmentGroup, op)
 			return &model.CreateIncidentResponse{
 				AlertID:            alertID,
 				ServiceNowIncident: inc,
-				Warnings:           buildCallerWarnings(callerRes, op),
+				Warnings:           warnings,
 			}, nil
 		}
 	}
@@ -147,7 +172,7 @@ func (s *IncidentService) CreateIncident(
 	}
 	assignGroup := req.AssignmentGroup
 	if assignGroup == "" {
-		assignGroup = resolveDefaultAssignmentGroup([]model.AlertDetail{resv.Alert}, s.cfg.DefaultAssignmentGroup)
+		assignGroup = s.resolveDefaultAssignmentGroup(ctx, []model.AlertDetail{resv.Alert}, s.cfg.DefaultAssignmentGroup)
 	}
 
 	payload := servicenow.CreateIncidentPayload{
@@ -181,20 +206,22 @@ func (s *IncidentService) CreateIncident(
 	}
 
 	if createErr != nil {
-		_ = s.repo.FinalizeIncidentFailed(ctx, alertID, resv.IncidentID, resv.Alert.State, op, createErr.Error())
+		_ = s.repo.FinalizeIncidentFailed(ctx, alertID, resv.IncidentID, resv.Alert.State, op, createErr.Error(), idemMeta.Key)
 		return nil, createErr
 	}
 
 	// Phase 3: Tx 2 finalize created incident.
-	inc, finErr := s.repo.FinalizeIncidentCreated(ctx, alertID, resv.IncidentID, resv.Alert.State, op, created.ToCreateResult(), callerRes, false)
+	warnings := buildCallerWarnings(callerRes, op)
+	inc, finErr := s.repo.FinalizeIncidentCreated(ctx, alertID, resv.IncidentID, resv.Alert.State, op, created.ToCreateResult(), callerRes, false, idemMeta.Key, warnings)
 	if finErr != nil {
 		return nil, finErr
 	}
+	s.recordLearnedTeamGroup(ctx, []model.AlertDetail{resv.Alert}, assignGroup, created.AssignmentGroup, op)
 
 	return &model.CreateIncidentResponse{
 		AlertID:            alertID,
 		ServiceNowIncident: inc,
-		Warnings:           buildCallerWarnings(callerRes, op),
+		Warnings:           warnings,
 	}, nil
 }
 
@@ -204,6 +231,7 @@ func (s *IncidentService) CreateBulkIncident(
 	ctx context.Context,
 	op auth.OperatorContext,
 	req model.CreateBulkIncidentRequest,
+	idempotencyKey string,
 ) (*model.CreateBulkIncidentResponse, error) {
 	if len(req.AlertIDs) == 0 || len(req.AlertIDs) > 50 {
 		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_ids must contain between 1 and 50 alert IDs.")
@@ -235,10 +263,16 @@ func (s *IncidentService) CreateBulkIncident(
 		req.Category = s.cfg.DefaultCategory
 	}
 
+	idemMeta := buildBulkIdempotencyMeta(idempotencyKey, req)
+
 	allowTriage := auth.HasPermission(op, auth.PermAlertsTriage)
-	resv, err := s.repo.ReserveBulkIncidentCreation(ctx, req.AlertIDs, op, req, allowTriage)
+	resv, err := s.repo.ReserveBulkIncidentCreation(ctx, req.AlertIDs, op, req, allowTriage, idemMeta)
 	if err != nil {
 		return nil, err
+	}
+	if resv.Replayed && resv.ReplayResponse != nil {
+		resv.ReplayResponse.Replayed = true
+		return resv.ReplayResponse, nil
 	}
 
 	resolvedIDs := make([]string, 0, len(resv.Alerts))
@@ -248,21 +282,34 @@ func (s *IncidentService) CreateBulkIncident(
 
 	callerRes := s.caller.Resolve(ctx, req.CallerMode, op)
 
-	if resv.IsRetry {
-		existing, lookupErr := s.snowClient.FindIncidentByCorrelationID(ctx, resv.PrimaryAlertID)
-		if lookupErr != nil {
-			_ = s.repo.FinalizeBulkIncidentFailed(ctx, resv, op, lookupErr.Error())
-			return nil, lookupErr
+	if resv.IsRetry || len(resv.RetryCorrelationIDs) > 0 {
+		candidates := resv.RetryCorrelationIDs
+		if len(candidates) == 0 {
+			candidates = []string{resv.PrimaryAlertID}
 		}
-		if existing != nil {
-			inc, finErr := s.repo.FinalizeBulkIncidentCreated(ctx, resv, op, existing.ToCreateResult(), callerRes, true)
+		var adoptedRec *servicenow.IncidentRecord
+		for _, corrID := range candidates {
+			existing, lookupErr := s.snowClient.FindIncidentByCorrelationID(ctx, corrID)
+			if lookupErr != nil {
+				_ = s.repo.FinalizeBulkIncidentFailed(ctx, resv, op, lookupErr.Error())
+				return nil, lookupErr
+			}
+			if existing != nil {
+				adoptedRec = existing
+				break
+			}
+		}
+		if adoptedRec != nil {
+			warnings := buildCallerWarnings(callerRes, op)
+			inc, finErr := s.repo.FinalizeBulkIncidentCreated(ctx, resv, op, adoptedRec.ToCreateResult(), callerRes, true, warnings)
 			if finErr != nil {
 				return nil, finErr
 			}
+			s.recordLearnedTeamGroup(ctx, resv.Alerts, req.AssignmentGroup, adoptedRec.AssignmentGroup, op)
 			return &model.CreateBulkIncidentResponse{
 				AlertIDs:           resolvedIDs,
 				ServiceNowIncident: inc,
-				Warnings:           buildCallerWarnings(callerRes, op),
+				Warnings:           warnings,
 			}, nil
 		}
 	}
@@ -273,7 +320,7 @@ func (s *IncidentService) CreateBulkIncident(
 	}
 	assignGroup := req.AssignmentGroup
 	if assignGroup == "" {
-		assignGroup = resolveDefaultAssignmentGroup(resv.Alerts, s.cfg.DefaultAssignmentGroup)
+		assignGroup = s.resolveDefaultAssignmentGroup(ctx, resv.Alerts, s.cfg.DefaultAssignmentGroup)
 	}
 
 	payload := servicenow.CreateIncidentPayload{
@@ -311,15 +358,17 @@ func (s *IncidentService) CreateBulkIncident(
 		return nil, createErr
 	}
 
-	inc, finErr := s.repo.FinalizeBulkIncidentCreated(ctx, resv, op, created.ToCreateResult(), callerRes, false)
+	warnings := buildCallerWarnings(callerRes, op)
+	inc, finErr := s.repo.FinalizeBulkIncidentCreated(ctx, resv, op, created.ToCreateResult(), callerRes, false, warnings)
 	if finErr != nil {
 		return nil, finErr
 	}
+	s.recordLearnedTeamGroup(ctx, resv.Alerts, assignGroup, created.AssignmentGroup, op)
 
 	return &model.CreateBulkIncidentResponse{
 		AlertIDs:           resolvedIDs,
 		ServiceNowIncident: inc,
-		Warnings:           buildCallerWarnings(callerRes, op),
+		Warnings:           warnings,
 	}, nil
 }
 
@@ -330,9 +379,9 @@ func (s *IncidentService) LinkIncident(
 	op auth.OperatorContext,
 	req model.LinkIncidentRequest,
 ) (*model.IncidentSyncResponse, error) {
-	num := strings.TrimSpace(req.IncidentNumber)
-	if num == "" {
-		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "incident_number is required.")
+	num, err := servicenow.ValidateIncidentNumber(req.IncidentNumber)
+	if err != nil {
+		return nil, err
 	}
 
 	found, err := s.snowClient.FindIncidentByNumber(ctx, num)
@@ -349,7 +398,7 @@ func (s *IncidentService) LinkIncident(
 	}
 
 	if req.PostWorkNote {
-		note := fmt.Sprintf("[Grafana NOC — %s (%s)] Linked alert episode %s in Grafana.", op.Login, emailOrLogin(op), alertID)
+		note := fmt.Sprintf("[Grafana NOC — %s] Linked alert episode %s in Grafana.", formatOperatorAttribution(op), alertID)
 		if postErr := s.snowClient.PostWorkNote(ctx, found.SysID, note); postErr != nil && s.logger != nil {
 			s.logger.Warn("failed posting link work note to servicenow",
 				slog.String("component", "incident_service"),
@@ -398,7 +447,7 @@ func (s *IncidentService) PostWorkNote(
 		return nil, err
 	}
 
-	formatted := fmt.Sprintf("[Grafana NOC — %s (%s)] %s", op.Login, emailOrLogin(op), note)
+	formatted := fmt.Sprintf("[Grafana NOC — %s] %s", formatOperatorAttribution(op), note)
 	if err := s.snowClient.PostWorkNote(ctx, *inc.SnowSysID, formatted); err != nil {
 		return nil, err
 	}
@@ -421,6 +470,10 @@ func (s *IncidentService) GetMetadata(ctx context.Context) model.ServiceNowMetad
 	}
 
 	groups, reachable := s.getCachedOrLiveGroups(ctx)
+	teamGroups, err := s.repo.ListTeamAssignmentGroups(ctx)
+	if err != nil || teamGroups == nil {
+		teamGroups = map[string]string{}
+	}
 	return model.ServiceNowMetadataResponse{
 		DefaultAssignmentGroup: s.cfg.DefaultAssignmentGroup,
 		DefaultCategory:        s.cfg.DefaultCategory,
@@ -428,8 +481,18 @@ func (s *IncidentService) GetMetadata(ctx context.Context) model.ServiceNowMetad
 		DefaultCallerMode:      model.CallerModeSSOUser,
 		DefaultCallerUsername:  s.cfg.DefaultCallerUsername,
 		AssignmentGroups:       groups,
+		TeamAssignmentGroups:   teamGroups,
 		SnowReachable:          reachable,
 	}
+}
+
+// GetIncidentActiveStatus reports whether any active alerts remain linked to snowSysID.
+func (s *IncidentService) GetIncidentActiveStatus(ctx context.Context, snowSysID string) (*model.IncidentActiveStatusResponse, error) {
+	trimmed := strings.TrimSpace(snowSysID)
+	if !snowSysIDPattern.MatchString(trimmed) {
+		return nil, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "snow_sys_id must be 1-64 alphanumeric, underscore, or hyphen characters.")
+	}
+	return s.repo.GetIncidentActiveStatus(ctx, trimmed)
 }
 
 func (s *IncidentService) getCachedOrLiveGroups(ctx context.Context) ([]model.AssignmentGroupInfo, bool) {
@@ -497,8 +560,149 @@ func (s *IncidentService) ProcessInboundWebhook(ctx context.Context, rawBody []b
 		return 0, err
 	}
 
+	if updatedCount > 0 && payload.State == 6 {
+		s.HandlePrematureResolvedState(ctx, sysID, "webhook")
+	}
+
 	s.logInboundWebhook(ctx, hash, http.StatusOK, started, nil)
 	return updatedCount, nil
+}
+
+// HandlePrematureResolvedState auto-reopens a ServiceNow incident moved to 6 (Resolved) if
+// any linked alert remains active (firing/acknowledged), subject to cooldown and attempt limits.
+func (s *IncidentService) HandlePrematureResolvedState(ctx context.Context, snowSysID, triggerSource string) {
+	trimmed := strings.TrimSpace(snowSysID)
+	if trimmed == "" {
+		return
+	}
+
+	mu := s.acquireReopenLock(trimmed)
+	mu.Lock()
+	defer mu.Unlock()
+
+	st, err := s.repo.GetAutoReopenState(ctx, trimmed)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed loading auto-reopen state for incident",
+				slog.String("component", "incident_service"),
+				slog.String("snow_sys_id", trimmed),
+				slog.String("trigger_source", triggerSource),
+				slog.String("error", err.Error()),
+			)
+		}
+		return
+	}
+	if st == nil || len(st.ActiveAlerts) == 0 {
+		return
+	}
+
+	maxAttempts := s.autoReopenMaxAttempts()
+	if st.MaxAutoReopenCount >= maxAttempts {
+		if s.logger != nil {
+			s.logger.Warn("auto-reopen attempt cap reached; leaving incident resolved for NOC warning badge",
+				slog.String("component", "incident_service"),
+				slog.String("snow_sys_id", trimmed),
+				slog.String("incident_number", st.IncidentNumber),
+				slog.Int("auto_reopen_count", st.MaxAutoReopenCount),
+				slog.Int("max_attempts", maxAttempts),
+			)
+		}
+		return
+	}
+
+	cooldown := s.autoReopenCooldown()
+	if st.LastAutoReopenedAt != nil && time.Since(*st.LastAutoReopenedAt) < cooldown {
+		if s.logger != nil {
+			s.logger.Warn("auto-reopen cooldown active; skipping ServiceNow reopen",
+				slog.String("component", "incident_service"),
+				slog.String("snow_sys_id", trimmed),
+				slog.String("incident_number", st.IncidentNumber),
+				slog.Duration("cooldown", cooldown),
+			)
+		}
+		return
+	}
+
+	names := make([]string, 0, min(len(st.ActiveAlerts), 5))
+	seen := make(map[string]struct{}, 5)
+	for _, a := range st.ActiveAlerts {
+		if _, ok := seen[a.AlertName]; ok {
+			continue
+		}
+		seen[a.AlertName] = struct{}{}
+		names = append(names, a.AlertName)
+		if len(names) >= 5 {
+			break
+		}
+	}
+	note := fmt.Sprintf(
+		"[Grafana NOC] Auto-reopened: %d linked alert(s) still firing (%s). Please wait until all linked alerts recover before resolving this incident.",
+		len(st.ActiveAlerts),
+		strings.Join(names, ", "),
+	)
+
+	rec, err := s.snowClient.ReopenIncident(ctx, trimmed, note)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed auto-reopening prematurely resolved ServiceNow incident",
+				slog.String("component", "incident_service"),
+				slog.String("snow_sys_id", trimmed),
+				slog.String("incident_number", st.IncidentNumber),
+				slog.String("trigger_source", triggerSource),
+				slog.String("error", err.Error()),
+			)
+		}
+		return
+	}
+
+	syncUpdate := store.SnowSyncUpdate{
+		State:      2,
+		StateLabel: model.SnowStateLabel(2),
+	}
+	if rec != nil {
+		if rec.Priority != nil {
+			syncUpdate.Priority = rec.Priority
+		}
+		if rec.AssignmentGroup != nil {
+			syncUpdate.AssignmentGroup = rec.AssignmentGroup
+		}
+	}
+
+	if err := s.repo.RecordIncidentAutoReopened(ctx, trimmed, syncUpdate, note, triggerSource, len(st.ActiveAlerts)); err != nil && s.logger != nil {
+		s.logger.Warn("failed recording auto-reopen state in PostgreSQL",
+			slog.String("component", "incident_service"),
+			slog.String("snow_sys_id", trimmed),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+func (s *IncidentService) acquireReopenLock(snowSysID string) *sync.Mutex {
+	s.reopenMu.Lock()
+	defer s.reopenMu.Unlock()
+	if s.reopenLocks == nil {
+		s.reopenLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := s.reopenLocks[snowSysID]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.reopenLocks[snowSysID] = mu
+	}
+	return mu
+}
+
+func (s *IncidentService) autoReopenCooldown() time.Duration {
+	if s.cfg != nil && s.cfg.SnowAutoReopenCooldown > 0 {
+		return s.cfg.SnowAutoReopenCooldown
+	}
+	return 5 * time.Minute
+}
+
+func (s *IncidentService) autoReopenMaxAttempts() int {
+	if s.cfg != nil && s.cfg.SnowAutoReopenMaxAttempts > 0 {
+		return s.cfg.SnowAutoReopenMaxAttempts
+	}
+	return 3
 }
 
 func (s *IncidentService) logInboundWebhook(ctx context.Context, hash string, status int, started time.Time, errMsg *string) {
@@ -515,19 +719,62 @@ func (s *IncidentService) logInboundWebhook(ctx context.Context, hash string, st
 	})
 }
 
-func resolveDefaultAssignmentGroup(alerts []model.AlertDetail, fallback string) string {
+func (s *IncidentService) resolveDefaultAssignmentGroup(ctx context.Context, alerts []model.AlertDetail, fallback string) string {
+	if team := sharedPrometheusTeam(alerts); team != "" {
+		if learned, err := s.repo.LookupTeamAssignmentGroup(ctx, team); err == nil && learned != "" {
+			return learned
+		}
+	}
 	for _, a := range alerts {
 		if g := strings.TrimSpace(a.Labels["assignment_group"]); g != "" {
 			return g
 		}
-		if t := strings.TrimSpace(a.Labels["team"]); t != "" {
-			return t
-		}
-		if a.AssignedTeam != nil && strings.TrimSpace(*a.AssignedTeam) != "" {
-			return strings.TrimSpace(*a.AssignedTeam)
-		}
 	}
 	return fallback
+}
+
+func sharedPrometheusTeam(alerts []model.AlertDetail) string {
+	if len(alerts) == 0 {
+		return ""
+	}
+	first := strings.TrimSpace(alerts[0].Labels["team"])
+	if first == "" {
+		return ""
+	}
+	for _, a := range alerts[1:] {
+		if strings.TrimSpace(a.Labels["team"]) != first {
+			return ""
+		}
+	}
+	return first
+}
+
+func (s *IncidentService) recordLearnedTeamGroup(
+	ctx context.Context,
+	alerts []model.AlertDetail,
+	submittedGroup string,
+	createdGroup *string,
+	op auth.OperatorContext,
+) {
+	team := sharedPrometheusTeam(alerts)
+	if team == "" {
+		return
+	}
+	effective := strings.TrimSpace(submittedGroup)
+	if createdGroup != nil && strings.TrimSpace(*createdGroup) != "" {
+		effective = strings.TrimSpace(*createdGroup)
+	}
+	if effective == "" {
+		return
+	}
+	if err := s.repo.UpsertTeamAssignmentGroup(ctx, team, effective, op); err != nil && s.logger != nil {
+		s.logger.Warn("failed persisting learned team assignment group mapping",
+			slog.String("component", "incident_service"),
+			slog.String("team", team),
+			slog.String("assignment_group", effective),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 func formatBulkDefaultDescription(grafanaPublicURL string, alerts []model.AlertDetail) string {
@@ -588,7 +835,7 @@ func formatDefaultDescription(grafanaPublicURL string, alert model.AlertDetail) 
 
 func formatInitialWorkNotes(op auth.OperatorContext, operatorNotes string, caller store.CallerResolution) string {
 	var parts []string
-	parts = append(parts, fmt.Sprintf("[Grafana NOC] Initiated in Grafana by: %s (%s).", op.Name, emailOrLogin(op)))
+	parts = append(parts, fmt.Sprintf("[Grafana NOC] Initiated in Grafana by: %s.", formatOperatorAttribution(op)))
 	if strings.TrimSpace(operatorNotes) != "" {
 		parts = append(parts, strings.TrimSpace(operatorNotes))
 	}
@@ -596,6 +843,43 @@ func formatInitialWorkNotes(op auth.OperatorContext, operatorNotes string, calle
 		parts = append(parts, "Caller fallback note: "+*caller.FallbackReason)
 	}
 	return strings.Join(parts, "\n")
+}
+
+func formatOperatorAttribution(op auth.OperatorContext) string {
+	name := strings.TrimSpace(op.Name)
+	login := strings.TrimSpace(op.Login)
+	email := strings.TrimSpace(op.Email)
+
+	primary := name
+	if primary == "" {
+		primary = login
+	}
+	if primary == "" {
+		primary = email
+	}
+	if primary == "" {
+		return "unknown"
+	}
+
+	var extras []string
+	addExtra := func(val string) {
+		if val == "" || strings.EqualFold(val, primary) {
+			return
+		}
+		for _, existing := range extras {
+			if strings.EqualFold(existing, val) {
+				return
+			}
+		}
+		extras = append(extras, val)
+	}
+	addExtra(login)
+	addExtra(email)
+
+	if len(extras) == 0 {
+		return primary
+	}
+	return fmt.Sprintf("%s (%s)", primary, strings.Join(extras, ", "))
 }
 
 func buildCallerWarnings(caller store.CallerResolution, op auth.OperatorContext) []string {
@@ -630,4 +914,84 @@ func parseOptionalTimePtr(s *string) *time.Time {
 		}
 	}
 	return nil
+}
+
+func buildSingleIdempotencyMeta(key, alertID string, req model.CreateIncidentRequest) store.IdempotencyMeta {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return store.IdempotencyMeta{}
+	}
+	canonical, _ := json.Marshal(struct {
+		AlertID          string               `json:"alert_id"`
+		ShortDescription string               `json:"short_description"`
+		Description      string               `json:"description"`
+		Impact           int16                `json:"impact"`
+		Urgency          int16                `json:"urgency"`
+		AssignmentGroup  string               `json:"assignment_group"`
+		Category         string               `json:"category"`
+		CallerMode       model.SnowCallerMode `json:"caller_mode"`
+		WorkNotes        string               `json:"work_notes"`
+	}{
+		AlertID:          alertID,
+		ShortDescription: req.ShortDescription,
+		Description:      strings.TrimSpace(req.Description),
+		Impact:           req.Impact,
+		Urgency:          req.Urgency,
+		AssignmentGroup:  req.AssignmentGroup,
+		Category:         req.Category,
+		CallerMode:       req.CallerMode,
+		WorkNotes:        strings.TrimSpace(req.WorkNotes),
+	})
+	return store.IdempotencyMeta{
+		Key:         key,
+		Endpoint:    "POST:/api/v1/alerts/{alert_id}/servicenow/incident",
+		RequestHash: sha256Hex(canonical),
+	}
+}
+
+func buildBulkIdempotencyMeta(key string, req model.CreateBulkIncidentRequest) store.IdempotencyMeta {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return store.IdempotencyMeta{}
+	}
+	seen := make(map[string]struct{}, len(req.AlertIDs))
+	sortedIDs := make([]string, 0, len(req.AlertIDs))
+	for _, raw := range req.AlertIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			sortedIDs = append(sortedIDs, id)
+		}
+	}
+	sort.Strings(sortedIDs)
+
+	canonical, _ := json.Marshal(struct {
+		AlertIDs         []string             `json:"alert_ids"`
+		ShortDescription string               `json:"short_description"`
+		Description      string               `json:"description"`
+		Impact           int16                `json:"impact"`
+		Urgency          int16                `json:"urgency"`
+		AssignmentGroup  string               `json:"assignment_group"`
+		Category         string               `json:"category"`
+		CallerMode       model.SnowCallerMode `json:"caller_mode"`
+		WorkNotes        string               `json:"work_notes"`
+	}{
+		AlertIDs:         sortedIDs,
+		ShortDescription: req.ShortDescription,
+		Description:      strings.TrimSpace(req.Description),
+		Impact:           req.Impact,
+		Urgency:          req.Urgency,
+		AssignmentGroup:  req.AssignmentGroup,
+		Category:         req.Category,
+		CallerMode:       req.CallerMode,
+		WorkNotes:        strings.TrimSpace(req.WorkNotes),
+	})
+	return store.IdempotencyMeta{
+		Key:         key,
+		Endpoint:    "POST:/api/v1/servicenow/incidents/bulk",
+		RequestHash: sha256Hex(canonical),
+	}
 }

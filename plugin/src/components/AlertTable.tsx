@@ -1,15 +1,17 @@
 import React from 'react';
 import { css } from '@emotion/css';
 import { GrafanaTheme2 } from '@grafana/data';
-import { Badge, Button, Spinner, Tooltip, useTheme2 } from '@grafana/ui';
+import { Button, Spinner, Tooltip, useTheme2 } from '@grafana/ui';
 import { Alert } from '../types/api';
 import {
+  formatDurationBetween,
   formatRelativeTime,
   getAlertEnvironment,
   getAlertSite,
   getAlertTeam,
-  isAlertSelectableForIncident,
+  isAlertSelectableForBulk,
 } from '../utils/format';
+import { RowActionMenu } from './RowActionMenu';
 
 interface AlertTableProps {
   alerts: Alert[];
@@ -18,6 +20,8 @@ interface AlertTableProps {
   canWriteIncidents: boolean;
   busyAlertId: string | null;
   selectedAlertIds: Set<string>;
+  maxBulkSelection?: number;
+  showServiceNowColumn: boolean;
   onToggleSelectAlert: (alertId: string) => void;
   onToggleSelectAll: (selectableIds: string[], selectAll: boolean) => void;
   onSelectAlert: (alert: Alert) => void;
@@ -43,6 +47,8 @@ export const AlertTable: React.FC<AlertTableProps> = ({
   canWriteIncidents,
   busyAlertId,
   selectedAlertIds,
+  maxBulkSelection = 50,
+  showServiceNowColumn,
   onToggleSelectAlert,
   onToggleSelectAll,
   onSelectAlert,
@@ -77,13 +83,27 @@ export const AlertTable: React.FC<AlertTableProps> = ({
     );
   }
 
-  const selectableIds = alerts.filter(isAlertSelectableForIncident).map((a) => a.id);
+  const selectableIds = alerts.filter(isAlertSelectableForBulk).map((a) => a.id);
+  const atSelectionCap = selectedAlertIds.size >= maxBulkSelection;
   const allSelectableChecked =
-    selectableIds.length > 0 && selectableIds.every((id) => selectedAlertIds.has(id));
+    selectableIds.length > 0 &&
+    (selectableIds.every((id) => selectedAlertIds.has(id)) ||
+      (atSelectionCap && selectableIds.some((id) => selectedAlertIds.has(id))));
 
   return (
     <div className={styles.tableWrapper}>
       <table className={styles.table} aria-label="Alert queue table">
+        <colgroup>
+          <col style={{ width: '36px' }} />
+          <col style={{ width: '92px' }} />
+          <col />
+          <col style={{ width: '76px' }} />
+          <col style={{ width: '104px' }} />
+          <col style={{ width: '124px' }} />
+          <col style={{ width: '92px' }} />
+          {showServiceNowColumn && <col style={{ width: '152px' }} />}
+          <col style={{ width: '48px' }} />
+        </colgroup>
         <thead>
           <tr>
             <th className={styles.checkboxCell}>
@@ -96,15 +116,15 @@ export const AlertTable: React.FC<AlertTableProps> = ({
               />
             </th>
             <th>Severity</th>
-            <th>State</th>
             <th>Alert</th>
-            <th>Environment</th>
+            <th>Env</th>
             <th>Site</th>
             <th>Team</th>
             <th>Duration</th>
-            <th>Owner</th>
-            <th>ServiceNow</th>
-            <th>Actions</th>
+            {showServiceNowColumn && <th>ServiceNow</th>}
+            <th className={styles.actionsHeaderCell}>
+              <span className={styles.srOnly}>Actions</span>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -112,338 +132,195 @@ export const AlertTable: React.FC<AlertTableProps> = ({
             const inc = alert.servicenow_incident;
             const hasLinkedIncident =
               Boolean(inc) && (inc?.sync_status === 'created' || inc?.sync_status === 'linked');
-            const isAckWithoutIncident = alert.state === 'acknowledged' && !hasLinkedIncident;
             const isBusy = busyAlertId === alert.id;
-            const selectable = isAlertSelectableForIncident(alert);
+            const selectable = isAlertSelectableForBulk(alert);
             const checked = selectedAlertIds.has(alert.id);
             const env = getAlertEnvironment(alert);
             const site = getAlertSite(alert);
             const teamInfo = getAlertTeam(alert);
+            const isCritical = alert.severity.toLowerCase() === 'critical';
 
             return (
-              <React.Fragment key={alert.id}>
-                <tr
-                  className={`${styles.row} ${idx % 2 === 1 ? styles.zebraRow : ''} ${
-                    checked ? styles.selectedRow : ''
-                  } ${isAckWithoutIncident ? styles.rowWithActionBar : ''}`}
-                  data-testid={`alert-row-${alert.id}`}
+              <tr
+                key={alert.id}
+                className={`${styles.row} ${idx % 2 === 1 ? styles.zebraRow : ''} ${
+                  checked ? styles.selectedRow : ''
+                }`}
+                data-testid={`alert-row-${alert.id}`}
+              >
+                <td
+                  className={`${styles.checkboxCell} ${
+                    isCritical ? styles.criticalStripe : styles.warningStripe
+                  }`}
                 >
-                  <td className={styles.checkboxCell}>
-                    <input
-                      type="checkbox"
-                      aria-label={`Select ${alert.alert_name}`}
-                      disabled={!selectable}
-                      checked={checked}
-                      onChange={() => onToggleSelectAlert(alert.id)}
-                    />
-                  </td>
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${alert.alert_name}`}
+                    disabled={!selectable || (!checked && atSelectionCap)}
+                    title={
+                      !checked && atSelectionCap
+                        ? `Maximum ${maxBulkSelection} alerts can be selected per incident`
+                        : undefined
+                    }
+                    checked={checked}
+                    onChange={() => onToggleSelectAlert(alert.id)}
+                  />
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    <Badge text={alert.severity || 'unknown'} color={severityColor(alert.severity)} />
-                  </td>
+                <td className={styles.nowrapCell}>
+                  <span className={isCritical ? styles.sevCritical : styles.sevWarning}>
+                    {isCritical ? 'Critical' : 'Warning'}
+                  </span>
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    <Badge text={displayStateLabel(alert)} color={displayStateColor(alert)} />
-                  </td>
-
-                  <td className={styles.alertCell}>
+                <td className={styles.alertCell}>
+                  <div className={styles.alertTitleRow}>
                     <button
                       type="button"
                       className={styles.alertNameBtn}
+                      title={alert.alert_name}
                       onClick={() => onSelectAlert(alert)}
                     >
                       {alert.alert_name}
                     </button>
-                    {alert.annotations?.summary && (
-                      <div className={styles.summaryText} title={alert.annotations.summary}>
-                        {alert.annotations.summary}
-                      </div>
-                    )}
                     {alert.previous_episode_count > 0 && (
                       <button
                         type="button"
                         className={styles.historyLinkBtn}
                         onClick={() => onFilterByFingerprint(alert.fingerprint)}
                       >
-                        {alert.previous_episode_count} prior episode
-                        {alert.previous_episode_count === 1 ? '' : 's'}
+                        {alert.previous_episode_count} prior
                       </button>
                     )}
-                  </td>
+                  </div>
+                  {alert.annotations?.summary && (
+                    <div className={styles.summaryText} title={alert.annotations.summary}>
+                      {alert.annotations.summary}
+                    </div>
+                  )}
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    {env ? <span className={styles.metaPill}>{env}</span> : <span className={styles.mutedText}>—</span>}
-                  </td>
+                <td className={styles.ellipsisCell}>
+                  {env ? (
+                    <span className={styles.metaText} title={env}>
+                      {env}
+                    </span>
+                  ) : (
+                    <span className={styles.mutedDash}>—</span>
+                  )}
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    {site ? <span className={styles.metaPill}>{site}</span> : <span className={styles.mutedText}>—</span>}
-                  </td>
+                <td className={styles.ellipsisCell}>
+                  {site ? (
+                    <span className={styles.metaText} title={site}>
+                      {site}
+                    </span>
+                  ) : (
+                    <span className={styles.mutedDash}>—</span>
+                  )}
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    {teamInfo.team ? (
-                      <Tooltip
-                        content={
-                          teamInfo.source === 'label'
-                            ? 'From Prometheus team label'
-                            : `Tagged by ${teamInfo.taggedBy || 'operator'}`
-                        }
-                        placement="top"
-                      >
-                        <span>
-                          <Badge
-                            text={teamInfo.team}
-                            color={teamInfo.source === 'label' ? 'blue' : 'purple'}
-                          />
-                        </span>
-                      </Tooltip>
-                    ) : (
-                      <span className={styles.untaggedText}>Untagged</span>
-                    )}
-                  </td>
+                <td className={styles.ellipsisCell}>
+                  {teamInfo.team ? (
+                    <Tooltip
+                      content={
+                        teamInfo.source === 'label'
+                          ? 'From Prometheus team label'
+                          : `Tagged by ${teamInfo.taggedBy || 'operator'}`
+                      }
+                      placement="top"
+                    >
+                      <span className={styles.teamInline}>
+                        <span
+                          className={`${styles.teamDot} ${
+                            teamInfo.source === 'label' ? styles.teamDotLabel : styles.teamDotOperator
+                          }`}
+                          aria-hidden="true"
+                        />
+                        <span className={styles.teamText}>{teamInfo.team}</span>
+                      </span>
+                    </Tooltip>
+                  ) : (
+                    <span className={styles.mutedDash}>—</span>
+                  )}
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    {alert.state === 'resolved' && alert.resolved_at ? (
-                      <div>
-                        <div>Resolved {formatRelativeTime(alert.resolved_at)} ago</div>
-                        <div className={styles.mutedText}>Started {formatRelativeTime(alert.starts_at)} ago</div>
-                      </div>
-                    ) : (
-                      <div>
-                        <div>{formatRelativeTime(alert.starts_at)}</div>
-                        <div className={styles.mutedText}>v{alert.version}</div>
-                      </div>
-                    )}
-                  </td>
+                <td className={`${styles.nowrapCell} ${styles.durationCell}`}>
+                  {alert.state === 'resolved' && alert.resolved_at ? (
+                    <div>
+                      <div>{formatDurationBetween(alert.starts_at, alert.resolved_at)}</div>
+                      <div className={styles.mutedText}>Res {formatRelativeTime(alert.resolved_at)} ago</div>
+                    </div>
+                  ) : (
+                    <div>
+                      <div>{formatRelativeTime(alert.starts_at)}</div>
+                      <div className={styles.mutedText}>v{alert.version}</div>
+                    </div>
+                  )}
+                </td>
 
-                  <td className={styles.nowrapCell}>
-                    {alert.acknowledged_by ? (
-                      <div>
-                        <div>{alert.acknowledged_by}</div>
-                        {alert.acknowledged_at && (
-                          <div className={styles.mutedText}>{formatRelativeTime(alert.acknowledged_at)} ago</div>
-                        )}
-                      </div>
-                    ) : alert.dismissed_by ? (
-                      <div>Dismissed by {alert.dismissed_by}</div>
-                    ) : (
-                      <span className={styles.mutedText}>—</span>
-                    )}
-                  </td>
-
-                  <td>
-                    {!inc && <span className={styles.mutedText}>—</span>}
+                {showServiceNowColumn && (
+                  <td className={styles.ellipsisCell}>
+                    {!inc && <span className={styles.mutedDash}>—</span>}
                     {inc && inc.sync_status === 'pending' && (
                       <span className={styles.pendingSpan}>
                         <Spinner inline size="sm" /> Creating...
                       </span>
                     )}
-                    {inc && inc.sync_status === 'failed' && <Badge text="SNOW Failed" color="red" />}
+                    {inc && inc.sync_status === 'failed' && (
+                      <span className={styles.snowFailedText}>SNOW Failed</span>
+                    )}
                     {inc && hasLinkedIncident && (
                       <div className={styles.snowCol}>
-                        <div className={styles.snowLinkRow}>
-                          {inc.incident_url ? (
-                            <a
-                              href={inc.incident_url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className={styles.snowLink}
-                            >
-                              {inc.incident_number || 'Incident'} ↗
-                            </a>
-                          ) : (
-                            <span>{inc.incident_number || 'Incident'}</span>
+                        {inc.incident_url ? (
+                          <a
+                            href={inc.incident_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className={styles.snowLink}
+                            title={inc.incident_number || 'Incident'}
+                          >
+                            {inc.incident_number || 'Incident'} ↗
+                          </a>
+                        ) : (
+                          <span className={styles.snowLink}>{inc.incident_number || 'Incident'}</span>
+                        )}
+                        <div className={styles.snowSubRow}>
+                          {inc.snow_state_label && (
+                            <span className={styles.snowStateText}>{inc.snow_state_label}</span>
                           )}
-                          {inc.snow_state_label && <Badge text={inc.snow_state_label} color="blue" />}
+                          {alert.incident_drift_status === 'resolved_open_ticket' && (
+                            <span className={styles.driftOpenText}>· Open Drift</span>
+                          )}
+                          {alert.incident_drift_status === 'active_closed_ticket' && (
+                            <span className={styles.driftClosedText}>· Ticket Closed</span>
+                          )}
                         </div>
-                        {alert.incident_drift_status === 'resolved_open_ticket' && (
-                          <Badge text="Ticket Still Open" color="orange" />
-                        )}
-                        {alert.incident_drift_status === 'active_closed_ticket' && (
-                          <Badge text="Ticket Closed" color="red" />
-                        )}
                       </div>
                     )}
                   </td>
-
-                  <td className={styles.actionsCell}>
-                    <div className={styles.actionsRow}>
-                      {alert.state === 'firing' && (
-                        <>
-                          <GatedButton
-                            allowed={canTriage}
-                            disabledReason={DISABLED_TRIAGE_REASON}
-                            variant="primary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onAcknowledge(alert)}
-                          >
-                            Acknowledge
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canTriage}
-                            disabledReason={DISABLED_TRIAGE_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenDismiss(alert)}
-                          >
-                            Dismiss
-                          </GatedButton>
-                        </>
-                      )}
-
-                      {alert.state === 'acknowledged' && hasLinkedIncident && (
-                        <>
-                          <GatedButton
-                            allowed={canWriteIncidents}
-                            disabledReason={DISABLED_INCIDENT_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenWorkNote(alert)}
-                          >
-                            Add Work Note
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canWriteIncidents}
-                            disabledReason={DISABLED_INCIDENT_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onSyncIncident(alert)}
-                          >
-                            Sync Status
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canTriage}
-                            disabledReason={DISABLED_TRIAGE_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenDismiss(alert)}
-                          >
-                            Dismiss
-                          </GatedButton>
-                        </>
-                      )}
-
-                      {alert.state === 'dismissed' && (
-                        <GatedButton
-                          allowed={canTriage}
-                          disabledReason={DISABLED_TRIAGE_REASON}
-                          variant="secondary"
-                          size="sm"
-                          disabled={isBusy}
-                          onClick={() => onReopen(alert)}
-                        >
-                          Reopen
-                        </GatedButton>
-                      )}
-
-                      {alert.state === 'resolved' &&
-                        alert.incident_drift_status === 'resolved_open_ticket' &&
-                        inc && (
-                          <>
-                            <GatedButton
-                              allowed={canWriteIncidents}
-                              disabledReason={DISABLED_INCIDENT_REASON}
-                              variant="secondary"
-                              size="sm"
-                              disabled={isBusy}
-                              onClick={() => onSyncIncident(alert)}
-                            >
-                              Refresh Status
-                            </GatedButton>
-                            <GatedButton
-                              allowed={canWriteIncidents}
-                              disabledReason={DISABLED_INCIDENT_REASON}
-                              variant="primary"
-                              size="sm"
-                              disabled={isBusy}
-                              onClick={() => onOpenWorkNote(alert)}
-                            >
-                              Post Work Note
-                            </GatedButton>
-                          </>
-                        )}
-
-                      <Button
-                        variant="secondary"
-                        fill="outline"
-                        size="sm"
-                        onClick={() => onSelectAlert(alert)}
-                      >
-                        Details
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-
-                {isAckWithoutIncident && (
-                  <tr className={styles.actionBarRow} data-testid={`action-bar-${alert.id}`}>
-                    <td colSpan={11}>
-                      <div className={styles.actionBarContent}>
-                        <span className={styles.actionBarPrompt}>
-                          Acknowledged by <strong>{alert.acknowledged_by || 'operator'}</strong> — next step:
-                        </span>
-                        <div className={styles.actionBarButtons}>
-                          <GatedButton
-                            allowed={canWriteIncidents}
-                            disabledReason={DISABLED_INCIDENT_REASON}
-                            variant="primary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenCreateIncident(alert)}
-                          >
-                            Create ServiceNow Incident
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canWriteIncidents}
-                            disabledReason={DISABLED_INCIDENT_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenLinkIncident(alert)}
-                          >
-                            Link Existing Incident
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canTriage}
-                            disabledReason={DISABLED_TRIAGE_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenAddNote(alert)}
-                          >
-                            Add Note
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canTriage}
-                            disabledReason={DISABLED_TRIAGE_REASON}
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onUnacknowledge(alert)}
-                          >
-                            Unacknowledge
-                          </GatedButton>
-                          <GatedButton
-                            allowed={canTriage}
-                            disabledReason={DISABLED_TRIAGE_REASON}
-                            variant="destructive"
-                            fill="outline"
-                            size="sm"
-                            disabled={isBusy}
-                            onClick={() => onOpenDismiss(alert)}
-                          >
-                            Dismiss
-                          </GatedButton>
-                        </div>
-                      </div>
-                    </td>
-                  </tr>
                 )}
-              </React.Fragment>
+
+                <td className={styles.actionsCell}>
+                  <RowActionMenu
+                    alert={alert}
+                    hasLinkedIncident={hasLinkedIncident}
+                    canTriage={canTriage}
+                    canWriteIncidents={canWriteIncidents}
+                    busy={isBusy}
+                    onAcknowledge={onAcknowledge}
+                    onUnacknowledge={onUnacknowledge}
+                    onReopen={onReopen}
+                    onOpenDismiss={onOpenDismiss}
+                    onOpenCreateIncident={onOpenCreateIncident}
+                    onOpenLinkIncident={onOpenLinkIncident}
+                    onOpenAddNote={onOpenAddNote}
+                    onOpenWorkNote={onOpenWorkNote}
+                    onSyncIncident={onSyncIncident}
+                    onSelectAlert={onSelectAlert}
+                  />
+                </td>
+              </tr>
             );
           })}
         </tbody>
@@ -501,10 +378,8 @@ export function severityColor(severity: string): 'red' | 'orange' | 'blue' | 'pu
       return 'red';
     case 'warning':
       return 'orange';
-    case 'info':
-      return 'blue';
     default:
-      return 'purple';
+      return 'orange';
   }
 }
 
@@ -535,14 +410,14 @@ export function stateLabel(state: Alert['state']): string {
 }
 
 export function displayStateLabel(alert: Alert): string {
-  if (alert.state === 'resolved' && alert.acknowledged_at) {
+  if (alert.state === 'resolved' && alert.acknowledged_at && !alert.dismissed_at) {
     return 'Non active Ack';
   }
   return stateLabel(alert.state);
 }
 
 export function displayStateColor(alert: Alert): 'red' | 'orange' | 'green' | 'blue' | 'purple' {
-  if (alert.state === 'resolved' && alert.acknowledged_at) {
+  if (alert.state === 'resolved' && alert.acknowledged_at && !alert.dismissed_at) {
     return 'purple';
   }
   return stateColor(alert.state);
@@ -561,48 +436,74 @@ const getStyles = (theme: GrafanaTheme2) => ({
     color: ${theme.colors.text.secondary};
   `,
   tableWrapper: css`
-    overflow-x: auto;
+    width: 100%;
     border: 1px solid ${theme.colors.border.medium};
     border-radius: ${theme.shape.radius.default};
     background: ${theme.colors.background.primary};
+    overflow-x: visible;
+
+    @media (max-width: 920px) {
+      overflow-x: auto;
+    }
   `,
   table: css`
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: ${theme.typography.bodySmall.fontSize};
 
+    @media (max-width: 920px) {
+      min-width: 820px;
+    }
+
     th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
       text-align: left;
       padding: ${theme.spacing(1)} ${theme.spacing(1.25)};
-      font-size: 12px;
+      font-size: 11px;
       font-weight: ${theme.typography.fontWeightBold};
       text-transform: uppercase;
-      letter-spacing: 0.03em;
+      letter-spacing: 0.04em;
       color: ${theme.colors.text.secondary};
       background: ${theme.colors.background.secondary};
       border-bottom: 1px solid ${theme.colors.border.medium};
-      border-right: 1px solid ${theme.colors.border.weak};
       white-space: nowrap;
-    }
-
-    th:last-child {
-      border-right: none;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     td {
-      padding: ${theme.spacing(1)} ${theme.spacing(1.25)};
+      padding: ${theme.spacing(0.875)} ${theme.spacing(1.25)};
       border-bottom: 1px solid ${theme.colors.border.weak};
-      border-right: 1px solid ${theme.colors.border.weak};
       vertical-align: middle;
-    }
-
-    td:last-child {
-      border-right: none;
     }
   `,
   checkboxCell: css`
-    width: 34px;
     text-align: center !important;
+    padding-left: ${theme.spacing(0.75)} !important;
+    padding-right: ${theme.spacing(0.75)} !important;
+  `,
+  criticalStripe: css`
+    box-shadow: inset 3px 0 0 ${theme.colors.error.main};
+  `,
+  warningStripe: css`
+    box-shadow: inset 3px 0 0 ${theme.colors.warning.main};
+  `,
+  actionsHeaderCell: css`
+    text-align: center !important;
+  `,
+  srOnly: css`
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   `,
   row: css`
     &:hover {
@@ -615,47 +516,32 @@ const getStyles = (theme: GrafanaTheme2) => ({
   selectedRow: css`
     background: rgba(50, 116, 217, 0.12) !important;
   `,
-  rowWithActionBar: css`
-    td {
-      border-bottom: none;
-    }
+  sevCritical: css`
+    font-weight: ${theme.typography.fontWeightBold};
+    color: ${theme.colors.error.text};
   `,
-  actionBarRow: css`
-    background: ${theme.colors.background.secondary};
-    td {
-      padding: ${theme.spacing(0.75)} ${theme.spacing(1.25)} ${theme.spacing(1.25)};
-      border-bottom: 1px solid ${theme.colors.border.medium};
-    }
-  `,
-  actionBarContent: css`
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: ${theme.spacing(1)};
-    padding: ${theme.spacing(0.75)} ${theme.spacing(1.25)};
-    border-left: 3px solid ${theme.colors.warning.main};
-    background: ${theme.colors.background.primary};
-    border-radius: ${theme.shape.radius.default};
-  `,
-  actionBarPrompt: css`
-    font-size: ${theme.typography.bodySmall.fontSize};
-    color: ${theme.colors.text.secondary};
-  `,
-  actionBarButtons: css`
-    display: flex;
-    flex-wrap: wrap;
-    gap: ${theme.spacing(0.75)};
+  sevWarning: css`
+    font-weight: ${theme.typography.fontWeightMedium};
+    color: ${theme.colors.warning.text};
   `,
   alertCell: css`
-    min-width: 220px;
-    max-width: 340px;
+    overflow: hidden;
+  `,
+  alertTitleRow: css`
+    display: flex;
+    align-items: baseline;
+    gap: ${theme.spacing(1)};
+    min-width: 0;
   `,
   alertNameBtn: css`
     background: none;
     border: none;
     padding: 0;
     margin: 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-weight: ${theme.typography.fontWeightBold};
     font-size: ${theme.typography.body.fontSize};
     color: ${theme.colors.text.link};
@@ -672,34 +558,70 @@ const getStyles = (theme: GrafanaTheme2) => ({
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 320px;
+    margin-top: 1px;
   `,
   historyLinkBtn: css`
+    flex-shrink: 0;
     background: none;
     border: none;
     padding: 0;
-    margin-top: 2px;
     font-size: 11px;
-    color: ${theme.colors.text.link};
+    color: ${theme.colors.text.secondary};
     cursor: pointer;
     text-decoration: underline;
+
+    &:hover {
+      color: ${theme.colors.text.link};
+    }
   `,
-  metaPill: css`
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: ${theme.shape.radius.default};
-    background: ${theme.colors.background.secondary};
-    border: 1px solid ${theme.colors.border.weak};
+  ellipsisCell: css`
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  `,
+  metaText: css`
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: ${theme.typography.fontFamilyMonospace};
-    font-size: 11px;
+    font-size: 12px;
+    color: ${theme.colors.text.secondary};
   `,
-  untaggedText: css`
-    font-size: 11px;
-    font-style: italic;
+  mutedDash: css`
     color: ${theme.colors.text.disabled};
+  `,
+  teamInline: css`
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    overflow: hidden;
+    vertical-align: middle;
+  `,
+  teamDot: css`
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  `,
+  teamDotLabel: css`
+    background: ${theme.colors.info.main};
+  `,
+  teamDotOperator: css`
+    background: #a855f7;
+  `,
+  teamText: css`
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: ${theme.colors.text.primary};
   `,
   nowrapCell: css`
     white-space: nowrap;
+  `,
+  durationCell: css`
+    font-variant-numeric: tabular-nums;
   `,
   mutedText: css`
     font-size: 11px;
@@ -710,29 +632,52 @@ const getStyles = (theme: GrafanaTheme2) => ({
     align-items: center;
     gap: ${theme.spacing(0.75)};
     color: ${theme.colors.text.secondary};
+    font-size: 12px;
+  `,
+  snowFailedText: css`
+    font-size: 12px;
+    font-weight: ${theme.typography.fontWeightMedium};
+    color: ${theme.colors.error.text};
   `,
   snowCol: css`
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 3px;
-  `,
-  snowLinkRow: css`
-    display: flex;
-    align-items: center;
-    gap: ${theme.spacing(0.75)};
-    white-space: nowrap;
+    gap: 1px;
+    min-width: 0;
   `,
   snowLink: css`
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-weight: ${theme.typography.fontWeightMedium};
     color: ${theme.colors.text.link};
   `,
-  actionsCell: css`
-    white-space: nowrap;
-  `,
-  actionsRow: css`
+  snowSubRow: css`
     display: flex;
-    flex-wrap: nowrap;
-    gap: ${theme.spacing(0.5)};
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 11px;
+  `,
+  snowStateText: css`
+    color: ${theme.colors.text.secondary};
+  `,
+  driftOpenText: css`
+    color: ${theme.colors.warning.text};
+    font-weight: ${theme.typography.fontWeightMedium};
+  `,
+  driftClosedText: css`
+    color: ${theme.colors.error.text};
+    font-weight: ${theme.typography.fontWeightMedium};
+  `,
+  actionsCell: css`
+    text-align: center !important;
+    padding-left: ${theme.spacing(0.5)} !important;
+    padding-right: ${theme.spacing(0.5)} !important;
   `,
 });

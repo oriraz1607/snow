@@ -181,6 +181,46 @@ func TestOperatorMiddlewareAndRBAC(t *testing.T) {
 		if recEnabled.Code != http.StatusOK || !gotOp.LookupByUsername || gotOp.Login != "legacy.op" {
 			t.Fatalf("expected legacy auth success with LookupByUsername=true, got status=%d op=%+v", recEnabled.Code, gotOp)
 		}
+
+		// REV-04: legacy proxy fallback MUST fail closed when X-Grafana-Role is empty
+		for _, perm := range []string{PermAlertsRead, PermAlertsTriage, PermIncidentsWrite} {
+			recDenied := httptest.NewRecorder()
+			OperatorMiddleware(enabledCfg)(RequirePermission(perm)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))).ServeHTTP(recDenied, req)
+			if recDenied.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 Forbidden for empty X-Grafana-Role on %s, got %d", perm, recDenied.Code)
+			}
+		}
+
+		// Viewer X-Grafana-Role permits read but denies write/triage; Editor permits write/triage
+		viewerReq := req.Clone(req.Context())
+		viewerReq.Header.Set("X-Grafana-Role", "Viewer")
+		recViewerRead := httptest.NewRecorder()
+		OperatorMiddleware(enabledCfg)(RequirePermission(PermAlertsRead)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))).ServeHTTP(recViewerRead, viewerReq)
+		if recViewerRead.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for legacy Viewer read, got %d", recViewerRead.Code)
+		}
+
+		recViewerTriage := httptest.NewRecorder()
+		OperatorMiddleware(enabledCfg)(RequirePermission(PermAlertsTriage)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))).ServeHTTP(recViewerTriage, viewerReq)
+		if recViewerTriage.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for legacy Viewer triage, got %d", recViewerTriage.Code)
+		}
+
+		editorReq := req.Clone(req.Context())
+		editorReq.Header.Set("X-Grafana-Role", "Editor")
+		recEditorWrite := httptest.NewRecorder()
+		OperatorMiddleware(enabledCfg)(RequirePermission(PermIncidentsWrite)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))).ServeHTTP(recEditorWrite, editorReq)
+		if recEditorWrite.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for legacy Editor write, got %d", recEditorWrite.Code)
+		}
 	})
 }
 

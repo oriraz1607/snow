@@ -37,14 +37,11 @@ func RequirePermission(permission string) func(http.Handler) http.Handler {
 }
 
 // HasPermission evaluates RBAC access for the given OperatorContext.
+// When explicit JWT permissions are omitted, authorization falls back to the Grafana role;
+// empty or unknown roles always fail closed (including in legacy proxy fallback mode).
 func HasPermission(op OperatorContext, required string) bool {
 	if len(op.Permissions) > 0 {
 		return slices.Contains(op.Permissions, required)
-	}
-
-	// Legacy proxy fallback relies on Grafana plugin.json reqRole when no role header is forwarded.
-	if op.LookupByUsername && strings.TrimSpace(op.Role) == "" {
-		return true
 	}
 
 	switch strings.ToLower(strings.TrimSpace(op.Role)) {

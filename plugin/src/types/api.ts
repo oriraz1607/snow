@@ -34,7 +34,8 @@ export type AuditEventType =
   | 'snow_incident_linked'
   | 'snow_caller_fallback'
   | 'snow_state_synced'
-  | 'snow_work_note_posted';
+  | 'snow_work_note_posted'
+  | 'snow_incident_reopened';
 
 export type ActorType = 'operator' | 'alertmanager' | 'servicenow' | 'system';
 
@@ -124,10 +125,20 @@ export interface AlertDetail extends Alert {
 export interface PreviousEpisodeSummary {
   id: string;
   starts_at: string;
+  ends_at?: string | null;
   resolved_at: string | null;
+  duration_seconds?: number;
   state: AlertState;
+  severity?: string;
+  acknowledged_by?: string | null;
+  acknowledged_at?: string | null;
+  dismissed_by?: string | null;
+  dismissed_at?: string | null;
+  dismiss_reason?: string | null;
   incident_number: string | null;
   snow_state_label: string | null;
+  incident_url?: string | null;
+  assignment_group?: string | null;
 }
 
 export interface AlertHistoryResponse {
@@ -135,19 +146,35 @@ export interface AlertHistoryResponse {
   fingerprint: string;
   audit_events: AuditEvent[];
   previous_episodes: PreviousEpisodeSummary[];
+  previous_episodes_total?: number;
+  limit?: number;
+  offset?: number;
+  has_more?: boolean;
 }
 
 export interface SummaryCounts {
   firing: number;
+  firing_critical?: number;
+  firing_warning?: number;
   acknowledged: number;
   acknowledged_without_incident: number;
-  non_active_acknowledged?: number;
+  non_active_acknowledged: number;
   dismissed: number;
+  resolved?: number;
   resolved_open_ticket: number;
+  active_closed_ticket?: number;
+}
+
+export interface AlertFilterOptions {
+  environments: string[];
+  sites: string[];
+  teams: string[];
 }
 
 export interface ListAlertsResponse {
   summary: SummaryCounts;
+  filter_options?: AlertFilterOptions;
+  filtered_total?: number;
   items: Alert[];
   next_cursor?: string | null;
 }
@@ -155,11 +182,16 @@ export interface ListAlertsResponse {
 export interface ListAlertsQuery {
   states?: AlertStateFilter[];
   severities?: string[];
+  environments?: string[];
+  sites?: string[];
+  teams?: string[];
   incident_drift?: 'all' | IncidentDriftStatus;
   has_incident?: boolean;
   fingerprint?: string;
   labels?: string[];
   search?: string;
+  from?: string;
+  to?: string;
   sort?: AlertSort;
   limit?: number;
   cursor?: string;
@@ -195,6 +227,16 @@ export interface StateMutationRequest {
 export interface DismissRequest {
   version: number;
   reason: string;
+}
+
+export interface BulkDismissRequest {
+  alert_ids: string[];
+  reason: string;
+}
+
+export interface BulkDismissResponse {
+  dismissed_count: number;
+  alert_ids: string[];
 }
 
 export interface AddNoteRequest {
@@ -250,6 +292,7 @@ export interface ServiceNowMetadataResponse {
   default_caller_mode: SnowCallerMode;
   default_caller_username: string;
   assignment_groups: AssignmentGroupInfo[];
+  team_assignment_groups?: Record<string, string>;
   snow_reachable: boolean;
 }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { alertApi, ApiClientError } from '../api/client';
-import { Alert, ListAlertsQuery, SummaryCounts } from '../types/api';
+import { Alert, AlertFilterOptions, ListAlertsQuery, SummaryCounts } from '../types/api';
 import { clampPollIntervalSeconds } from '../utils/format';
 
 export interface UseAlertQueueOptions {
@@ -12,23 +12,42 @@ export interface UseAlertQueueOptions {
 export interface UseAlertQueueResult {
   items: Alert[];
   summary: SummaryCounts;
+  filterOptions: AlertFilterOptions;
+  filteredTotal: number;
   nextCursor: string | null;
+  pageIndex: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+  staleOnLaterPage: boolean;
   loading: boolean;
   refreshing: boolean;
   lastSyncedAt: Date | null;
   apiDegraded: boolean;
   errorMessage: string | null;
   refresh: () => Promise<void>;
-  loadMore: () => Promise<void>;
+  goNextPage: () => Promise<void>;
+  goPrevPage: () => Promise<void>;
+  goFirstPage: () => Promise<void>;
   upsertAlert: (updated: Alert) => void;
 }
 
 const EMPTY_SUMMARY: SummaryCounts = {
   firing: 0,
+  firing_critical: 0,
+  firing_warning: 0,
   acknowledged: 0,
   acknowledged_without_incident: 0,
+  non_active_acknowledged: 0,
   dismissed: 0,
+  resolved: 0,
   resolved_open_ticket: 0,
+  active_closed_ticket: 0,
+};
+
+const EMPTY_FILTER_OPTIONS: AlertFilterOptions = {
+  environments: [],
+  sites: [],
+  teams: [],
 };
 
 export function useAlertQueue({
@@ -38,7 +57,11 @@ export function useAlertQueue({
 }: UseAlertQueueOptions): UseAlertQueueResult {
   const [items, setItems] = useState<Alert[]>([]);
   const [summary, setSummary] = useState<SummaryCounts>(EMPTY_SUMMARY);
+  const [filterOptions, setFilterOptions] = useState<AlertFilterOptions>(EMPTY_FILTER_OPTIONS);
+  const [filteredTotal, setFilteredTotal] = useState<number>(0);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [pageIndex, setPageIndex] = useState<number>(0);
+  const [staleOnLaterPage, setStaleOnLaterPage] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
@@ -48,6 +71,12 @@ export function useAlertQueue({
   const baseIntervalSec = clampPollIntervalSeconds(pollIntervalSeconds);
   const queryRef = useRef(query);
   queryRef.current = query;
+
+  const pageIndexRef = useRef<number>(0);
+  const cursorStackRef = useRef<Array<string | null>>([null]);
+  const nextCursorRef = useRef<string | null>(null);
+  const summaryRef = useRef<SummaryCounts>(EMPTY_SUMMARY);
+  const filteredTotalRef = useRef<number>(0);
 
   const activeAbortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -62,29 +91,66 @@ export function useAlertQueue({
     }
   }, []);
 
-  const fetchAlerts = useCallback(
-    async (isBackgroundPoll: boolean) => {
+  const fetchPage = useCallback(
+    async (
+      targetPageIndex: number,
+      targetCursor: string | null,
+      options: { isBackgroundPoll: boolean }
+    ) => {
       if (activeAbortRef.current) {
         activeAbortRef.current.abort();
       }
       const controller = new AbortController();
       activeAbortRef.current = controller;
 
-      if (!hasLoadedOnceRef.current && !isBackgroundPoll) {
+      if (!hasLoadedOnceRef.current && !options.isBackgroundPoll) {
         setLoading(true);
       } else {
         setRefreshing(true);
       }
 
       try {
-        const resp = await alertApi.listAlerts(queryRef.current, controller.signal);
+        const reqQuery: ListAlertsQuery = targetCursor
+          ? { ...queryRef.current, cursor: targetCursor }
+          : { ...queryRef.current };
+        const resp = await alertApi.listAlerts(reqQuery, controller.signal);
         if (!mountedRef.current || controller.signal.aborted) {
           return;
         }
         hasLoadedOnceRef.current = true;
-        setItems(resp.items ?? []);
-        setSummary(resp.summary ?? EMPTY_SUMMARY);
-        setNextCursor(resp.next_cursor ?? null);
+        const nextItems = resp.items ?? [];
+        const nextSummary = resp.summary ?? EMPTY_SUMMARY;
+        const nextTotal =
+          typeof resp.filtered_total === 'number' ? resp.filtered_total : nextItems.length;
+        const nextCur = resp.next_cursor ?? null;
+
+        if (options.isBackgroundPoll && targetPageIndex > 0) {
+          if (
+            nextSummary.firing !== summaryRef.current.firing ||
+            nextSummary.acknowledged !== summaryRef.current.acknowledged ||
+            nextTotal !== filteredTotalRef.current
+          ) {
+            setStaleOnLaterPage(true);
+          }
+        } else if (targetPageIndex === 0) {
+          setStaleOnLaterPage(false);
+        }
+
+        summaryRef.current = nextSummary;
+        filteredTotalRef.current = nextTotal;
+        nextCursorRef.current = nextCur;
+
+        setItems(nextItems);
+        setSummary(nextSummary);
+        if (resp.filter_options) {
+          setFilterOptions({
+            environments: resp.filter_options.environments ?? [],
+            sites: resp.filter_options.sites ?? [],
+            teams: resp.filter_options.teams ?? [],
+          });
+        }
+        setFilteredTotal(nextTotal);
+        setNextCursor(nextCur);
         setLastSyncedAt(new Date());
         setApiDegraded(false);
         setErrorMessage(null);
@@ -118,7 +184,7 @@ export function useAlertQueue({
 
   const scheduleNextPoll = useCallback(() => {
     clearScheduledPoll();
-    if (!autoRefresh || typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    if (!autoRefresh || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) {
       return;
     }
     const delayMs = backoffSecRef.current * 1000;
@@ -129,20 +195,27 @@ export function useAlertQueue({
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
         return;
       }
-      await fetchAlerts(true);
+      const curIdx = pageIndexRef.current;
+      const curCursor = cursorStackRef.current[curIdx] ?? null;
+      await fetchPage(curIdx, curCursor, { isBackgroundPoll: true });
       if (mountedRef.current) {
         scheduleNextPoll();
       }
     }, delayMs);
-  }, [autoRefresh, clearScheduledPoll, fetchAlerts]);
+  }, [autoRefresh, clearScheduledPoll, fetchPage]);
 
   const queryKey = JSON.stringify(query);
 
   useEffect(() => {
     mountedRef.current = true;
     backoffSecRef.current = baseIntervalSec;
+    pageIndexRef.current = 0;
+    cursorStackRef.current = [null];
+    nextCursorRef.current = null;
+    setPageIndex(0);
+    setStaleOnLaterPage(false);
 
-    void fetchAlerts(false).then(() => {
+    void fetchPage(0, null, { isBackgroundPoll: false }).then(() => {
       if (mountedRef.current) {
         scheduleNextPoll();
       }
@@ -155,7 +228,7 @@ export function useAlertQueue({
         activeAbortRef.current = null;
       }
     };
-  }, [queryKey, baseIntervalSec, autoRefresh, fetchAlerts, scheduleNextPoll, clearScheduledPoll]);
+  }, [queryKey, baseIntervalSec, autoRefresh, fetchPage, scheduleNextPoll, clearScheduledPoll]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -164,7 +237,9 @@ export function useAlertQueue({
         return;
       }
       if (autoRefresh) {
-        void fetchAlerts(true).then(() => {
+        const curIdx = pageIndexRef.current;
+        const curCursor = cursorStackRef.current[curIdx] ?? null;
+        void fetchPage(curIdx, curCursor, { isBackgroundPoll: true }).then(() => {
           if (mountedRef.current) {
             scheduleNextPoll();
           }
@@ -176,7 +251,7 @@ export function useAlertQueue({
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [autoRefresh, clearScheduledPoll, fetchAlerts, scheduleNextPoll]);
+  }, [autoRefresh, clearScheduledPoll, fetchPage, scheduleNextPoll]);
 
   useEffect(() => {
     return () => {
@@ -190,39 +265,62 @@ export function useAlertQueue({
 
   const refresh = useCallback(async () => {
     clearScheduledPoll();
-    await fetchAlerts(false);
+    const curIdx = pageIndexRef.current;
+    const curCursor = cursorStackRef.current[curIdx] ?? null;
+    await fetchPage(curIdx, curCursor, { isBackgroundPoll: false });
     if (mountedRef.current) {
       scheduleNextPoll();
     }
-  }, [clearScheduledPoll, fetchAlerts, scheduleNextPoll]);
+  }, [clearScheduledPoll, fetchPage, scheduleNextPoll]);
 
-  const loadMore = useCallback(async () => {
-    if (!nextCursor) {
+  const goNextPage = useCallback(async () => {
+    const cursor = nextCursorRef.current;
+    if (!cursor) {
       return;
     }
-    setRefreshing(true);
-    try {
-      const resp = await alertApi.listAlerts({ ...queryRef.current, cursor: nextCursor });
-      if (!mountedRef.current) {
-        return;
-      }
-      setItems((prev) => {
-        const seen = new Set(prev.map((item) => item.id));
-        const appended = (resp.items ?? []).filter((item) => !seen.has(item.id));
-        return [...prev, ...appended];
-      });
-      setSummary(resp.summary ?? EMPTY_SUMMARY);
-      setNextCursor(resp.next_cursor ?? null);
-      setLastSyncedAt(new Date());
-    } catch (err) {
-      const apiErr = err as ApiClientError;
-      setErrorMessage(apiErr?.message || 'Failed to load next page of alerts.');
-    } finally {
-      if (mountedRef.current) {
-        setRefreshing(false);
-      }
+    const nextIdx = pageIndexRef.current + 1;
+    const nextStack = [...cursorStackRef.current.slice(0, nextIdx), cursor];
+    cursorStackRef.current = nextStack;
+    pageIndexRef.current = nextIdx;
+    setPageIndex(nextIdx);
+    setStaleOnLaterPage(false);
+
+    clearScheduledPoll();
+    await fetchPage(nextIdx, cursor, { isBackgroundPoll: false });
+    if (mountedRef.current) {
+      scheduleNextPoll();
     }
-  }, [nextCursor]);
+  }, [clearScheduledPoll, fetchPage, scheduleNextPoll]);
+
+  const goPrevPage = useCallback(async () => {
+    if (pageIndexRef.current <= 0) {
+      return;
+    }
+    const prevIdx = pageIndexRef.current - 1;
+    const prevCursor = cursorStackRef.current[prevIdx] ?? null;
+    pageIndexRef.current = prevIdx;
+    setPageIndex(prevIdx);
+    setStaleOnLaterPage(false);
+
+    clearScheduledPoll();
+    await fetchPage(prevIdx, prevCursor, { isBackgroundPoll: false });
+    if (mountedRef.current) {
+      scheduleNextPoll();
+    }
+  }, [clearScheduledPoll, fetchPage, scheduleNextPoll]);
+
+  const goFirstPage = useCallback(async () => {
+    cursorStackRef.current = [null];
+    pageIndexRef.current = 0;
+    setPageIndex(0);
+    setStaleOnLaterPage(false);
+
+    clearScheduledPoll();
+    await fetchPage(0, null, { isBackgroundPoll: false });
+    if (mountedRef.current) {
+      scheduleNextPoll();
+    }
+  }, [clearScheduledPoll, fetchPage, scheduleNextPoll]);
 
   const upsertAlert = useCallback((updated: Alert) => {
     setItems((prev) => prev.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
@@ -231,14 +329,22 @@ export function useAlertQueue({
   return {
     items,
     summary,
+    filterOptions,
+    filteredTotal,
     nextCursor,
+    pageIndex,
+    hasNextPage: Boolean(nextCursor),
+    hasPrevPage: pageIndex > 0,
+    staleOnLaterPage,
     loading,
     refreshing,
     lastSyncedAt,
     apiDegraded,
     errorMessage,
     refresh,
-    loadMore,
+    goNextPage,
+    goPrevPage,
+    goFirstPage,
     upsertAlert,
   };
 }

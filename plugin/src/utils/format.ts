@@ -60,6 +60,64 @@ export function isAlertSelectableForIncident(alert: Alert): boolean {
   return !sync || sync === 'failed';
 }
 
+export function isAlertSelectableForBulk(alert: Alert): boolean {
+  return alert.state === 'firing' || alert.state === 'acknowledged';
+}
+
+export function hasOpenServiceNowIncident(alert?: Alert | null): boolean {
+  const inc = alert?.servicenow_incident;
+  if (!inc) {
+    return false;
+  }
+  if (inc.sync_status !== 'created' && inc.sync_status !== 'linked') {
+    return false;
+  }
+  return inc.snow_state === 1 || inc.snow_state === 2 || inc.snow_state === 3;
+}
+
+export function getOpenIncidentDismissBlockReason(alert?: Alert | null): string | undefined {
+  if (!hasOpenServiceNowIncident(alert)) {
+    return undefined;
+  }
+  const incNum = alert?.servicenow_incident?.incident_number?.trim() || 'linked ticket';
+  return `Cannot dismiss while ServiceNow incident ${incNum} is open`;
+}
+
+export function formatDurationSeconds(totalSeconds?: number | null): string {
+  if (typeof totalSeconds !== 'number' || Number.isNaN(totalSeconds) || totalSeconds < 0) {
+    return '—';
+  }
+  const secs = Math.floor(totalSeconds);
+  if (secs < 60) {
+    return `${secs}s`;
+  }
+  const mins = Math.floor(secs / 60);
+  const remSecs = secs % 60;
+  if (mins < 60) {
+    return remSecs > 0 ? `${mins}m ${remSecs}s` : `${mins}m`;
+  }
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  if (hrs < 24) {
+    return remMins > 0 ? `${hrs}h ${remMins}m` : `${hrs}h`;
+  }
+  const days = Math.floor(hrs / 24);
+  const remHrs = hrs % 24;
+  return remHrs > 0 ? `${days}d ${remHrs}h` : `${days}d`;
+}
+
+export function formatDurationBetween(startsAt?: string | null, endsAt?: string | null): string {
+  if (!startsAt || !endsAt) {
+    return '—';
+  }
+  const startMs = new Date(startsAt).getTime();
+  const endMs = new Date(endsAt).getTime();
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+    return '—';
+  }
+  return formatDurationSeconds(Math.max(0, Math.floor((endMs - startMs) / 1000)));
+}
+
 export function highestSeverity(alerts: Alert[]): string {
   let best = 'unknown';
   let bestRank = 99;

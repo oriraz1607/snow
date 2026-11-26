@@ -23,6 +23,7 @@ Therefore, the schema models each firing lifecycle as an **Alert Episode**:
 erDiagram
     alerts ||--o| servicenow_incidents : "has at most one primary ticket"
     alerts ||--o{ alert_audit_log : "records immutable events"
+    alert_fingerprint_teams |o--o{ alerts : "inherits team by fingerprint"
 
     alerts {
         uuid id PK
@@ -35,11 +36,23 @@ erDiagram
         varchar severity
         jsonb labels
         jsonb annotations
+        varchar assigned_team
+        varchar assigned_team_by
+        timestamptz assigned_team_at
         varchar acknowledged_by
         timestamptz acknowledged_at
         varchar dismissed_by
         timestamptz dismissed_at
         timestamptz resolved_at
+    }
+
+    alert_fingerprint_teams {
+        varchar fingerprint PK
+        varchar team
+        varchar tagged_by
+        varchar tagged_by_email
+        timestamptz created_at
+        timestamptz updated_at
     }
 
     servicenow_incidents {
@@ -109,6 +122,7 @@ erDiagram
 | *(none)* | Alertmanager `firing` webhook (new `(fingerprint, starts_at)`) | `firing` | Inserts new `alerts` row (`version = 1`), logs `alert_fired`. |
 | `firing` | Alertmanager `firing` webhook (repeat, same `(fingerprint, starts_at)`) | `firing` | Updates `labels`, `annotations`, `last_received_at`, `delivery_count += 1`. No state transition; logs `alert_updated` only if labels/annotations changed. |
 | `firing` | Operator `POST /acknowledge` | `acknowledged` | Sets `acknowledged_by`, `acknowledged_by_email`, `acknowledged_at = NOW()`, `version += 1`; logs `alert_acknowledged`. |
+| `firing` | Operator `POST /servicenow/incidents/bulk` | `acknowledged` | Auto-acknowledges selected `firing` alerts inside Tx 1 (`version += 1`, logs `alert_acknowledged` with `auto_acknowledged_by_incident: true`), then reserves pending `servicenow_incidents` rows. |
 | `firing` | Operator `POST /dismiss` | `dismissed` | Sets `dismissed_by`, `dismissed_by_email`, `dismissed_at = NOW()`, `dismiss_reason`, `version += 1`; logs `alert_dismissed`. |
 | `firing` | Alertmanager `resolved` webhook | `resolved` | Sets `ends_at`, `resolved_at = COALESCE(ends_at, NOW())`, `version += 1`; logs `alert_resolved`. |
 | `acknowledged` | Alertmanager `firing` webhook (repeat, same `(fingerprint, starts_at)`) | `acknowledged` | **Preserves `acknowledged` state**; refreshes `annotations`/`last_received_at`/`delivery_count`. |
@@ -122,6 +136,7 @@ erDiagram
 | `resolved` | Alertmanager `firing` webhook (**same** `starts_at` — out-of-order delayed delivery) | `resolved` | Ignored as stale out-of-order delivery (cannot un-resolve an already resolved episode with the same `starts_at`). |
 | `resolved` | Alertmanager `firing` webhook (**new** `starts_at > prev.starts_at`) | *(new row)* `firing` | **Creates a brand-new `alerts` row** (`id = gen_random_uuid()`, `state = 'firing'`, `acknowledged_by = NULL`, `version = 1`). |
 | `resolved` | Operator `POST /acknowledge` or `POST /dismiss` | *(rejected)* | Returns `409 INVALID_STATE_TRANSITION` (terminal episode). |
+| *(any)* | Operator `POST /alerts/{id}/team` | *(unchanged)* | Sets `assigned_team`, `assigned_team_by`, `assigned_team_at = NOW()`, upserts `alert_fingerprint_teams`, logs `alert_team_tagged`. |
 
 ---
 
@@ -168,6 +183,7 @@ CREATE TYPE audit_event_type AS ENUM (
     'alert_unacknowledged',
     'alert_dismissed',
     'alert_reopened',
+    'alert_team_tagged',     -- Added in migration 0002_team_tags.up.sql
     'operator_note_added',
     'snow_incident_requested',
     'snow_incident_created',
@@ -216,6 +232,11 @@ CREATE TABLE alerts (
     dismissed_at          TIMESTAMPTZ NULL,
     dismiss_reason        TEXT NULL,
     resolved_at           TIMESTAMPTZ NULL,
+
+    -- Operator team tagging (added in migration 0002_team_tags.up.sql)
+    assigned_team         VARCHAR(128) NULL,
+    assigned_team_by      VARCHAR(255) NULL,
+    assigned_team_at      TIMESTAMPTZ NULL,
 
     -- Ingestion bookkeeping
     first_received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -343,6 +364,46 @@ CREATE TABLE webhook_ingestion_log (
     error_message    TEXT NULL,
     received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ============================================================================
+-- 7. FINGERPRINT TEAM TAGS (ADDED IN MIGRATION 0002_team_tags.up.sql)
+-- ============================================================================
+
+CREATE TABLE alert_fingerprint_teams (
+    fingerprint     VARCHAR(64) PRIMARY KEY,
+    team            VARCHAR(128) NOT NULL,
+    tagged_by       VARCHAR(255) NOT NULL,
+    tagged_by_email VARCHAR(255) NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER trg_alert_fingerprint_teams_updated_at
+    BEFORE UPDATE ON alert_fingerprint_teams
+    FOR EACH ROW
+    EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================================
+-- 8. IDEMPOTENCY KEYS (ADDED IN MIGRATION 0003_idempotency_keys.up.sql)
+-- ============================================================================
+
+CREATE TABLE idempotency_keys (
+    idempotency_key VARCHAR(128) PRIMARY KEY,
+    endpoint        VARCHAR(128) NOT NULL,
+    request_hash    VARCHAR(64) NOT NULL,
+    actor_login     VARCHAR(255) NOT NULL,
+    status          VARCHAR(16) NOT NULL CHECK (status IN ('in_progress', 'completed')),
+    response_status SMALLINT NULL,
+    response_body   JSONB NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL
+);
+
+CREATE TRIGGER trg_idempotency_keys_updated_at
+    BEFORE UPDATE ON idempotency_keys
+    FOR EACH ROW
+    EXECUTE FUNCTION set_updated_at();
 ```
 
 ---
@@ -399,6 +460,26 @@ CREATE INDEX idx_snow_user_cache_expires_at
 -- 10. Retention cleanup for webhook_ingestion_log
 CREATE INDEX idx_webhook_ingestion_log_received_at
     ON webhook_ingestion_log (received_at);
+
+-- 11. Non-Active Acknowledged bucket (added in migration 0002_team_tags.up.sql)
+CREATE INDEX idx_alerts_non_active_ack
+    ON alerts (resolved_at DESC, id DESC)
+    WHERE state = 'resolved' AND acknowledged_at IS NOT NULL;
+
+-- 12. Idempotency key expiry purge (added in migration 0003_idempotency_keys.up.sql)
+CREATE INDEX idx_idempotency_keys_expires_at
+    ON idempotency_keys (expires_at);
+
+-- 13. Critical-first keyset pagination on Critical/Warning active queues (added in migration 0004_severity_sort_index.up.sql)
+CREATE INDEX idx_alerts_active_severity_rank
+    ON alerts (
+        state,
+        (CASE severity WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END),
+        starts_at DESC,
+        id DESC
+    )
+    WHERE state IN ('firing', 'acknowledged', 'dismissed')
+      AND severity IN ('critical', 'warning');
 ```
 
 ### 5.1 Query for "Resolved — Open Ticket" Drift Detection
@@ -435,9 +516,15 @@ Because `idx_snow_incidents_open_sync` only indexes open ServiceNow tickets (typ
 
 ## 6. Immutability, Retention & Operational Maintenance
 
-1. **Audit Log Immutability:** Application database role (`noc_api_app`) is granted `SELECT, INSERT` on `alert_audit_log` — **no `UPDATE` or `DELETE`** privileges (enforced at PostgreSQL role level; cascading cleanup happens only via scheduled archival jobs using a separate maintenance role).
+1. **Audit Log Immutability & Least-Privilege Grants (`backend/internal/migrate/runner.go`):** After applying migrations, `migrate up` executes `GrantAppRole` for `POSTGRES_APP_USER` (default `alert_api_app`):
+   - `GRANT USAGE ON SCHEMA public`
+   - `GRANT SELECT, INSERT, UPDATE, DELETE ON alerts, servicenow_incidents, snow_user_cache, webhook_ingestion_log, alert_fingerprint_teams, idempotency_keys`
+   - `GRANT SELECT, INSERT ON alert_audit_log` and explicit `REVOKE UPDATE, DELETE ON alert_audit_log` (preventing audit log tampering even if an application bug occurs)
+   - `GRANT SELECT ON schema_migrations` and `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public`
 2. **Retention Policy (Configurable Background Job):**
    - `webhook_ingestion_log`: purge rows older than `30 days` via batched deletes (`LIMIT 10000`).
-   - `snow_user_cache`: positive matches cached for `6 hours`, negative misses cached for `5 minutes`; expired rows purged hourly.
+   - `snow_user_cache`: positive matches cached for `6 hours`, negative misses cached for `5 minutes`; expired rows purged hourly (`PurgeExpiredUserCache`).
+   - `idempotency_keys`: `24 hours` TTL; expired rows purged hourly (`PurgeExpiredIdempotencyKeys`).
    - `alerts` + `servicenow_incidents` + `alert_audit_log`: retain `resolved` episodes whose linked ServiceNow ticket (if any) is `Closed`/`Canceled`/`Resolved` (or absent) for `180 days` (configurable for compliance), then archive to cold storage or drop monthly partitions if volume exceeds 5M alerts/year. **Never purge a `resolved` alert while its linked ServiceNow ticket is still open (`snow_state IN (1, 2, 3)`).**
-3. **Trigger for `updated_at`:** A lightweight `BEFORE UPDATE` trigger maintains `updated_at = NOW()` on `alerts` and `servicenow_incidents` automatically.
+3. **Trigger for `updated_at`:** A lightweight `BEFORE UPDATE` trigger (`set_updated_at()`) maintains `updated_at = NOW()` on `alerts`, `servicenow_incidents`, `alert_fingerprint_teams`, and `idempotency_keys` automatically.
+4. **Migration Rollback Note:** `migrations/0002_team_tags.down.sql` documents PostgreSQL's `DROP VALUE` limitation on enum types: rolling back `0002` drops `idx_alerts_non_active_ack`, `trg_alert_fingerprint_teams_updated_at`, `alert_fingerprint_teams`, and `alerts.assigned_team*` columns, while `'alert_team_tagged'` remains in `audit_event_type` unless the enum is manually recreated.

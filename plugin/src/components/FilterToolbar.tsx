@@ -1,60 +1,84 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { css } from '@emotion/css';
 import { GrafanaTheme2, SelectableValue } from '@grafana/data';
 import { Button, Input, Select, Switch, Tag, useTheme2 } from '@grafana/ui';
-import { AlertSort, IncidentDriftStatus } from '../types/api';
+import { AlertFilterOptions, AlertSort } from '../types/api';
 
-export type SnowStatusFilter =
-  | 'all'
-  | 'no_incident'
-  | 'incident_open'
-  | 'resolved_open_ticket'
-  | 'active_closed_ticket';
+export type HistoryTimeRange = '' | '24h' | '7d' | '30d' | '90d';
 
 export interface FilterState {
   search: string;
   severities: string[];
+  environment: string;
+  site: string;
+  team: string;
   labels: string[];
-  snowStatus: SnowStatusFilter;
   sort: AlertSort;
   fingerprint: string;
+  timeRange?: HistoryTimeRange;
 }
 
 interface FilterToolbarProps {
   filters: FilterState;
+  filterOptions: AlertFilterOptions;
   autoRefresh: boolean;
   pollIntervalSeconds: number;
   refreshing: boolean;
   lastSyncedAt: Date | null;
+  showTimeRange?: boolean;
   onChangeFilters: (next: FilterState) => void;
   onToggleAutoRefresh: (enabled: boolean) => void;
   onManualRefresh: () => void;
   onResetAll: () => void;
 }
 
-const SEVERITY_OPTIONS = ['critical', 'warning', 'info', 'unknown'];
-
-const SNOW_STATUS_OPTIONS: Array<SelectableValue<SnowStatusFilter>> = [
-  { label: 'ServiceNow: All', value: 'all' },
-  { label: 'No Incident Linked', value: 'no_incident' },
-  { label: 'Has Linked Incident', value: 'incident_open' },
-  { label: 'Drift: Resolved w/ Open Ticket', value: 'resolved_open_ticket' },
-  { label: 'Drift: Active w/ Closed Ticket', value: 'active_closed_ticket' },
-];
+const SEVERITY_OPTIONS = ['critical', 'warning'];
 
 const SORT_OPTIONS: Array<SelectableValue<AlertSort>> = [
+  { label: 'Highest Severity First', value: 'severity_desc' },
   { label: 'Newest Firing First', value: 'starts_at_desc' },
   { label: 'Oldest Firing First', value: 'starts_at_asc' },
-  { label: 'Highest Severity First', value: 'severity_desc' },
   { label: 'Recently Resolved First', value: 'resolved_at_desc' },
 ];
 
+const TIME_RANGE_OPTIONS: Array<SelectableValue<HistoryTimeRange>> = [
+  { label: 'Time: All', value: '' },
+  { label: 'Last 24h', value: '24h' },
+  { label: 'Last 7d', value: '7d' },
+  { label: 'Last 30d', value: '30d' },
+  { label: 'Last 90d', value: '90d' },
+];
+
+function buildSelectOptions(
+  allLabel: string,
+  prefix: string,
+  values: string[],
+  selectedValue: string,
+  extraHead: Array<SelectableValue<string>> = []
+): Array<SelectableValue<string>> {
+  const unique = Array.from(
+    new Set(
+      [...values, selectedValue && selectedValue !== '__untagged__' ? selectedValue : '']
+        .map((v) => v.trim())
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+
+  return [
+    { label: allLabel, value: '' },
+    ...extraHead,
+    ...unique.map((v) => ({ label: `${prefix}${v}`, value: v })),
+  ];
+}
+
 export const FilterToolbar: React.FC<FilterToolbarProps> = ({
   filters,
+  filterOptions,
   autoRefresh,
   pollIntervalSeconds,
   refreshing,
   lastSyncedAt,
+  showTimeRange = false,
   onChangeFilters,
   onToggleAutoRefresh,
   onManualRefresh,
@@ -63,6 +87,39 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
   const theme = useTheme2();
   const styles = getStyles(theme);
   const [labelInput, setLabelInput] = useState('');
+  const [searchInput, setSearchInput] = useState(filters.search);
+
+  useEffect(() => {
+    setSearchInput(filters.search);
+  }, [filters.search]);
+
+  useEffect(() => {
+    if (searchInput === filters.search) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      onChangeFilters({ ...filters, search: searchInput });
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchInput, filters, onChangeFilters]);
+
+  const envOptions = useMemo(
+    () => buildSelectOptions('Env: All', 'Env: ', filterOptions.environments, filters.environment),
+    [filterOptions.environments, filters.environment]
+  );
+
+  const siteOptions = useMemo(
+    () => buildSelectOptions('Site: All', 'Site: ', filterOptions.sites, filters.site),
+    [filterOptions.sites, filters.site]
+  );
+
+  const teamOptions = useMemo(
+    () =>
+      buildSelectOptions('Team: All', 'Team: ', filterOptions.teams, filters.team, [
+        { label: 'Team: Untagged', value: '__untagged__' },
+      ]),
+    [filterOptions.teams, filters.team]
+  );
 
   const toggleSeverity = (sev: string) => {
     const exists = filters.severities.includes(sev);
@@ -86,39 +143,94 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
   };
 
   const hasActiveFilters =
-    Boolean(filters.search.trim()) ||
+    Boolean(searchInput.trim()) ||
     filters.severities.length > 0 ||
+    Boolean(filters.environment) ||
+    Boolean(filters.site) ||
+    Boolean(filters.team) ||
     filters.labels.length > 0 ||
-    filters.snowStatus !== 'all' ||
-    Boolean(filters.fingerprint);
+    Boolean(filters.fingerprint) ||
+    Boolean(filters.timeRange);
 
   return (
     <div className={styles.container}>
       <div className={styles.row}>
         <div className={styles.searchBox}>
           <Input
-            placeholder="Search alert name, fingerprint, summary, or INC..."
-            value={filters.search}
-            onChange={(e) => onChangeFilters({ ...filters, search: e.currentTarget.value })}
+            placeholder="Search alert name, team, summary, fingerprint, or INC..."
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                if (searchInput !== filters.search) {
+                  onChangeFilters({ ...filters, search: searchInput });
+                }
+              }
+            }}
             aria-label="Search alerts"
           />
         </div>
 
-        <div className={styles.selectBox}>
+        <div className={styles.compactSelectBox}>
           <Select
-            aria-label="ServiceNow status filter"
-            options={SNOW_STATUS_OPTIONS}
-            value={filters.snowStatus}
+            aria-label="Filter by environment"
+            options={envOptions}
+            value={filters.environment}
             onChange={(opt) =>
               onChangeFilters({
                 ...filters,
-                snowStatus: (opt.value ?? 'all') as SnowStatusFilter,
+                environment: opt.value ?? '',
               })
             }
           />
         </div>
 
-        <div className={styles.selectBox}>
+        <div className={styles.compactSelectBox}>
+          <Select
+            aria-label="Filter by site"
+            options={siteOptions}
+            value={filters.site}
+            onChange={(opt) =>
+              onChangeFilters({
+                ...filters,
+                site: opt.value ?? '',
+              })
+            }
+          />
+        </div>
+
+        <div className={styles.teamSelectBox}>
+          <Select
+            aria-label="Filter by team"
+            options={teamOptions}
+            value={filters.team}
+            onChange={(opt) =>
+              onChangeFilters({
+                ...filters,
+                team: opt.value ?? '',
+              })
+            }
+          />
+        </div>
+
+        {showTimeRange && (
+          <div className={styles.compactSelectBox}>
+            <Select
+              aria-label="Filter by time range"
+              options={TIME_RANGE_OPTIONS}
+              value={filters.timeRange ?? ''}
+              onChange={(opt) =>
+                onChangeFilters({
+                  ...filters,
+                  timeRange: (opt.value ?? '') as HistoryTimeRange,
+                })
+              }
+            />
+          </div>
+        )}
+
+        <div className={styles.sortSelectBox}>
           <Select
             aria-label="Sort alerts"
             options={SORT_OPTIONS}
@@ -126,28 +238,10 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
             onChange={(opt) =>
               onChangeFilters({
                 ...filters,
-                sort: (opt.value ?? 'starts_at_desc') as AlertSort,
+                sort: (opt.value ?? 'severity_desc') as AlertSort,
               })
             }
           />
-        </div>
-
-        <div className={styles.labelInputGroup}>
-          <Input
-            placeholder="Add label key=value"
-            value={labelInput}
-            onChange={(e) => setLabelInput(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                addLabelFilter();
-              }
-            }}
-            aria-label="Label filter key=value"
-          />
-          <Button variant="secondary" size="sm" onClick={addLabelFilter} disabled={!labelInput.includes('=')}>
-            Add Label
-          </Button>
         </div>
       </div>
 
@@ -187,13 +281,43 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
           )}
 
           {hasActiveFilters && (
-            <Button variant="secondary" fill="text" size="sm" onClick={onResetAll}>
+            <Button
+              variant="secondary"
+              fill="text"
+              size="sm"
+              onClick={() => {
+                setSearchInput('');
+                onResetAll();
+              }}
+            >
               Clear filters
             </Button>
           )}
         </div>
 
         <div className={styles.refreshControls}>
+          <div className={styles.labelInputGroup}>
+            <Input
+              placeholder="Label key=value"
+              value={labelInput}
+              onChange={(e) => setLabelInput(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addLabelFilter();
+                }
+              }}
+              aria-label="Label filter key=value"
+            />
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={addLabelFilter}
+              disabled={!labelInput.includes('=')}
+            >
+              Add Label
+            </Button>
+          </div>
           <label className={styles.autoRefreshLabel}>
             <Switch
               value={autoRefresh}
@@ -222,31 +346,13 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
   );
 };
 
-export function snowStatusToQueryParams(snowStatus: SnowStatusFilter): {
-  has_incident?: boolean;
-  incident_drift?: 'all' | IncidentDriftStatus;
-} {
-  switch (snowStatus) {
-    case 'no_incident':
-      return { has_incident: false, incident_drift: 'all' };
-    case 'incident_open':
-      return { has_incident: true, incident_drift: 'all' };
-    case 'resolved_open_ticket':
-      return { incident_drift: 'resolved_open_ticket' };
-    case 'active_closed_ticket':
-      return { incident_drift: 'active_closed_ticket' };
-    default:
-      return { incident_drift: 'all' };
-  }
-}
-
 const getStyles = (theme: GrafanaTheme2) => ({
   container: css`
     display: flex;
     flex-direction: column;
-    gap: ${theme.spacing(1.5)};
+    gap: ${theme.spacing(1.25)};
     padding: ${theme.spacing(1.5)};
-    margin-bottom: ${theme.spacing(2)};
+    margin-bottom: ${theme.spacing(1.5)};
     background: ${theme.colors.background.secondary};
     border: 1px solid ${theme.colors.border.weak};
     border-radius: ${theme.shape.radius.default};
@@ -258,24 +364,34 @@ const getStyles = (theme: GrafanaTheme2) => ({
     align-items: center;
   `,
   searchBox: css`
-    flex: 2 1 260px;
+    flex: 2 1 250px;
+    min-width: 220px;
   `,
-  selectBox: css`
-    flex: 1 1 200px;
-    min-width: 190px;
+  compactSelectBox: css`
+    flex: 0 1 160px;
+    min-width: 135px;
+  `,
+  teamSelectBox: css`
+    flex: 0 1 180px;
+    min-width: 150px;
+  `,
+  sortSelectBox: css`
+    flex: 0 1 195px;
+    min-width: 170px;
   `,
   labelInputGroup: css`
     display: flex;
     gap: ${theme.spacing(0.75)};
     align-items: center;
-    flex: 1 1 230px;
+    width: 220px;
+    max-width: 100%;
   `,
   bottomRow: css`
     display: flex;
     flex-wrap: wrap;
     justify-content: space-between;
     align-items: center;
-    gap: ${theme.spacing(1.5)};
+    gap: ${theme.spacing(1.25)};
   `,
   severityChips: css`
     display: flex;
@@ -307,7 +423,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: ${theme.spacing(1.5)};
+    gap: ${theme.spacing(1.25)};
   `,
   autoRefreshLabel: css`
     display: inline-flex;

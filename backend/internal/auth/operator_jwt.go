@@ -63,6 +63,8 @@ func OperatorMiddleware(cfg OperatorAuthConfig) func(http.Handler) http.Handler 
 				grafanaUser := strings.TrimSpace(r.Header.Get("X-Grafana-User"))
 				if proxyToken != "" && grafanaUser != "" && cfg.ProxySharedToken != "" {
 					if subtle.ConstantTimeCompare([]byte(proxyToken), []byte(cfg.ProxySharedToken)) == 1 {
+						// X-Grafana-Role is strictly trimmed and never defaulted to an elevated role;
+						// RequirePermission / HasPermission fails closed when X-Grafana-Role is empty.
 						op := OperatorContext{
 							Login:            grafanaUser,
 							Name:             grafanaUser,

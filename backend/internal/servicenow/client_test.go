@@ -178,12 +178,25 @@ func TestCallerResolverCacheAndFallback(t *testing.T) {
 	resp2, _ := http.Post(ts.URL+"/_mock/faults", "application/json", strings.NewReader(`{}`))
 	resp2.Body.Close()
 
-	// 5. Legacy username lookup mode
-	res = resolver.Resolve(context.Background(), model.CallerModeSSOUser, auth.OperatorContext{Login: "alice.smith", LookupByUsername: true})
+	// 5. Email miss falls back to LookupUserByUsername(op.Login) and caches under user:<login>
+	res = resolver.Resolve(context.Background(), model.CallerModeSSOUser, auth.OperatorContext{
+		Login: "alice.smith",
+		Email: "alice.alias@other.example",
+	})
 	if res.ResolutionStatus != model.CallerResSSOMatched || res.SysID != "u_alice_001" {
-		t.Fatalf("expected username lookup match for alice.smith, got %+v", res)
+		t.Fatalf("expected username fallback match after email miss, got %+v", res)
 	}
-	_, err = client.CreateIncident(context.Background(), CreateIncidentPayload{
+	if _, ok := cache.entries["user:alice.smith"]; !ok {
+		t.Fatalf("expected username fallback cached under user:alice.smith")
+	}
+
+	// 6. Empty email falls back to LookupUserByUsername even when LookupByUsername=false
+	res = resolver.Resolve(context.Background(), model.CallerModeSSOUser, auth.OperatorContext{Login: "alice.smith"})
+	if res.ResolutionStatus != model.CallerResSSOMatched || res.SysID != "u_alice_001" {
+		t.Fatalf("expected username lookup match for alice.smith with empty email, got %+v", res)
+	}
+
+	createdRec, err := client.CreateIncident(context.Background(), CreateIncidentPayload{
 		ShortDescription: "Corr check",
 		Impact:           "2",
 		Urgency:          "2",
@@ -197,6 +210,11 @@ func TestCallerResolverCacheAndFallback(t *testing.T) {
 	if err != nil || found == nil {
 		t.Fatalf("expected correlation_id lookup success, got rec=%v err=%v", found, err)
 	}
+
+	reopened, err := client.ReopenIncident(context.Background(), createdRec.SysID, "[Grafana NOC] Auto-reopened: alert still firing")
+	if err != nil || reopened == nil || reopened.State != 2 {
+		t.Fatalf("expected ReopenIncident to move state back to 2 (In Progress), got rec=%+v err=%v", reopened, err)
+	}
 }
 
 func TestIsCallerIDRejection(t *testing.T) {
@@ -206,5 +224,49 @@ func TestIsCallerIDRejection(t *testing.T) {
 	}
 	if errors.Is(se, context.DeadlineExceeded) {
 		t.Fatalf("unexpected error match")
+	}
+}
+
+func TestSysparmQueryValidation(t *testing.T) {
+	httpHits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	metrics := observability.NewMetrics()
+	client := NewClient(ts.URL, 2*time.Second, NewBasicAuthProvider("svc", "pass"), NewCircuitBreaker(nil), metrics)
+
+	if _, err := client.FindIncidentByNumber(context.Background(), "INC001^ORpriority=1"); err == nil {
+		t.Fatalf("expected FindIncidentByNumber to reject ^ operator")
+	}
+	if _, err := client.FindIncidentByNumber(context.Background(), "IN"); err == nil {
+		t.Fatalf("expected FindIncidentByNumber to reject too-short incident number")
+	}
+	if _, err := client.LookupUserByEmail(context.Background(), "a@b.com^active=false"); err == nil {
+		t.Fatalf("expected LookupUserByEmail to reject ^ operator")
+	}
+	if _, err := client.LookupUserByUsername(context.Background(), "alice\n^admin=true"); err == nil {
+		t.Fatalf("expected LookupUserByUsername to reject newline/^ operator")
+	}
+	if _, err := client.FindIncidentByCorrelationID(context.Background(), "abc^OR1=1"); err == nil {
+		t.Fatalf("expected FindIncidentByCorrelationID to reject ^ operator")
+	}
+	if _, err := client.GetIncidentsBySysIDs(context.Background(), "get", []string{"sys1,sys2"}); err == nil {
+		t.Fatalf("expected GetIncidentsBySysIDs to reject comma inside sys_id")
+	}
+	if httpHits != 0 {
+		t.Fatalf("expected 0 outbound HTTP calls for rejected sysparm_query inputs, got %d", httpHits)
+	}
+
+	// CallerResolver safely falls back to default NOC caller when poisoned operator email is rejected.
+	resolver := NewCallerResolver(nil, client, "noc_001", metrics, nil)
+	res := resolver.Resolve(context.Background(), model.CallerModeSSOUser, auth.OperatorContext{
+		Login: "attacker",
+		Email: "attacker@corp.example^ORactive=true",
+	})
+	if res.ResolutionStatus != model.CallerResFallbackNOC || res.SysID != "noc_001" {
+		t.Fatalf("expected fallback_noc on rejected sys_user query input, got %+v", res)
 	}
 }

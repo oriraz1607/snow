@@ -38,7 +38,7 @@ flowchart TB
     end
 
     subgraph DataTier["Persistence Layer"]
-        PG[("PostgreSQL 15+\nalerts\nservicenow_incidents\nalert_audit_log\nsnow_user_cache\nwebhook_ingestion_log")]
+        PG[("PostgreSQL 15+\nalerts\nservicenow_incidents\nalert_audit_log\nalert_fingerprint_teams\nsnow_user_cache\nwebhook_ingestion_log")]
     end
 
     subgraph ITSM["ServiceNow (Shared Corporate SSO IdP)"]
@@ -111,6 +111,9 @@ sequenceDiagram
     API-->>UI: 201 Created (INC0012345 + optional fallback warning banner)
 ```
 
+> [!NOTE]
+> **Multi-alert bulk creation (`POST /api/v1/servicenow/incidents/bulk`)** follows the same two-phase reservation pattern across up to 50 selected alerts: Tx 1 locks all selected `alerts` in deterministic `id ASC` order, auto-acknowledges any `firing` alerts (requiring `alerts:triage`), and reserves `pending` rows for every alert; Phase 2 creates one ServiceNow incident (with `correlation_id = PrimaryAlertID`, the lexicographically smallest alert UUID); Tx 2 marks the primary row `created` and sibling rows `linked` to the same `snow_sys_id`. See [05-servicenow-integration.md](05-servicenow-integration.md) §4.6.
+
 ---
 
 ### 3.2 Flow 2: Alert Stops Firing While ServiceNow Ticket Remains Open (Drift Detection & Sync)
@@ -167,11 +170,12 @@ sequenceDiagram
     Note over PG: Episode 1 (id=A1, fp1, startsAt=T1) is state=resolved (uq_alerts_active_fingerprint released)
     AM->>API: POST /api/v1/webhooks/alertmanager (status=firing, fp1, startsAt=T3 > T1)
     API->>PG: SELECT (fp1, T3) -> none; SELECT active (fp1) -> none
-    API->>PG: INSERT alerts (id=A2, fp1, startsAt=T3, state=firing, acknowledged_by=NULL, version=1) + audit_log
+    API->>PG: If labels["team"] absent, SELECT alert_fingerprint_teams WHERE fingerprint=fp1
+    API->>PG: INSERT alerts (id=A2, fp1, startsAt=T3, state=firing, acknowledged_by=NULL, assigned_team=inherited, version=1) + audit_log
     API-->>AM: 200 OK
 
     UI->>API: GET /api/v1/alerts?state=firing
-    API-->>UI: Returns A2 as brand-new UNACKNOWLEDGED firing alert (with previous_episode_count=1 linking history to A1 / INC0012345)
+    API-->>UI: Returns A2 as brand-new UNACKNOWLEDGED firing alert (with previous_episode_count=1 linking history to A1 / INC0012345 and inherited assigned_team if previously tagged)
 ```
 
 ---
@@ -185,6 +189,7 @@ sequenceDiagram
 | *(none)* | AM webhook `firing` (new `fp, startsAt`) | Alertmanager | `firing` | `= 1` | `alert_fired` | Creates new episode row. |
 | `firing` | AM webhook `firing` (same `fp, startsAt`) | Alertmanager | `firing` | No | `alert_updated` *(if changed)* | Refreshes labels/annotations/count. |
 | `firing` | `POST /acknowledge` | Operator (Editor+) | `acknowledged` | `+1` | `alert_acknowledged` | Reveals SNOW Action Bar in UI. |
+| `firing` | `POST /servicenow/incidents/bulk` | Operator (Editor+) | `acknowledged` | `+1` | `alert_acknowledged`, `snow_incident_requested`, `snow_incident_created`/`linked` | Auto-acknowledges firing alerts (requires `alerts:triage` + `incidents:write`) and links all selected alerts to one ServiceNow incident. |
 | `firing` | `POST /dismiss` | Operator (Editor+) | `dismissed` | `+1` | `alert_dismissed` | Requires `reason`. |
 | `firing` | AM webhook `resolved` | Alertmanager | `resolved` | `+1` | `alert_resolved` | Auto-cleared without NOC ack. |
 | `acknowledged` | AM webhook `firing` (same `fp, startsAt`) | Alertmanager | `acknowledged` | No | `alert_updated` *(if changed)* | Preserves ack & owner. |
@@ -198,6 +203,16 @@ sequenceDiagram
 | `resolved` | AM webhook `firing` (**same** `startsAt`) | Alertmanager | `resolved` | No | *(none)* | Ignored (out-of-order delayed delivery). |
 | `resolved` | AM webhook `firing` (**new** `startsAt`) | Alertmanager | *(new row)* `firing` | `= 1` | `alert_fired` | Fresh unacknowledged episode! |
 | `resolved` | `POST /acknowledge` or `/dismiss` | Operator | *(409 Rejected)* | No | *(none)* | Terminal episode state. |
+| *(any)* | `POST /alerts/{alert_id}/team` | Operator (Editor+) | *(unchanged)* | No | `alert_team_tagged` | Persists `assigned_team` on the episode and upserts `alert_fingerprint_teams` for future re-fire inheritance (Prometheus `team` label still takes precedence when present). |
+
+#### Queue Bucket Mapping
+
+| UI Queue Bucket | Query Filter (`GET /api/v1/alerts`) | PostgreSQL Predicate | Summary Counter Field |
+|---|---|---|---|
+| **Firing** | `state=firing` | `a.state = 'firing'` | `summary.firing` |
+| **Acknowledged** | `state=acknowledged` | `a.state = 'acknowledged'` | `summary.acknowledged` (sub-count `summary.acknowledged_without_incident`) |
+| **Non active Acknowledged** | `state=non_active_acknowledged` | `a.state = 'resolved' AND a.acknowledged_at IS NOT NULL` | `summary.non_active_acknowledged` (drift sub-count `summary.resolved_open_ticket`) |
+| **Dismissed** | `state=dismissed` | `a.state = 'dismissed'` | `summary.dismissed` |
 
 ### 4.2 Cross-System Drift Matrix (`alerts.state` × `servicenow_incidents.snow_state`)
 
@@ -206,7 +221,7 @@ sequenceDiagram
 | `firing` / `acknowledged` | *(none)* | `none` | Normal active alert (if `acknowledged`, show SNOW Action Bar). |
 | `firing` / `acknowledged` | `1` (New), `2` (In Progress), `3` (On Hold) | `none` | Aligned — incident is actively being worked. |
 | `firing` / `acknowledged` | `6` (Resolved), `7` (Closed), `8` (Canceled) | `active_closed_ticket` | **Red Drift Badge:** Team closed SNOW ticket while alert is still firing! |
-| `resolved` | `1` (New), `2` (In Progress), `3` (On Hold) | `resolved_open_ticket` | **Amber Drift Badge:** Alert stopped firing, but team has not resolved the SNOW ticket! Highlighted in top KPI card & filter. |
+| `resolved` | `1` (New), `2` (In Progress), `3` (On Hold) | `resolved_open_ticket` | **Amber Drift Badge:** Alert stopped firing, but team has not resolved the SNOW ticket! Highlighted in the **Non active Acknowledged** bucket sub-count and ServiceNow status filter. |
 | `resolved` | `6` (Resolved), `7` (Closed), `8` (Canceled) | `none` | Fully closed end-to-end. |
 | `dismissed` | `1` / `2` / `3` | `none` *(informational badge)* | Alert dismissed in NOC; SNOW ticket link remains visible for manual follow-up. |
 
@@ -217,8 +232,8 @@ sequenceDiagram
 | # | Failure Mode / Edge Case | Concrete Impact Without Mitigation | Mitigation Strategy |
 |---|---|---|---|
 | 1 | **Race: Operator clicks `Acknowledge` at the exact millisecond Alertmanager sends `resolved`** | Lost update: alert stays stuck in `acknowledged` after resolution or operator overwrites `resolved_at`. | Both paths lock the row with `SELECT ... FOR UPDATE`. If webhook commits first (`version` bumps, `state='resolved'`), the operator's ack fails with `409 Conflict` carrying the fresh `resolved` snapshot. If operator commits first, webhook transitions `acknowledged` → `resolved` cleanly. |
-| 2 | **Race: Two NOC operators click `Acknowledge` or `Create SNOW Incident` simultaneously** | Duplicate audit logs or two ServiceNow incidents created for the same alert. | `Acknowledge` is serialized by `FOR UPDATE` + optimistic `version` check (second operator gets `409` showing who acked). `Create SNOW Incident` enforces `UNIQUE (alert_id)` on `servicenow_incidents` in Tx 1; the second request immediately receives `409 INCIDENT_CREATION_IN_PROGRESS` or `409 INCIDENT_ALREADY_LINKED`. |
-| 3 | **ServiceNow timeout (`504`) after ServiceNow actually created the incident** | Operator clicks Retry and creates a duplicate `INC` ticket. | `correlation_id = alert_id` is sent on every `POST`. Before retrying any `failed` or stale `pending` (>60s) record, the Go API queries `GET /api/now/table/incident?sysparm_query=correlation_id=<alert_id>` and adopts the existing ticket if found. |
+| 2 | **Race: Two NOC operators click `Acknowledge` or `Create SNOW Incident` (single or bulk) simultaneously** | Duplicate audit logs, deadlocks, or two ServiceNow incidents created for the same alert. | `Acknowledge` is serialized by `FOR UPDATE` + optimistic `version` check (second operator gets `409` showing who acked). Single and bulk `Create SNOW Incident` lock alerts in deterministic `id ASC` order and enforce `UNIQUE (alert_id)` on `servicenow_incidents` in Tx 1; the second request immediately receives `409 INCIDENT_CREATION_IN_PROGRESS` or `409 INCIDENT_ALREADY_LINKED`. |
+| 3 | **ServiceNow timeout (`504`) after ServiceNow actually created the incident** | Operator clicks Retry and creates a duplicate `INC` ticket. | `correlation_id` is sent on every `POST`, and `Idempotency-Key` responses are persisted in `idempotency_keys` (24h TTL) so matching retries replay `201 Created`. Before retrying any `failed` or stale `pending` (>60s) record, the Go API queries `GET /api/now/table/incident?sysparm_query=correlation_id=<id>` (across all prior candidate correlation IDs for bulk batches) and adopts the existing ticket if found. |
 | 4 | **ServiceNow API completely down / unreachable** | Alert triage stalls, DB connection pool exhausts, or Alertmanager webhooks time out. | (a) Two-phase reservation never holds DB transactions open across SNOW HTTP calls.<br>(b) Alertmanager webhooks never call SNOW synchronously.<br>(c) SNOW client circuit breaker fails fast (`503`) while `Acknowledge`/`Dismiss` and `/readyz` remain 100% healthy. |
 | 5 | **Operator's Grafana SSO email does not exist or is inactive in ServiceNow `sys_user`** | Ticket creation fails during a critical outage. | 3-second bounded `sys_user` lookup with `snow_user_cache` automatically falls back to `SNOW_DEFAULT_NOC_CALLER_SYS_ID` (`generic_noc`), records `caller_resolution_status='fallback_noc'`, logs the operator's real SSO email in `work_notes` and `alert_audit_log`, and returns a non-blocking warning banner. |
 | 6 | **Alertmanager HA duplicate delivery or batch deadlock** | Duplicate alert rows or PostgreSQL deadlock errors (`40P01`). | `UNIQUE (fingerprint, starts_at)` + deterministic sorting of `alerts[]` by `(fingerprint, startsAt)` prior to row locking eliminates deadlocks and guarantees idempotency. |
@@ -233,21 +248,22 @@ sequenceDiagram
 
 ### 6.1 End-to-End Security Controls
 - **Zero Secrets in Frontend or Source:** ServiceNow OAuth/Basic credentials and PostgreSQL DSNs live solely in Go API environment variables (`SNOW_*`, `DATABASE_URL`). The Grafana plugin stores only the internal JWT signing secret (`apiJwtSecret`) encrypted inside Grafana `secureJsonData`.
-- **Transport Encryption:** TLS 1.2+ mandatory for Browser ↔ Grafana, Grafana ↔ Go API, Alertmanager ↔ Go API, Go API ↔ PostgreSQL (`sslmode=require`), and Go API ↔ ServiceNow (`https://`).
-- **Tamper-Proof Operator Attribution:** Operator identity (`login`, `email`, `role`, `permissions`) is extracted server-side from Grafana's authenticated `PluginContext.User` and cryptographically signed into a 60-second JWT (`HS256`); client-supplied JSON bodies cannot spoof actor identity.
-- **Database Least Privilege:** Application DB user (`noc_api_app`) has `SELECT, INSERT` only on `alert_audit_log` (no `UPDATE`/`DELETE`), preventing audit log tampering even if an application bug occurs.
+- **Transport Encryption:** TLS 1.2+ supported end-to-end: Browser ↔ Grafana, Grafana ↔ Go API (via ingress/proxy or in-process `TLS_CERT_FILE` + `TLS_KEY_FILE` on `PORT`), Alertmanager ↔ Go API, Go API ↔ PostgreSQL (`sslmode=require`), and Go API ↔ ServiceNow (`https://`).
+- **Tamper-Proof Operator Attribution:** Operator identity (`login`, `email`, `role`, `permissions`) is extracted server-side from Grafana's authenticated `PluginContext.User` and cryptographically signed into a 60-second JWT (`HS256`); client-supplied JSON bodies cannot spoof actor identity. Legacy proxy fallback requires explicit `X-Grafana-Role` and fails closed when omitted.
+- **Database Least Privilege:** Application DB user (`alert_api_app`) has `SELECT, INSERT` only on `alert_audit_log` (no `UPDATE`/`DELETE`), preventing audit log tampering even if an application bug occurs.
 - **Webhook Hardening:** Constant-time token/HMAC verification (`subtle.ConstantTimeCompare` / `hmac.Equal`), strict `5 MiB` body cap (`http.MaxBytesReader`), and strict JSON schema validation.
 
 ### 6.2 RBAC Authorization Matrix
 
-| Capability | Grafana Plugin RBAC Action | Default Grant (OSS & Enterprise) | Go API Enforcement |
-|---|---|---|---|
-| View alert queue, details, audit history, past episodes, SNOW metadata | `noc-alert-manager-app.alerts:read` | `Viewer`, `Editor`, `Admin` | Verified via signed JWT `permissions` / `role`. |
-| Acknowledge, unacknowledge, dismiss, reopen, add triage notes | `noc-alert-manager-app.alerts:triage` | `Editor`, `Admin` | Verified via signed JWT `permissions` / `role`. |
-| Create/link SNOW incident, post SNOW work note, force SNOW sync | `noc-alert-manager-app.incidents:write` | `Editor`, `Admin` | Verified via signed JWT `permissions` / `role`. |
-| Configure Grafana plugin URL, poll interval, JWT secret | `noc-alert-manager-app.settings:write` | `Admin` | Enforced by Grafana App Settings API. |
-| Ingest Alertmanager alerts | *(N/A — Machine Auth)* | Alertmanager Receiver | `ALERTMANAGER_WEBHOOK_TOKEN` Bearer auth. |
-| Push ServiceNow incident state changes | *(N/A — Machine Auth)* | ServiceNow Business Rule | `SNOW_INBOUND_WEBHOOK_SECRET` HMAC-SHA256. |
+| Capability | Endpoints (`backend/internal/httpapi/router.go`) | Grafana Plugin RBAC Action | Default Grant (OSS & Enterprise) | Go API Enforcement |
+|---|---|---|---|---|
+| View alert queue, details, audit history, past episodes, SNOW metadata | `GET /api/v1/alerts`<br>`GET /api/v1/alerts/{alert_id}`<br>`GET /api/v1/alerts/{alert_id}/history`<br>`GET /api/v1/servicenow/metadata` | `noc-alert-manager-app.alerts:read` | `Viewer`, `Editor`, `Admin` | Verified via signed JWT `permissions` / `role`. |
+| Acknowledge, unacknowledge, dismiss, reopen, add triage notes, tag owning team | `POST /api/v1/alerts/{alert_id}/acknowledge`<br>`POST /api/v1/alerts/{alert_id}/unacknowledge`<br>`POST /api/v1/alerts/{alert_id}/dismiss`<br>`POST /api/v1/alerts/{alert_id}/reopen`<br>`POST /api/v1/alerts/{alert_id}/notes`<br>`POST /api/v1/alerts/{alert_id}/team` | `noc-alert-manager-app.alerts:triage` | `Editor`, `Admin` | Verified via signed JWT `permissions` / `role`. |
+| Create/link single or bulk SNOW incident, post SNOW work note, force SNOW sync | `POST /api/v1/servicenow/incidents/bulk` *(also requires `alerts:triage` if any selected alert is `firing`)*<br>`POST /api/v1/alerts/{alert_id}/servicenow/incident`<br>`POST /api/v1/alerts/{alert_id}/servicenow/link`<br>`POST /api/v1/alerts/{alert_id}/servicenow/sync`<br>`POST /api/v1/alerts/{alert_id}/servicenow/work-notes` | `noc-alert-manager-app.incidents:write` | `Editor`, `Admin` | Verified via signed JWT `permissions` / `role`. |
+| Configure Grafana plugin URL, poll interval, JWT secret | Grafana App Settings (`/a/noc-alert-manager-app/config`) | `noc-alert-manager-app.settings:write` | `Admin` | Enforced by Grafana App Settings API. |
+| Ingest Alertmanager alerts | `POST /api/v1/webhooks/alertmanager` | *(N/A — Machine Auth)* | Alertmanager Receiver | `ALERTMANAGER_WEBHOOK_TOKEN` Bearer auth. |
+| Push ServiceNow incident state changes | `POST /api/v1/webhooks/servicenow` | *(N/A — Machine Auth)* | ServiceNow Business Rule | `SNOW_INBOUND_WEBHOOK_SECRET` HMAC-SHA256 / Bearer. |
+| Health, readiness, and Prometheus metrics (`ADMIN_PORT`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | *(N/A — Internal Network)* | Cluster / Scraper | Served only on `ADMIN_PORT` (`9090`). |
 
 ### 6.3 Observability: Metrics, Logging & Health Probes
 
@@ -263,6 +279,7 @@ sequenceDiagram
 - `noc_snow_caller_resolution_total{status="sso_matched|generic_noc_selected|fallback_noc"}` (Counter — alerts if fallback rate spikes due to IdP/email mismatch!)
 - `noc_snow_circuit_breaker_state` (Gauge: `0=closed, 1=open, 2=half_open`)
 - `noc_db_pool_acquired_conns`, `noc_db_pool_idle_conns` (Gauges from `pgxpool.Stat`)
+- **Meta-Alert Rules:** `deploy/prometheus-alerts.yml` defines Prometheus alerts for `noc_alertmanager_truncated_alerts_total` increases (`NocAlertmanagerTruncatedAlerts`) and `fallback_noc` spikes (`NocSnowCallerFallbackSpike`).
 
 #### Structured JSON Logging (`log/slog`)
 - Every log line includes: `timestamp`, `level`, `msg`, `request_id`, `component`, and (when applicable) `alert_id`, `fingerprint`, `actor_login`, `incident_number`, `duration_ms`.

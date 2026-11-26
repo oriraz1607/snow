@@ -166,67 +166,69 @@ Modeled after the **Grafana Cloud IRM ServiceNow integration** (alert-group list
 ### 5.1 Primary View: NOC Alert Queue (`/a/noc-alert-manager-app/alerts`)
 
 #### Top KPI & Quick-Filter Strip
-Displays clickable counter cards populated from `GET /api/v1/alerts` summary counts:
-1. **Firing** (red badge) — `state=firing` (unacknowledged alerts requiring immediate attention).
-2. **Acknowledged** (amber badge) — `state=acknowledged` (active alerts claimed by NOC; shows sub-count of `Without Ticket` vs `Ticket Open`).
-3. **Resolved — Open Ticket** (purple/orange drift badge) — `incident_drift=resolved_open_ticket` (**highlights alerts that stopped firing while their ServiceNow incident is still `New`, `In Progress`, or `On Hold`**).
-4. **Dismissed** (neutral gray badge) — `state=dismissed`.
-5. **All Resolved** (green badge) — `state=resolved`.
+Displays 4 clickable exclusive bucket tab cards (`KpiFilterStrip.tsx`) populated from `GET /api/v1/alerts` `summary` counts (defaulting to **`Firing`** on load; only `critical` and `warning` alerts are shown or counted):
+1. **Firing** (red accent, default active tab) — `state=firing`, count `summary.firing`, with live `summary.firing_critical` / `summary.firing_warning` severity breakdown when non-zero (otherwise *"Unacknowledged active alerts"*).
+2. **Acknowledged** (amber accent) — `state=acknowledged`, count `summary.acknowledged`, subtext showing `summary.acknowledged_without_incident` without ticket vs. ticket open.
+3. **Non active Acknowledged** (purple accent) — `state=non_active_acknowledged` (`state = 'resolved' AND acknowledged_at IS NOT NULL AND dismissed_at IS NULL`), count `summary.non_active_acknowledged`; when `summary.resolved_open_ticket > 0`, subtext highlights **`<N> open ServiceNow ticket`** drift.
+4. **Dismissed** (neutral gray accent) — `state=dismissed`, count `summary.dismissed` (*"Suppressed for episode"*).
 
-#### Filter & Search Toolbar
-- Free-text search across `alert_name`, `fingerprint`, `incident_number` (`INC...`), and `annotations.summary`.
-- Multi-select dropdowns: **Severity** (`critical`, `warning`, `info`), **Label Filter** (`key=value`, e.g., `cluster=prod-eu1`), **ServiceNow Status** (`No Incident`, `Incident Open`, `Incident Resolved/Closed`, `Drift: Resolved w/ Open Ticket`).
+#### Filter, Search & Pagination Toolbar
+- 250ms debounced free-text search across `alert_name`, team (`labels.team` / `assigned_team`), `fingerprint`, `incident_number` (`INC...`), and `annotations.summary`.
+- Filter controls (`FilterToolbar.tsx`): **Env** dropdown (`Env: All` + distinct store values), **Site** dropdown (`Site: All` + distinct store values), **Team** dropdown (`Team: All`, `Team: Untagged`, + distinct Prometheus/operator teams), **Sort** dropdown (`severity_desc` default — Critical before Warning, `starts_at_desc`, `starts_at_asc`, `resolved_at_desc`), **Severity** toggle chips (`critical`, `warning`), and **Label Filter** (`key=value` tags).
+- Bulk selection bar (`bulk-selection-bar`): Selecting ≥1 firing/acknowledged alert lets operators **`Dismiss Selected (<N>)`** in one atomic batch (`POST /v1/alerts/bulk/dismiss`) or **`Create Single ServiceNow Incident (<M>)`** for incident-eligible alerts (`MAX_BULK_SELECTION = 50`).
 - Auto-refresh toggle (`15s` default) with manual **Refresh** button and last-synced timestamp.
+- Keyset pagination bar below the table (`25` / `50` / `100` rows per page, default `50`) showing `Showing X–Y of N · Page P of T`, `« First` / `‹ Prev` / `Next ›`, and preserving Page 2+ during background polling with a non-disruptive `"Queue updated — Jump to Page 1"` pill when counts change.
 
 #### Alert Table Columns
-| Column | Data Source | Visual Behavior |
-|---|---|---|
-| **Severity & State** | `severity`, `state` | Color-coded severity pill + state badge (`Firing`, `Acknowledged`, `Dismissed`, `Resolved`). |
-| **Alert & Summary** | `alert_name`, `annotations.summary`, key `labels` | Bold alert name, truncated summary, inline label chips (e.g., `service=payments`, `instance=db-01`), plus a subtle history indicator if `previous_episode_count > 0` (e.g., `"Fired 3× in 7d"` — click to view past episodes). |
-| **Duration / Timeline** | `starts_at`, `resolved_at` | Relative age (`Firing 14m`) or resolved duration (`Resolved 42m ago`). |
-| **Owner / Ack** | `acknowledged_by`, `acknowledged_at` | Operator login/avatar when `acknowledged`; `—` when `firing`. |
-| **ServiceNow Incident** | `servicenow_incident` + `incident_drift_status` | - None: `—`<br>- Pending: spinner `"Creating..."`<br>- Created/Linked: clickable link `INC0012345 ↗` + SNOW state pill (`New`, `In Progress`, `On Hold`, `Resolved`, `Closed`).<br>- **Drift Warning Badge:** If `incident_drift_status === "resolved_open_ticket"`, renders an amber warning pill: **`Alert Resolved · Ticket Still Open`**.<br>- If `incident_drift_status === "active_closed_ticket"`, renders a red warning pill: **`Alert Firing · Ticket Closed`**. |
-| **Quick Actions** | Context-sensitive buttons | - If `firing`: **[Acknowledge]**, **[Dismiss]**<br>- If `acknowledged` & no incident: **[Create SNOW Incident]**, **[Link INC]**, **[Dismiss]**<br>- If `resolved_open_ticket`: **[Open in SNOW ↗]**, **[Nudge / Post Note]**, **[Sync Status]** |
+Rendered as a fixed-layout HTML table (`table-layout: fixed; width: 100%` in `AlertTable.tsx`) with sticky headers (`thead`), de-boxed metadata typography (no square pills/badges), and locked column widths identical across tabs so columns never shift:
+
+| Column | Fixed Width | Data Source | Visual Behavior |
+|---|---|---|---|
+| **Checkbox** *(select)* | `36px` | `isAlertSelectableForIncident(alert)` | Header "Select all eligible alerts" + per-row checkbox (`critical`/`warning` `3px` left accent stripe on cell edge). |
+| **Severity** | `92px` | `severity` | Clean bold colored label (`Critical` red, `Warning` orange — `info`/`low`/`unknown` excluded). |
+| **Alert** | `auto` *(flex)* | `alert_name`, `annotations.summary`, `previous_episode_count` | Bold clickable alert link (opens detail drawer), inline `"<N> prior"` episode filter link, and 1-line truncated summary. |
+| **Env** | `76px` | `environment` (`labels.environment` / `labels.env`) | Plain monospace text or `—`. |
+| **Site** | `104px` | `site` (`labels.site`) | Plain monospace text or `—`. |
+| **Team** | `124px` | `team`, `team_source`, `assigned_team_by` | Colored dot (`●` blue for Prometheus `labels.team`, purple with tooltip *"Tagged by `<user>`"* for operator tag) + team name, or `—`. |
+| **Duration** | `92px` | `starts_at`, `resolved_at`, `version` | Active alerts show relative duration + `v<version>`; resolved alerts show `Res <age>` and `Start <age>`. |
+| **ServiceNow** *(acknowledged tabs only)* | `152px` | `servicenow_incident` + `incident_drift_status` | Shown only on `Acknowledged` and `Non active Acknowledged` tabs: clickable link `INC0012345 ↗` + plain state/drift text (`Open Drift` / `Ticket Closed`), `Creating...`, or `SNOW Failed`. |
+| **Actions** | `48px` | `RowActionMenu.tsx` | Centered **3-squares** menu trigger opening a portal-mounted contextual menu:<br>- `firing`: **Acknowledge**, **Create ServiceNow Incident**, **Dismiss...**, **View Details**<br>- `acknowledged` (unlinked): **Create ServiceNow Incident**, **Link Existing Incident...**, **Add Triage Note...**, **Unacknowledge**, **Dismiss...**, **View Details**<br>- `acknowledged` (linked): **Add ServiceNow Work Note...**, **Sync ServiceNow Status**, **Add Triage Note...**, **Dismiss...**, **View Details**<br>- `resolved_open_ticket`: **Post Work Note...**, **Refresh ServiceNow Status**, **View Details**<br>- `dismissed`: **Reopen Alert**, **View Details** |
 
 ---
 
-### 5.2 Core NOC Triage Flow: Acknowledge → ServiceNow Action Bar
+### 5.2 Core NOC Triage Flow: Acknowledge → ServiceNow Action Menu
 
 ```mermaid
 stateDiagram-v2
     [*] --> FiringRow: Alert arrives (state=firing)
-    FiringRow --> AckPending: Operator clicks [Acknowledge]
-    AckPending --> AckWithBar: 200 OK (state=acknowledged, version+1)
+    FiringRow --> AckPending: Operator clicks [Acknowledge] in 3-squares menu
+    AckPending --> AckTab: 200 OK (moves to Acknowledged tab)
     AckPending --> ConflictToast: 409 Conflict (already acked/resolved)
     ConflictToast --> FiringRow: Auto-refresh row state
 
-    state AckWithBar {
-        [*] --> ActionBarVisible: Contextual Action Bar revealed inline & in Drawer
-        ActionBarVisible --> CreateModal: Click [Create ServiceNow Incident]
-        ActionBarVisible --> LinkModal: Click [Link Existing Incident]
-        ActionBarVisible --> DismissModal: Click [Dismiss]
-        ActionBarVisible --> UnackAction: Click [Unacknowledge]
+    state AckTab {
+        [*] --> MenuActions: Contextual actions in 3-squares menu & Drawer
+        MenuActions --> CreateModal: Click [Create ServiceNow Incident]
+        MenuActions --> LinkModal: Click [Link Existing Incident...]
+        MenuActions --> DismissModal: Click [Dismiss...]
+        MenuActions --> UnackAction: Click [Unacknowledge]
     }
 
     CreateModal --> SnowCreating: Submit form (SSO user or Generic NOC)
-    SnowCreating --> IncidentLinked: 201 Created (INCxxxxxxx + badge)
+    SnowCreating --> IncidentLinked: 201 Created (INCxxxxxxx link on Acknowledged tab)
     SnowCreating --> FallbackBanner: 201 Created (caller_resolution_status=fallback_noc)
     SnowCreating --> SnowErrorRetry: 502/503/504 (Alert stays acknowledged; Retry CTA)
 ```
 
 #### Step-by-Step UX Behavior
-1. **Clicking `Acknowledge` (on a `firing` alert):**
+1. **Clicking `Acknowledge` (inside a `firing` row's 3-squares `RowActionMenu`):**
    - Calls `POST /api/plugins/noc-alert-manager-app/resources/v1/alerts/{alert_id}/acknowledge` with `{ "version": alert.version }`.
-   - On `200 OK`, the row transitions to `acknowledged`, updates `version`, and **immediately expands the Contextual ServiceNow Action Bar** directly below the alert row (and pins it to the top of the Alert Detail Drawer if open).
-   - **Action Bar Contents (when `state === "acknowledged"` and no incident is linked):**
-     - Primary button: **`Create ServiceNow Incident`** (blue primary CTA, icon + shortcut `C`).
-     - Secondary button: **`Link Existing Incident`** (allows typing `INC0012345` to attach an existing ticket).
-     - Tertiary actions: **`Add Note`**, **`Unacknowledge`**, **`Dismiss`**.
+   - On `200 OK`, removes the row from the `Firing` tab, shows a confirmation toast (`Moved to the Acknowledged tab`), and updates the KPI counts (`Acknowledged` tab exposes `Create ServiceNow Incident`, `Link Existing Incident...`, `Add Triage Note...`, `Unacknowledge`, and `Dismiss...` via its 3-squares menu and the Alert Detail Drawer).
 2. **Clicking `Create ServiceNow Incident`:**
    - Opens the **Create ServiceNow Incident Drawer/Modal** pre-populated from the alert context and `GET /api/v1/servicenow/metadata`:
      - **Short Description** *(required, max 160 chars)*: Pre-filled as `[<severity>] <alert_name>: <annotations.summary>`.
      - **Description** *(multiline, editable)*: Pre-filled Markdown/text block containing Alert Name, Severity, Starts At (UTC), Fingerprint, all Labels, Annotations (`description`, `runbook_url`), Alertmanager `generatorURL`, and deep link back to this Grafana alert (`/a/noc-alert-manager-app/alerts/{alert_id}`).
-     - **Impact** *(1-High, 2-Medium, 3-Low)* & **Urgency** *(1-High, 2-Medium, 3-Low)*: Pre-mapped from alert `severity` (`critical` → Impact 1 / Urgency 1, `warning` → Impact 2 / Urgency 2, `info` → Impact 3 / Urgency 3), displaying the live calculated ServiceNow **Priority** preview (`1 - Critical` through `5 - Planning`).
+     - **Impact** *(1-High, 2-Medium, 3-Low)* & **Urgency** *(1-High, 2-Medium, 3-Low)*: Pre-mapped from alert `severity` (`critical` → Impact 1 / Urgency 1, `warning` → Impact 2 / Urgency 2), displaying the live calculated ServiceNow **Priority** preview (`1 - Critical` through `5 - Planning`).
      - **Assignment Group** *(dropdown/autocomplete)*: Pre-filled from label `labels.assignment_group` or `labels.team` mapping, falling back to `SNOW_DEFAULT_ASSIGNMENT_GROUP`.
      - **Category** *(dropdown)*: Default from `SNOW_DEFAULT_CATEGORY` (e.g., `Infrastructure` / `Software`).
      - **Caller Identity** *(radio toggle — addresses corporate SSO + generic `noc` requirement)*:
@@ -238,6 +240,11 @@ stateDiagram-v2
    - **Standard Success (`caller_resolution_status: "sso_matched"` or `"generic_noc_selected"`):** Action bar updates in place to show **`INC0012345`** (`New`), clickable **`Open in ServiceNow ↗`**, **`Sync Status`**, and **`Add Work Note`**.
    - **Success with SSO Fallback (`caller_resolution_status: "fallback_noc"`):** Incident is linked normally AND a dismissible info banner displays: *"Incident `INC0012345` created using the generic `noc` account because your SSO account (`alice.smith@corp.example`) could not be matched in ServiceNow."*
    - **ServiceNow Failure (`502` / `503` / `504`):** The alert **remains `acknowledged`** (triage is never rolled back). The modal remains open with form values preserved and displays a clear error alert with a **`Retry Creation`** button reusing the same `Idempotency-Key`.
+4. **Multi-Alert Selection & Bulk ServiceNow Incident Creation:**
+   - Operators can select up to `50` eligible (`firing` or `acknowledged`, unlinked) alerts via the table checkboxes (`MAX_BULK_SELECTION = 50`; checkboxes cap at 50 with an inline notice). A bulk selection bar displays the selected count, notes how many `firing` alerts will be auto-acknowledged, and exposes **`Create Single ServiceNow Incident (<N>)`**.
+   - Opening the modal with multiple alerts (or any `firing` alert) shows an **Included Alerts** list and submits `POST /api/plugins/noc-alert-manager-app/resources/v1/servicenow/incidents/bulk` with `alert_ids` and an `Idempotency-Key` header, auto-acknowledging any `firing` alerts and linking all selected alerts to one ServiceNow incident.
+   - On `409 Conflict`, `CreateIncidentModal` disables retry, surfaces the conflicting alert and incident/state details inside the modal, and refreshes the queue immediately.
+   - Selections that disappear or gain a linked incident on background refresh are automatically pruned from `selectedAlertIds`.
 
 ---
 
@@ -245,8 +252,8 @@ stateDiagram-v2
 
 When an alert was acknowledged, a ServiceNow incident was created, and Prometheus Alertmanager subsequently sends `status: "resolved"` while the owning engineering team has **not** resolved/closed the ServiceNow ticket:
 1. The alert transitions to `state: "resolved"` in PostgreSQL, while `servicenow_incidents.snow_state` remains `1` (`New`), `2` (`In Progress`), or `3` (`On Hold`).
-2. The **"Resolved — Open Ticket"** top counter increments immediately on the next poll.
-3. Clicking the counter filters the table via `GET /api/v1/alerts?incident_drift=resolved_open_ticket`.
+2. The **"Non active Acknowledged"** bucket card updates its subtext to highlight `<N> open ServiceNow ticket` (`summary.resolved_open_ticket`).
+3. Selecting **`Drift: Resolved w/ Open Ticket`** in the ServiceNow status filter switches to the `Non active Acknowledged` bucket and queries `GET /api/v1/alerts?state=non_active_acknowledged&incident_drift=resolved_open_ticket`.
 4. Opening the alert detail drawer displays a prominent **Drift Callout Banner**:
    - *"Alert stopped firing at `2026-11-25 18:12:04 UTC` (42m ago), but ServiceNow incident `INC0012345` is still **In Progress** (last synced 2m ago)."*
    - Inline buttons:
@@ -258,7 +265,8 @@ When an alert was acknowledged, a ServiceNow incident was created, and Prometheu
 
 ### 5.4 Alert Detail Drawer & Audit Timeline
 
-Clicking any row opens a right-hand slide-over drawer (URL-addressable at `/a/noc-alert-manager-app/alerts/:alertId`) with 4 tabs:
+Clicking any row opens a right-hand slide-over drawer (URL-addressable at `/a/noc-alert-manager-app/alerts/:alertId`) with a **Connected Team** card above 4 tabs:
+- **Connected Team Card:** Displays the resolved owning team (`team_source: "label"` blue badge from Prometheus `labels.team`, or `team_source: "operator"` purple badge with *"Change Team"* button). When no team is connected (`team_source: "none"`) or editing, Editors/Admins can type a team name or pick a quick-select chip (seeded from `metadata.assignment_groups` + defaults) to call `POST /api/plugins/noc-alert-manager-app/resources/v1/alerts/{alert_id}/team`. Operator tags are stored by `fingerprint` and inherited automatically on future re-fires.
 1. **Overview:** State banner, ServiceNow Action Bar (or linked incident card + drift banner), summary/description annotations, `generatorURL` ("Open in Prometheus ↗"), `runbook_url` ("Open Runbook ↗"), and full `labels` key-value table.
 2. **ServiceNow:** Linked incident metadata (`number`, `sys_id`, `state`, `priority`, `assignment_group`, `caller_resolution_status`, `snow_state_synced_at`), quick work-note composer, and manual sync button.
 3. **Audit Timeline:** Chronological feed from `GET /api/v1/alerts/{alert_id}/history` showing every event (`alert_fired`, `alert_acknowledged`, `snow_incident_created`, `snow_caller_fallback`, `alert_resolved`, `snow_state_synced`, etc.) with actor identity, timestamp, and comments.
@@ -273,9 +281,11 @@ The frontend reads the user's granted plugin permissions via Grafana's `@grafana
 | UI Control | Required Action (`plugin.json`) | Viewer | Editor | Admin |
 |---|---|---|---|---|
 | View Alert Queue, Detail Drawer, Audit Log, Past Episodes | `noc-alert-manager-app.alerts:read` | Allowed | Allowed | Allowed |
-| Acknowledge, Unacknowledge, Dismiss, Reopen, Add Note | `noc-alert-manager-app.alerts:triage` | Disabled (tooltip) | Allowed | Allowed |
-| Create/Link SNOW Incident, Post Work Note, Sync SNOW Status | `noc-alert-manager-app.incidents:write` | Disabled (tooltip) | Allowed | Allowed |
+| Acknowledge, Unacknowledge, Dismiss, Reopen, Add Note, Tag Team | `noc-alert-manager-app.alerts:triage` | Disabled (tooltip) | Allowed | Allowed |
+| Create/Link SNOW Incident (single or bulk*), Post Work Note, Sync SNOW Status | `noc-alert-manager-app.incidents:write` | Disabled (tooltip) | Allowed | Allowed |
 | Edit Plugin Configuration (`/config`) | `noc-alert-manager-app.settings:write` | Hidden | Hidden | Allowed |
+
+*\*Bulk creation that includes any `firing` alert also requires `noc-alert-manager-app.alerts:triage` to auto-acknowledge those alerts (enforced in both `AlertQueuePage.tsx` and the Go API).*
 
 ---
 

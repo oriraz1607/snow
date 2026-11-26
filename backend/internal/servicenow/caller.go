@@ -58,6 +58,8 @@ func NewCallerResolver(
 }
 
 // Resolve determines caller_sys_id, caller_resolution_status, and optional fallback reason.
+// In sso_user mode, email is attempted first; if empty or unmatched, it falls back to
+// user_name (op.Login) before falling back to SNOW_DEFAULT_NOC_CALLER_SYS_ID.
 func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode, op auth.OperatorContext) store.CallerResolution {
 	if mode == model.CallerModeGenericNOC {
 		r.recordCallerMetric(string(model.CallerResGenericNOCSelected))
@@ -67,15 +69,11 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 		}
 	}
 
-	lookupKey := strings.ToLower(strings.TrimSpace(op.Email))
-	byUsername := false
-	if op.LookupByUsername && lookupKey == "" {
-		lookupKey = strings.ToLower(strings.TrimSpace(op.Login))
-		byUsername = true
-	}
+	email := strings.ToLower(strings.TrimSpace(op.Email))
+	login := strings.ToLower(strings.TrimSpace(op.Login))
 
-	if lookupKey == "" {
-		reason := "Grafana session has no email address; fell back to generic service user."
+	if email == "" && login == "" {
+		reason := "Grafana session has no email address or login; fell back to generic service user."
 		r.recordCallerMetric(string(model.CallerResFallbackNOC))
 		return store.CallerResolution{
 			SysID:            r.defaultCallerSysID,
@@ -84,11 +82,35 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 		}
 	}
 
-	cacheKey := lookupKey
-	if byUsername {
-		cacheKey = "user:" + lookupKey
+	// Step 1: Lookup by email if non-empty.
+	if email != "" {
+		res, matched, transientErr := r.resolveOne(ctx, email, email, false)
+		if matched || transientErr {
+			return res
+		}
 	}
 
+	// Step 2: Email empty or definite miss -> fallback to ServiceNow user_name (Grafana login).
+	if login != "" {
+		res, _, _ := r.resolveOne(ctx, "user:"+login, login, true)
+		return res
+	}
+
+	reason := fmt.Sprintf("No active sys_user found for %s; fell back to generic service user.", email)
+	r.recordCallerMetric(string(model.CallerResFallbackNOC))
+	return store.CallerResolution{
+		SysID:            r.defaultCallerSysID,
+		ResolutionStatus: model.CallerResFallbackNOC,
+		FallbackReason:   &reason,
+	}
+}
+
+func (r *CallerResolver) resolveOne(
+	ctx context.Context,
+	cacheKey string,
+	lookupKey string,
+	byUsername bool,
+) (res store.CallerResolution, matched bool, transientErr bool) {
 	if r.cache != nil {
 		cached, err := r.cache.LookupUserCache(ctx, cacheKey)
 		if err != nil && r.logger != nil {
@@ -102,7 +124,7 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 				return store.CallerResolution{
 					SysID:            *cached.SnowSysID,
 					ResolutionStatus: model.CallerResSSOMatched,
-				}
+				}, true, false
 			}
 			reason := fmt.Sprintf("Cached negative ServiceNow sys_user lookup for %s; fell back to generic service user.", lookupKey)
 			r.recordCallerMetric(string(model.CallerResFallbackNOC))
@@ -110,7 +132,7 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 				SysID:            r.defaultCallerSysID,
 				ResolutionStatus: model.CallerResFallbackNOC,
 				FallbackReason:   &reason,
-			}
+			}, false, false
 		}
 	}
 
@@ -137,7 +159,7 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 			SysID:            r.defaultCallerSysID,
 			ResolutionStatus: model.CallerResFallbackNOC,
 			FallbackReason:   &reason,
-		}
+		}, false, true
 	}
 
 	if user != nil && user.SysID != "" {
@@ -156,7 +178,7 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 		return store.CallerResolution{
 			SysID:            user.SysID,
 			ResolutionStatus: model.CallerResSSOMatched,
-		}
+		}, true, false
 	}
 
 	// Definite miss (200 OK with empty result): cache negatively for 5m.
@@ -174,7 +196,7 @@ func (r *CallerResolver) Resolve(ctx context.Context, mode model.SnowCallerMode,
 		SysID:            r.defaultCallerSysID,
 		ResolutionStatus: model.CallerResFallbackNOC,
 		FallbackReason:   &reason,
-	}
+	}, false, false
 }
 
 func (r *CallerResolver) recordCallerMetric(status string) {

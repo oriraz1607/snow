@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -65,15 +66,15 @@ func main() {
 	snowRepo := store.NewServiceNowRepository(pool)
 	callerResolver := servicenow.NewCallerResolver(snowRepo, snowClient, cfg.DefaultCallerSysID, metrics, logger)
 
-	workers := service.NewBackgroundWorkers(pool, snowRepo, snowClient, cfg, metrics, logger)
-	workers.Start(rootCtx)
-
 	logWriter := func(ctx context.Context, entry model.WebhookIngestionLogEntry) error {
 		return store.InsertWebhookIngestionLog(ctx, pool, entry)
 	}
 
-	amSvc := service.NewAlertmanagerService(alertRepo, logWriter, workers, metrics, logger)
 	incSvc := service.NewIncidentService(snowRepo, snowClient, callerResolver, cfg, logWriter, logger)
+	workers := service.NewBackgroundWorkers(pool, snowRepo, snowClient, incSvc, cfg, metrics, logger)
+	workers.Start(rootCtx)
+
+	amSvc := service.NewAlertmanagerService(alertRepo, logWriter, workers, metrics, logger)
 
 	var shuttingDown atomic.Bool
 
@@ -87,6 +88,9 @@ func main() {
 		Handler:           httpapi.NewAPIRouter(cfg, logger, metrics, alertsHandler, snowHandler, webhooksHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		apiSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 	adminSrv := &http.Server{
 		Addr:              ":" + cfg.AdminPort,
 		Handler:           httpapi.NewAdminRouter(healthHandler, metrics),
@@ -95,9 +99,16 @@ func main() {
 
 	errCh := make(chan error, 2)
 	go func() {
-		logger.Info("api listener started", slog.String("component", "http_server"), slog.String("addr", apiSrv.Addr))
-		if err := apiSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+		tlsEnabled := cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""
+		logger.Info("api listener started", slog.String("component", "http_server"), slog.String("addr", apiSrv.Addr), slog.Bool("tls", tlsEnabled))
+		var listenErr error
+		if tlsEnabled {
+			listenErr = apiSrv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+		} else {
+			listenErr = apiSrv.ListenAndServe()
+		}
+		if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
+			errCh <- listenErr
 		}
 	}()
 	go func() {

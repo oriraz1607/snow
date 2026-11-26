@@ -8,7 +8,7 @@ import { AlertTable, GatedButton } from '../components/AlertTable';
 import { CreateIncidentModal } from '../components/CreateIncidentModal';
 import { DismissAlertModal } from '../components/DismissAlertModal';
 import { FallbackBannerInfo, FallbackWarningBanner } from '../components/FallbackWarningBanner';
-import { FilterState, FilterToolbar, snowStatusToQueryParams } from '../components/FilterToolbar';
+import { FilterState, FilterToolbar, HistoryTimeRange } from '../components/FilterToolbar';
 import { KpiFilterStrip, QuickFilterKey } from '../components/KpiFilterStrip';
 import { LinkIncidentModal } from '../components/LinkIncidentModal';
 import { NoteModalMode, WorkNoteModal } from '../components/WorkNoteModal';
@@ -22,7 +22,13 @@ import {
   ServiceNowIncident,
   ServiceNowMetadataResponse,
 } from '../types/api';
-import { clampPollIntervalSeconds, isAlertSelectableForIncident } from '../utils/format';
+import {
+  clampPollIntervalSeconds,
+  getOpenIncidentDismissBlockReason,
+  hasOpenServiceNowIncident,
+  isAlertSelectableForBulk,
+  isAlertSelectableForIncident,
+} from '../utils/format';
 import { canTriageAlerts, canWriteIncidents, getCurrentUser } from '../utils/permissions';
 
 interface AlertQueuePageProps {
@@ -31,13 +37,25 @@ interface AlertQueuePageProps {
   onSelectAlertId: (alertId: string | null) => void;
 }
 
+export const MAX_BULK_SELECTION = 50;
+
 const DEFAULT_FILTERS: FilterState = {
   search: '',
   severities: [],
+  environment: '',
+  site: '',
+  team: '',
   labels: [],
-  snowStatus: 'all',
-  sort: 'starts_at_desc',
+  sort: 'severity_desc',
   fingerprint: '',
+  timeRange: '',
+};
+
+const TIME_RANGE_OFFSETS_MS: Record<Exclude<HistoryTimeRange, ''>, number> = {
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
+  '90d': 90 * 24 * 60 * 60 * 1000,
 };
 
 export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
@@ -52,12 +70,15 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   const canWriteSnow = canWriteIncidents();
   const pollIntervalSeconds = clampPollIntervalSeconds(pluginSettings.pollIntervalSeconds);
 
-  const [quickFilter, setQuickFilter] = useState<QuickFilterKey>('all');
+  const [viewMode, setViewMode] = useState<'active' | 'history'>('active');
+  const [quickFilter, setQuickFilter] = useState<QuickFilterKey>('firing');
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
+  const [pageSize, setPageSize] = useState<number>(50);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
   const [metadata, setMetadata] = useState<ServiceNowMetadataResponse | null>(null);
 
   const [selectedAlertIds, setSelectedAlertIds] = useState<Set<string>>(new Set());
+  const [selectionCapHit, setSelectionCapHit] = useState<boolean>(false);
   const [busyAlertId, setBusyAlertId] = useState<string | null>(null);
   const [drawerRefreshTrigger, setDrawerRefreshTrigger] = useState<number>(0);
 
@@ -72,7 +93,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   // Isolated modal state — background polling updates never clobber these.
   const [createModalAlerts, setCreateModalAlerts] = useState<Alert[]>([]);
   const [linkModalAlert, setLinkModalAlert] = useState<Alert | null>(null);
-  const [dismissModalAlert, setDismissModalAlert] = useState<Alert | null>(null);
+  const [dismissModalAlerts, setDismissModalAlerts] = useState<Alert[]>([]);
   const [noteModal, setNoteModal] = useState<{
     alert: Alert;
     mode: NoteModalMode;
@@ -96,42 +117,49 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   }, []);
 
   const query = useMemo<ListAlertsQuery>(() => {
-    let states: AlertStateFilter[] | undefined;
-    if (quickFilter === 'firing') {
-      states = ['firing'];
-    } else if (quickFilter === 'acknowledged') {
-      states = ['acknowledged'];
-    } else if (quickFilter === 'non_active_acknowledged') {
-      states = ['non_active_acknowledged'];
-    } else if (quickFilter === 'dismissed') {
-      states = ['dismissed'];
+    const states: AlertStateFilter[] = viewMode === 'history' ? ['resolved'] : [quickFilter];
+    let from: string | undefined;
+    if (viewMode === 'history' && filters.timeRange) {
+      const offsetMs = TIME_RANGE_OFFSETS_MS[filters.timeRange];
+      if (offsetMs) {
+        const roundedNow = Math.floor(Date.now() / 1000) * 1000;
+        from = new Date(roundedNow - offsetMs).toISOString();
+      }
     }
-
-    const snowParams = snowStatusToQueryParams(filters.snowStatus);
 
     return {
       states,
       severities: filters.severities.length > 0 ? filters.severities : undefined,
+      environments: filters.environment ? [filters.environment] : undefined,
+      sites: filters.site ? [filters.site] : undefined,
+      teams: filters.team ? [filters.team] : undefined,
       labels: filters.labels.length > 0 ? filters.labels : undefined,
       search: filters.search.trim() || undefined,
+      from,
       fingerprint: filters.fingerprint.trim() || undefined,
       sort: filters.sort,
-      limit: 50,
-      ...snowParams,
+      limit: pageSize,
     };
-  }, [quickFilter, filters]);
+  }, [viewMode, quickFilter, filters, pageSize]);
 
   const {
     items,
     summary,
-    nextCursor,
+    filterOptions,
+    filteredTotal,
+    pageIndex,
+    hasNextPage,
+    hasPrevPage,
+    staleOnLaterPage,
     loading,
     refreshing,
     lastSyncedAt,
     apiDegraded,
     errorMessage,
     refresh,
-    loadMore,
+    goNextPage,
+    goPrevPage,
+    goFirstPage,
     upsertAlert,
   } = useAlertQueue({
     query,
@@ -139,13 +167,13 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     autoRefresh,
   });
 
-  // Auto-prune selections that disappeared or gained a linked incident on background refresh.
+  // Auto-prune selections that disappeared or became non-triageable on background refresh.
   useEffect(() => {
     setSelectedAlertIds((prev) => {
       if (prev.size === 0) {
         return prev;
       }
-      const eligible = new Set(items.filter(isAlertSelectableForIncident).map((a) => a.id));
+      const eligible = new Set(items.filter(isAlertSelectableForBulk).map((a) => a.id));
       let changed = false;
       const next = new Set<string>();
       for (const id of prev) {
@@ -154,6 +182,9 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         } else {
           changed = true;
         }
+      }
+      if (next.size < MAX_BULK_SELECTION) {
+        setSelectionCapHit(false);
       }
       return changed ? next : prev;
     });
@@ -169,8 +200,18 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       const next = new Set(prev);
       if (next.has(alertId)) {
         next.delete(alertId);
-      } else {
-        next.add(alertId);
+        if (next.size < MAX_BULK_SELECTION) {
+          setSelectionCapHit(false);
+        }
+        return next;
+      }
+      if (next.size >= MAX_BULK_SELECTION) {
+        setSelectionCapHit(true);
+        return prev;
+      }
+      next.add(alertId);
+      if (next.size >= MAX_BULK_SELECTION) {
+        setSelectionCapHit(true);
       }
       return next;
     });
@@ -180,12 +221,24 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     setSelectedAlertIds((prev) => {
       const next = new Set(prev);
       if (selectAll) {
+        let truncated = false;
         for (const id of selectableIds) {
+          if (next.has(id)) {
+            continue;
+          }
+          if (next.size >= MAX_BULK_SELECTION) {
+            truncated = true;
+            break;
+          }
           next.add(id);
         }
+        setSelectionCapHit(truncated || next.size >= MAX_BULK_SELECTION);
       } else {
         for (const id of selectableIds) {
           next.delete(id);
+        }
+        if (next.size < MAX_BULK_SELECTION) {
+          setSelectionCapHit(false);
         }
       }
       return next;
@@ -193,31 +246,54 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
   }, []);
 
   const handleSelectQuickFilter = useCallback((nextKey: QuickFilterKey) => {
+    setViewMode('active');
     setQuickFilter(nextKey);
-    if (nextKey !== 'non_active_acknowledged') {
-      setFilters((prev) =>
-        prev.snowStatus === 'resolved_open_ticket' ? { ...prev, snowStatus: 'all' } : prev
-      );
-    }
+    setFilters((prev) =>
+      prev.sort === 'resolved_at_desc' || prev.timeRange
+        ? {
+            ...prev,
+            sort: prev.sort === 'resolved_at_desc' ? 'severity_desc' : prev.sort,
+            timeRange: '',
+          }
+        : prev
+    );
   }, []);
 
-  const handleChangeFilters = useCallback(
-    (next: FilterState) => {
-      setFilters(next);
-      if (next.snowStatus === 'resolved_open_ticket') {
-        setQuickFilter('non_active_acknowledged');
-      }
-    },
-    []
-  );
+  const handleSelectViewMode = useCallback((nextMode: 'active' | 'history') => {
+    setViewMode(nextMode);
+    setSelectedAlertIds(new Set());
+    setSelectionCapHit(false);
+    setFilters((prev) => ({
+      ...prev,
+      sort: nextMode === 'history' ? 'resolved_at_desc' : prev.sort === 'resolved_at_desc' ? 'severity_desc' : prev.sort,
+      timeRange: nextMode === 'history' ? prev.timeRange ?? '' : '',
+    }));
+  }, []);
+
+  const handleChangeFilters = useCallback((next: FilterState) => {
+    setFilters(next);
+  }, []);
 
   const handleResetFilters = useCallback(() => {
-    setQuickFilter('all');
+    setViewMode('active');
+    setQuickFilter('firing');
     setFilters(DEFAULT_FILTERS);
   }, []);
 
   const handleConflict = useCallback(
     (err: ApiClientError) => {
+      if (err.code === 'ALERT_HAS_OPEN_INCIDENT') {
+        setToast({
+          severity: 'warning',
+          title: 'Cannot Dismiss — Open ServiceNow Incident',
+          message: err.message,
+          testId: 'conflict-toast',
+        });
+        setDrawerRefreshTrigger((n) => n + 1);
+        void refresh();
+        return;
+      }
+
       const details = err.details ?? {};
       const currentState = typeof details.current_state === 'string' ? details.current_state : '';
       const ackedBy = typeof details.acknowledged_by === 'string' ? details.acknowledged_by : '';
@@ -242,6 +318,10 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       });
       setDrawerRefreshTrigger((n) => n + 1);
       void refresh();
+      void alertApi
+        .getServiceNowMetadata()
+        .then(setMetadata)
+        .catch(() => {});
     },
     [refresh]
   );
@@ -252,6 +332,13 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       try {
         const updated = await alertApi.acknowledgeAlert(alert.id, { version: alert.version });
         upsertAlert(updated);
+        if (quickFilter === 'firing') {
+          setToast({
+            severity: 'success',
+            title: `Acknowledged ${alert.alert_name}`,
+            message: 'Moved to the Acknowledged tab.',
+          });
+        }
         setDrawerRefreshTrigger((n) => n + 1);
         void refresh();
       } catch (err) {
@@ -362,18 +449,24 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     ) => {
       setCreateModalAlerts([]);
       setSelectedAlertIds(new Set());
+      setSelectionCapHit(false);
       const idSet = new Set(alertIds);
       for (const item of items) {
-        if (idSet.has(item.id)) {
+        // Only optimistically update alerts that already carry authoritative acknowledged metadata;
+        // firing alerts auto-acknowledged server-side will be populated by refresh().
+        if (idSet.has(item.id) && item.state === 'acknowledged') {
           upsertAlert({
             ...item,
-            state: 'acknowledged',
             servicenow_incident: result.servicenow_incident,
           });
         }
       }
       setDrawerRefreshTrigger((n) => n + 1);
       void refresh();
+      void alertApi
+        .getServiceNowMetadata()
+        .then(setMetadata)
+        .catch(() => {});
 
       const incNum = result.servicenow_incident.incident_number || 'Incident';
       if (
@@ -419,12 +512,27 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       });
       setDrawerRefreshTrigger((n) => n + 1);
       void refresh();
+      void alertApi
+        .getServiceNowMetadata()
+        .then(setMetadata)
+        .catch(() => {});
     },
     [linkModalAlert, refresh, upsertAlert]
   );
 
-  const selectedFiringCount = selectedAlerts.filter((a) => a.state === 'firing').length;
-  const canCreateBulk = canWriteSnow && (selectedFiringCount === 0 || canTriage);
+  const incidentEligibleAlerts = selectedAlerts.filter(isAlertSelectableForIncident);
+  const selectedFiringForSnowCount = incidentEligibleAlerts.filter((a) => a.state === 'firing').length;
+  const dismissEligibleAlerts = selectedAlerts.filter((a) => !hasOpenServiceNowIncident(a));
+  const blockedDismissAlerts = selectedAlerts.filter(hasOpenServiceNowIncident);
+  const canBulkDismiss = canTriage && dismissEligibleAlerts.length > 0;
+  const bulkDismissDisabledReason = !canTriage
+    ? 'Requires Editor or Admin role (alerts:triage permission)'
+    : (blockedDismissAlerts[0] ? getOpenIncidentDismissBlockReason(blockedDismissAlerts[0]) : undefined) ||
+      'Cannot dismiss while linked ServiceNow incident is open';
+  const canCreateBulk =
+    canWriteSnow &&
+    incidentEligibleAlerts.length > 0 &&
+    (selectedFiringForSnowCount === 0 || canTriage);
   const bulkDisabledReason = !canWriteSnow
     ? 'Requires Editor or Admin role (incidents:write permission)'
     : 'Requires triage permission to auto-acknowledge firing alerts';
@@ -437,6 +545,26 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
           <p className={styles.subtitle}>
             Triage Prometheus Alertmanager episodes, assign owning teams, and manage ServiceNow incidents.
           </p>
+        </div>
+        <div className={styles.viewSwitch} role="group" aria-label="Queue view mode" data-testid="view-mode-switch">
+          <button
+            type="button"
+            className={`${styles.viewBtn} ${viewMode === 'active' ? styles.viewBtnActive : ''}`}
+            aria-pressed={viewMode === 'active'}
+            data-testid="view-tab-active"
+            onClick={() => handleSelectViewMode('active')}
+          >
+            Active Queue
+          </button>
+          <button
+            type="button"
+            className={`${styles.viewBtn} ${viewMode === 'history' ? styles.viewBtnActive : ''}`}
+            aria-pressed={viewMode === 'history'}
+            data-testid="view-tab-history"
+            onClick={() => handleSelectViewMode('history')}
+          >
+            History
+          </button>
         </div>
       </div>
 
@@ -472,16 +600,18 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
 
       <KpiFilterStrip
         summary={summary}
-        activeFilter={quickFilter}
+        activeFilter={viewMode === 'active' ? quickFilter : null}
         onSelectFilter={handleSelectQuickFilter}
       />
 
       <FilterToolbar
         filters={filters}
+        filterOptions={filterOptions}
         autoRefresh={autoRefresh}
         pollIntervalSeconds={pollIntervalSeconds}
         refreshing={refreshing}
         lastSyncedAt={lastSyncedAt}
+        showTimeRange={viewMode === 'history'}
         onChangeFilters={handleChangeFilters}
         onToggleAutoRefresh={setAutoRefresh}
         onManualRefresh={() => void refresh()}
@@ -494,25 +624,58 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
             <strong>
               {selectedAlerts.length} alert{selectedAlerts.length === 1 ? '' : 's'} selected
             </strong>
-            {selectedFiringCount > 0 && (
+            {selectedFiringForSnowCount > 0 && (
               <span className={styles.bulkNote}>
-                ({selectedFiringCount} firing alert{selectedFiringCount === 1 ? '' : 's'} will be auto-acknowledged)
+                ({selectedFiringForSnowCount} firing alert{selectedFiringForSnowCount === 1 ? '' : 's'} auto-ack on SNOW create)
+              </span>
+            )}
+            {blockedDismissAlerts.length > 0 && (
+              <span className={styles.bulkNote} data-testid="bulk-dismiss-blocked-notice">
+                {blockedDismissAlerts.length} alert{blockedDismissAlerts.length === 1 ? '' : 's'} with open SNOW ticket
+                {dismissEligibleAlerts.length > 0 ? ' (excluded from dismiss)' : ' cannot be dismissed'}
+              </span>
+            )}
+            {(selectionCapHit || selectedAlerts.length >= MAX_BULK_SELECTION) && (
+              <span className={styles.bulkNote} data-testid="bulk-selection-cap-notice">
+                Maximum {MAX_BULK_SELECTION} alerts per batch reached.
               </span>
             )}
           </div>
           <div className={styles.bulkActions}>
             <GatedButton
-              allowed={canCreateBulk}
-              disabledReason={bulkDisabledReason}
-              variant="primary"
+              allowed={canBulkDismiss}
+              disabledReason={bulkDismissDisabledReason}
+              variant="destructive"
               size="sm"
-              onClick={() => setCreateModalAlerts(selectedAlerts)}
+              onClick={() => setDismissModalAlerts(dismissEligibleAlerts)}
             >
-              {selectedAlerts.length > 1
-                ? `Create Single ServiceNow Incident (${selectedAlerts.length})`
-                : 'Create ServiceNow Incident'}
+              {blockedDismissAlerts.length > 0 && dismissEligibleAlerts.length > 0
+                ? `Dismiss Eligible (${dismissEligibleAlerts.length})`
+                : selectedAlerts.length > 1
+                  ? `Dismiss Selected (${selectedAlerts.length})`
+                  : 'Dismiss Selected'}
             </GatedButton>
-            <Button variant="secondary" size="sm" onClick={() => setSelectedAlertIds(new Set())}>
+            {incidentEligibleAlerts.length > 0 && (
+              <GatedButton
+                allowed={canCreateBulk}
+                disabledReason={bulkDisabledReason}
+                variant="primary"
+                size="sm"
+                onClick={() => setCreateModalAlerts(incidentEligibleAlerts)}
+              >
+                {incidentEligibleAlerts.length > 1
+                  ? `Create Single ServiceNow Incident (${incidentEligibleAlerts.length})`
+                  : 'Create ServiceNow Incident'}
+              </GatedButton>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                setSelectedAlertIds(new Set());
+                setSelectionCapHit(false);
+              }}
+            >
               Clear Selection
             </Button>
           </div>
@@ -526,13 +689,19 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         canWriteIncidents={canWriteSnow}
         busyAlertId={busyAlertId}
         selectedAlertIds={selectedAlertIds}
+        maxBulkSelection={MAX_BULK_SELECTION}
+        showServiceNowColumn={
+          viewMode === 'history' ||
+          quickFilter === 'acknowledged' ||
+          quickFilter === 'non_active_acknowledged'
+        }
         onToggleSelectAlert={handleToggleSelectAlert}
         onToggleSelectAll={handleToggleSelectAll}
         onSelectAlert={(alert) => onSelectAlertId(alert.id)}
         onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
-        onOpenDismiss={(alert) => setDismissModalAlert(alert)}
+        onOpenDismiss={(alert) => setDismissModalAlerts([alert])}
         onOpenCreateIncident={(alert) => setCreateModalAlerts([alert])}
         onOpenLinkIncident={(alert) => setLinkModalAlert(alert)}
         onOpenAddNote={(alert) =>
@@ -562,11 +731,68 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         }
       />
 
-      {nextCursor && (
-        <div className={styles.loadMoreRow}>
-          <Button variant="secondary" onClick={() => void loadMore()} disabled={refreshing}>
-            {refreshing ? 'Loading...' : 'Load More Alerts'}
-          </Button>
+      {(items.length > 0 || hasPrevPage || hasNextPage) && (
+        <div className={styles.paginationBar} data-testid="pagination-bar">
+          <div className={styles.paginationInfo}>
+            <span>
+              {(() => {
+                const startRow = items.length === 0 ? 0 : pageIndex * pageSize + 1;
+                const endRow = pageIndex * pageSize + items.length;
+                const effectiveTotal = Math.max(filteredTotal, endRow);
+                const totalPages = Math.max(1, Math.ceil(effectiveTotal / pageSize));
+                return `Showing ${startRow.toLocaleString()}–${endRow.toLocaleString()} of ${effectiveTotal.toLocaleString()} · Page ${(pageIndex + 1).toLocaleString()} of ${totalPages.toLocaleString()}`;
+              })()}
+            </span>
+            {staleOnLaterPage && pageIndex > 0 && (
+              <button
+                type="button"
+                className={styles.stalePillBtn}
+                data-testid="stale-page-jump"
+                onClick={() => void goFirstPage()}
+              >
+                Queue updated — Jump to Page 1
+              </button>
+            )}
+          </div>
+          <div className={styles.paginationControls}>
+            <label className={styles.pageSizeLabel}>
+              <span>Rows:</span>
+              <select
+                aria-label="Rows per page"
+                className={styles.pageSizeSelect}
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.currentTarget.value))}
+              >
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </label>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!hasPrevPage || refreshing}
+              onClick={() => void goFirstPage()}
+            >
+              « First
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!hasPrevPage || refreshing}
+              onClick={() => void goPrevPage()}
+            >
+              ‹ Prev
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!hasNextPage || refreshing}
+              onClick={() => void goNextPage()}
+            >
+              Next ›
+            </Button>
+          </div>
         </div>
       )}
 
@@ -583,7 +809,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
-        onOpenDismiss={(alert) => setDismissModalAlert(alert)}
+        onOpenDismiss={(alert) => setDismissModalAlerts([alert])}
         onOpenCreateIncident={(alert) => setCreateModalAlerts([alert])}
         onOpenLinkIncident={(alert) => setLinkModalAlert(alert)}
         onOpenAddNote={(alert) =>
@@ -612,6 +838,10 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         metadata={metadata}
         pluginSettings={pluginSettings}
         onClose={() => setCreateModalAlerts([])}
+        onConflict={() => {
+          setDrawerRefreshTrigger((n) => n + 1);
+          void refresh();
+        }}
         onCreated={handleIncidentCreated}
       />
 
@@ -623,12 +853,29 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
       />
 
       <DismissAlertModal
-        isOpen={Boolean(dismissModalAlert)}
-        alert={dismissModalAlert}
-        onClose={() => setDismissModalAlert(null)}
-        onDismissed={(updated) => {
-          setDismissModalAlert(null);
-          upsertAlert(updated);
+        isOpen={dismissModalAlerts.length > 0}
+        alerts={dismissModalAlerts}
+        onClose={() => setDismissModalAlerts([])}
+        onDismissed={(dismissedIds) => {
+          setDismissModalAlerts([]);
+          const dismissedSet = new Set(dismissedIds);
+          setSelectedAlertIds((prev) => {
+            const next = new Set<string>();
+            for (const id of prev) {
+              if (!dismissedSet.has(id)) {
+                next.add(id);
+              }
+            }
+            if (next.size < MAX_BULK_SELECTION) {
+              setSelectionCapHit(false);
+            }
+            return next;
+          });
+          setToast({
+            severity: 'success',
+            title: `Dismissed ${dismissedIds.length} alert${dismissedIds.length === 1 ? '' : 's'}`,
+            message: 'Moved to the Dismissed tab.',
+          });
           setDrawerRefreshTrigger((n) => n + 1);
           void refresh();
         }}
@@ -661,15 +908,47 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
 
 const getStyles = (theme: GrafanaTheme2) => ({
   page: css`
-    padding: ${theme.spacing(3)};
-    max-width: 1720px;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: hidden;
+    padding: ${theme.spacing(2.5)};
     margin: 0 auto;
   `,
   header: css`
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
     align-items: flex-start;
+    gap: ${theme.spacing(1.5)};
     margin-bottom: ${theme.spacing(2)};
+  `,
+  viewSwitch: css`
+    display: inline-flex;
+    align-items: center;
+    padding: 3px;
+    border: 1px solid ${theme.colors.border.medium};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+    gap: 2px;
+  `,
+  viewBtn: css`
+    padding: 5px 12px;
+    border: none;
+    border-radius: ${theme.shape.radius.default};
+    background: transparent;
+    color: ${theme.colors.text.secondary};
+    font-size: ${theme.typography.bodySmall.fontSize};
+    font-weight: ${theme.typography.fontWeightMedium};
+    cursor: pointer;
+
+    &:hover {
+      color: ${theme.colors.text.primary};
+    }
+  `,
+  viewBtnActive: css`
+    background: ${theme.colors.primary.main};
+    color: ${theme.colors.primary.contrastText};
   `,
   title: css`
     margin: 0 0 ${theme.spacing(0.5)} 0;
@@ -708,9 +987,60 @@ const getStyles = (theme: GrafanaTheme2) => ({
     display: flex;
     gap: ${theme.spacing(1)};
   `,
-  loadMoreRow: css`
+  paginationBar: css`
     display: flex;
-    justify-content: center;
-    margin-top: ${theme.spacing(2)};
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: ${theme.spacing(1.5)};
+    margin-top: ${theme.spacing(1.5)};
+    padding: ${theme.spacing(1)} ${theme.spacing(1.5)};
+    border: 1px solid ${theme.colors.border.weak};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+    font-size: ${theme.typography.bodySmall.fontSize};
+    color: ${theme.colors.text.secondary};
+  `,
+  paginationInfo: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${theme.spacing(1.5)};
+    font-variant-numeric: tabular-nums;
+  `,
+  stalePillBtn: css`
+    padding: 2px 10px;
+    border-radius: 12px;
+    border: 1px solid ${theme.colors.warning.border};
+    background: ${theme.colors.background.primary};
+    color: ${theme.colors.warning.text};
+    font-size: 11px;
+    font-weight: ${theme.typography.fontWeightMedium};
+    cursor: pointer;
+
+    &:hover {
+      background: ${theme.colors.background.elevated};
+    }
+  `,
+  paginationControls: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+  `,
+  pageSizeLabel: css`
+    display: inline-flex;
+    align-items: center;
+    gap: ${theme.spacing(0.75)};
+    margin: 0 ${theme.spacing(0.5)} 0 0;
+  `,
+  pageSizeSelect: css`
+    height: 28px;
+    padding: 0 ${theme.spacing(1)};
+    border-radius: ${theme.shape.radius.default};
+    border: 1px solid ${theme.colors.border.medium};
+    background: ${theme.colors.background.primary};
+    color: ${theme.colors.text.primary};
+    font-size: ${theme.typography.bodySmall.fontSize};
   `,
 });

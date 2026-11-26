@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,16 +12,29 @@ import (
 	"github.com/oriraz/grafana-snow-integration/backend/internal/apierror"
 	"github.com/oriraz/grafana-snow-integration/backend/internal/auth"
 	"github.com/oriraz/grafana-snow-integration/backend/internal/model"
-	"github.com/oriraz/grafana-snow-integration/backend/internal/store"
 )
+
+// AlertStore defines alert repository dependencies (satisfied by *store.AlertRepository).
+type AlertStore interface {
+	ListAlerts(ctx context.Context, filter model.ListAlertsFilter) (*model.ListAlertsResponse, error)
+	GetAlert(ctx context.Context, alertID string) (*model.AlertDetail, error)
+	GetAlertHistory(ctx context.Context, alertID string, limit, offset int) (*model.AlertHistoryResponse, error)
+	AcknowledgeAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, comment string) (*model.Alert, error)
+	UnacknowledgeAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, comment string) (*model.Alert, error)
+	DismissAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, reason string) (*model.Alert, error)
+	BulkDismissAlerts(ctx context.Context, alertIDs []string, op auth.OperatorContext, reason string) (*model.BulkDismissResponse, error)
+	ReopenAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, comment string) (*model.Alert, error)
+	AddOperatorNote(ctx context.Context, alertID string, op auth.OperatorContext, comment string) (*model.AuditEvent, error)
+	TagAlertTeam(ctx context.Context, alertID string, op auth.OperatorContext, team string) (*model.Alert, error)
+}
 
 // AlertsHandler handles HTTP query and triage mutations for alerts.
 type AlertsHandler struct {
-	repo *store.AlertRepository
+	repo AlertStore
 }
 
 // NewAlertsHandler constructs an AlertsHandler.
-func NewAlertsHandler(repo *store.AlertRepository) *AlertsHandler {
+func NewAlertsHandler(repo AlertStore) *AlertsHandler {
 	return &AlertsHandler{repo: repo}
 }
 
@@ -61,7 +75,25 @@ func (h *AlertsHandler) History(w http.ResponseWriter, r *http.Request) {
 		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_id must be a valid UUID."))
 		return
 	}
-	history, err := h.repo.GetAlertHistory(r.Context(), alertID)
+	limit := 20
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		v, err := strconv.Atoi(rawLimit)
+		if err != nil || v < 1 || v > 100 {
+			apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "limit must be an integer between 1 and 100."))
+			return
+		}
+		limit = v
+	}
+	offset := 0
+	if rawOffset := strings.TrimSpace(r.URL.Query().Get("offset")); rawOffset != "" {
+		v, err := strconv.Atoi(rawOffset)
+		if err != nil || v < 0 {
+			apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "offset must be a non-negative integer."))
+			return
+		}
+		offset = v
+	}
+	history, err := h.repo.GetAlertHistory(r.Context(), alertID, limit, offset)
 	if err != nil {
 		apierror.Write(w, r, err)
 		return
@@ -147,6 +179,50 @@ func (h *AlertsHandler) Dismiss(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apierror.WriteJSON(w, http.StatusOK, updated)
+}
+
+// BulkDismiss handles POST /api/v1/alerts/bulk/dismiss.
+func (h *AlertsHandler) BulkDismiss(w http.ResponseWriter, r *http.Request) {
+	var req model.BulkDismissRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	if len(req.AlertIDs) == 0 {
+		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_ids must contain at least 1 alert ID."))
+		return
+	}
+	seen := make(map[string]struct{}, len(req.AlertIDs))
+	deduped := make([]string, 0, len(req.AlertIDs))
+	for _, raw := range req.AlertIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || !model.IsValidUUID(id) {
+			apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Every item in alert_ids must be a valid UUID."))
+			return
+		}
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			deduped = append(deduped, id)
+		}
+	}
+	if len(deduped) > 100 {
+		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Cannot bulk-dismiss more than 100 alerts per request."))
+		return
+	}
+
+	reason := strings.TrimSpace(req.Reason)
+	if len(reason) < 3 || len(reason) > 500 {
+		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "reason must be between 3 and 500 characters."))
+		return
+	}
+
+	op, _ := auth.OperatorFromContext(r.Context())
+	resp, err := h.repo.BulkDismissAlerts(r.Context(), deduped, op, reason)
+	if err != nil {
+		apierror.Write(w, r, err)
+		return
+	}
+	apierror.WriteJSON(w, http.StatusOK, resp)
 }
 
 // Reopen handles POST /api/v1/alerts/{alert_id}/reopen.
@@ -236,7 +312,7 @@ func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 		IncidentDrift: strings.TrimSpace(q.Get("incident_drift")),
 	}
 	if filter.Sort == "" {
-		filter.Sort = model.SortStartsAtDesc
+		filter.Sort = model.SortSeverityDesc
 	}
 	switch filter.Sort {
 	case model.SortStartsAtDesc, model.SortStartsAtAsc, model.SortSeverityDesc, model.SortResolvedAtDesc:
@@ -277,13 +353,17 @@ func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 				continue
 			}
 			switch sev {
-			case "critical", "warning", "info", "unknown":
+			case "critical", "warning":
 				filter.Severities = append(filter.Severities, sev)
 			default:
-				return filter, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Invalid severity filter value.")
+				return filter, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "Invalid severity filter value (only critical and warning are supported).")
 			}
 		}
 	}
+
+	filter.Environments = parseCSVFilterValues(q["env"], q["environment"])
+	filter.Sites = parseCSVFilterValues(q["site"])
+	filter.Teams = parseCSVFilterValues(q["team"])
 
 	if rawHas := strings.TrimSpace(q.Get("has_incident")); rawHas != "" {
 		b, err := strconv.ParseBool(rawHas)
@@ -341,4 +421,24 @@ func parseListAlertsFilter(r *http.Request) (model.ListAlertsFilter, error) {
 	}
 
 	return filter, nil
+}
+
+func parseCSVFilterValues(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, vals := range groups {
+		for _, raw := range vals {
+			for _, part := range strings.Split(raw, ",") {
+				v := strings.TrimSpace(part)
+				if v == "" {
+					continue
+				}
+				if _, ok := seen[v]; !ok {
+					seen[v] = struct{}{}
+					out = append(out, v)
+				}
+			}
+		}
+	}
+	return out
 }

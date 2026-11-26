@@ -110,15 +110,18 @@ Signed by the thin Grafana App Plugin backend using `secureJsonData.apiJwtSecret
 Lists alert episodes with filtering, cursor/offset pagination, and live queue counters.
 - **Required Permission:** `noc-alert-manager-app.alerts:read`
 - **Query Parameters:**
-  - `state` (optional, repeatable CSV): `firing`, `acknowledged`, `dismissed`, `resolved`
-  - `severity` (optional, repeatable CSV): `critical`, `warning`, `info`, `unknown`
+  - `state` (optional, repeatable CSV): `firing`, `acknowledged`, `non_active_acknowledged` (`state = 'resolved' AND acknowledged_at IS NOT NULL`), `dismissed`, `resolved`
+  - `severity` (optional, repeatable CSV): `critical`, `warning` *(only `critical` and `warning` alerts are returned in queue listings and KPI summary counts; `info`/`low`/`unknown` are excluded)*
+  - `env` / `environment` (optional, repeatable CSV): exact match on `COALESCE(labels.environment, labels.env)`
+  - `site` (optional, repeatable CSV): exact match on `labels.site`
+  - `team` (optional, repeatable CSV): exact match on resolved team (`COALESCE(labels.team, assigned_team)`), plus `"__untagged__"` for alerts with no team
   - `incident_drift` (optional): `all` (default) | `resolved_open_ticket` | `active_closed_ticket` | `none`
   - `has_incident` (optional, boolean): `true` | `false`
   - `fingerprint` (optional, string): exact match for viewing all episodes of one alert series
   - `label` (optional, repeatable `key=value`): JSONB containment filter on `alerts.labels`
-  - `search` (optional, string): case-insensitive search on `alert_name`, `annotations->>'summary'`, `fingerprint`, or linked `incident_number`
+  - `search` (optional, string): case-insensitive search on `alert_name`, `annotations->>'summary'`, `fingerprint`, linked `incident_number`, or team (`labels->>'team'` / `assigned_team`)
   - `from` / `to` (optional, RFC 3339): filter by `starts_at` range
-  - `sort` (optional): `starts_at_desc` (default), `starts_at_asc`, `severity_desc`, `resolved_at_desc`
+  - `sort` (optional): `severity_desc` (default — Critical before Warning), `starts_at_desc`, `starts_at_asc`, `resolved_at_desc`
   - `limit` (optional, int): default `50`, max `200`
   - `cursor` (optional, opaque base64): keyset pagination cursor
 - **Response `200 OK`:**
@@ -126,11 +129,20 @@ Lists alert episodes with filtering, cursor/offset pagination, and live queue co
 {
   "summary": {
     "firing": 12,
+    "firing_critical": 4,
+    "firing_warning": 8,
     "acknowledged": 7,
     "acknowledged_without_incident": 2,
+    "non_active_acknowledged": 5,
     "dismissed": 4,
     "resolved_open_ticket": 3
   },
+  "filter_options": {
+    "environments": ["prod", "staging"],
+    "sites": ["eu-west-1", "us-east-1"],
+    "teams": ["core-db", "observability"]
+  },
+  "filtered_total": 12,
   "items": [
     {
       "id": "c7a2d5e8-9f31-4b2c-8a11-7e5f2c4d9a01",
@@ -144,6 +156,8 @@ Lists alert episodes with filtering, cursor/offset pagination, and live queue co
       "labels": {
         "alertname": "HighDatabaseReplicationLag",
         "severity": "critical",
+        "environment": "production",
+        "site": "eu-west-1",
         "cluster": "prod-eu1",
         "service": "orders-db"
       },
@@ -152,6 +166,13 @@ Lists alert episodes with filtering, cursor/offset pagination, and live queue co
         "description": "Lag reached 47.2s for > 5m.",
         "runbook_url": "https://runbooks.internal.example.com/db-lag"
       },
+      "environment": "production",
+      "site": "eu-west-1",
+      "team": "Database SRE",
+      "team_source": "operator",
+      "assigned_team": "Database SRE",
+      "assigned_team_by": "alice.smith",
+      "assigned_team_at": "2026-11-25T16:12:00Z",
       "generator_url": "https://prometheus.internal.example.com/graph?g0.expr=...",
       "acknowledged_by": "alice.smith",
       "acknowledged_by_email": "alice.smith@corp.example",
@@ -272,6 +293,14 @@ Transitions an alert from `firing` or `acknowledged` → `dismissed`.
 
 ---
 
+#### `POST /api/v1/alerts/bulk/dismiss`
+Atomically transitions up to `100` `firing` or `acknowledged` alerts → `dismissed` under canonical `ORDER BY id ASC FOR UPDATE` row locks.
+- **Required Permission:** `noc-alert-manager-app.alerts:triage`
+- **Request Body:** `{ "alert_ids": ["<uuid>", ...], "reason": "Planned deployment noise" }` (`reason` 3–500 chars)
+- **Responses:** `200 OK` (`{ "dismissed_count": N, "alert_ids": [...] }`), `400 Bad Request`, `404 Not Found`, `409 Conflict`.
+
+---
+
 #### `POST /api/v1/alerts/{alert_id}/reopen`
 Transitions a `dismissed` alert back to `firing` (while the episode is not yet resolved).
 - **Required Permission:** `noc-alert-manager-app.alerts:triage`
@@ -288,12 +317,33 @@ Appends an operator triage comment to `alert_audit_log` without mutating alert s
 
 ---
 
+#### `POST /api/v1/alerts/{alert_id}/team`
+Tags an alert episode with an owning team and persists the mapping by `fingerprint` in `alert_fingerprint_teams` so future re-fired episodes without a Prometheus `team` label inherit it automatically.
+- **Required Permission:** `noc-alert-manager-app.alerts:triage`
+- **Request Body (`TagTeamRequest`):**
+```json
+{
+  "team": "Database SRE"
+}
+```
+- **Validation:** `alert_id` must be a valid UUID; `team` (trimmed) must be 1–128 characters.
+- **Behavior:**
+  - Locks the alert row (`SELECT fingerprint, state, assigned_team, labels FROM alerts WHERE id = $1::uuid FOR UPDATE`).
+  - If Prometheus `labels["team"]` is already non-empty, rejects the override with `409 Conflict` (`TEAM_MANAGED_BY_LABEL`).
+  - Otherwise updates `alerts.assigned_team`, `assigned_team_by` (from JWT `OperatorContext.Login`), and `assigned_team_at = NOW()`.
+  - Upserts `alert_fingerprint_teams (fingerprint, team, tagged_by, tagged_by_email)` on `fingerprint`.
+  - Records `alert_team_tagged` in `alert_audit_log` with `metadata: { fingerprint, previous_team, new_team }`.
+  - Note: When computing derived `team` / `team_source`, a non-empty Prometheus `labels["team"]` always takes precedence (`team_source = "label"`) over `assigned_team` (`team_source = "operator"`).
+- **Responses:** `200 OK` (returns updated `Alert` object with `team`, `team_source`, `assigned_team`, `assigned_team_by`, `assigned_team_at`), `400 Bad Request` (`INVALID_REQUEST` / `VALIDATION_ERROR`), `403 Forbidden` (`FORBIDDEN_RBAC`), `404 Not Found` (`ALERT_NOT_FOUND`), `409 Conflict` (`TEAM_MANAGED_BY_LABEL`), `503 Service Unavailable` (`DB_UNAVAILABLE`).
+
+---
+
 ### 4.2 ServiceNow Incident Endpoints
 
 #### `POST /api/v1/alerts/{alert_id}/servicenow/incident`
 Creates a new ServiceNow incident via the Table API and links it to the alert episode.
 - **Required Permission:** `noc-alert-manager-app.incidents:write`
-- **Headers:** `Idempotency-Key: <uuid>` (recommended; additionally guarded server-side by `servicenow_incidents.alert_id` unique constraint + `correlation_id = alert_id`).
+- **Headers:** `Idempotency-Key: <uuid>` (optional, validated against `^[A-Za-z0-9._:-]{1,128}$`). Persisted in `idempotency_keys` (24h TTL): retries with the same key and matching canonical payload replay the stored `201 Created` response (`Idempotency-Replayed: true`); reusing a key with a different payload/endpoint returns `409 IDEMPOTENCY_KEY_CONFLICT`; transient creation failures release the `in_progress` claim so operator retries can reuse the same key alongside `correlation_id` adoption.
 - **Preconditions:** Alert must exist and be in `acknowledged` state (or `resolved` if operator creates a retrospective incident — configurable; default allows `acknowledged` only, returning `409 INVALID_STATE_TRANSITION` if `firing` or `dismissed`).
 - **Request Body:**
 ```json
@@ -352,6 +402,64 @@ Creates a new ServiceNow incident via the Table API and links it to the alert ep
 
 ---
 
+#### `POST /api/v1/servicenow/incidents/bulk`
+Creates **one** ServiceNow incident covering multiple selected alert episodes, auto-acknowledging any selected `firing` alerts and linking every selected alert to the created incident.
+- **Required Permission:** `noc-alert-manager-app.incidents:write` (and `noc-alert-manager-app.alerts:triage` if any selected alert is in `firing` state; returns `403 FORBIDDEN_RBAC` otherwise).
+- **Request Body (`CreateBulkIncidentRequest`):**
+```json
+{
+  "alert_ids": [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222"
+  ],
+  "short_description": "[CRITICAL] 2 alerts: HighReplicationLag, ApiLatency",
+  "description": "Combined Incident (2 alerts selected)...",
+  "impact": 1,
+  "urgency": 1,
+  "assignment_group": "Database SRE",
+  "category": "Infrastructure",
+  "caller_mode": "sso_user",
+  "work_notes": "Correlated outage across DB and API tier."
+}
+```
+- **Field Validation:**
+  - `alert_ids`: required, 1–50 valid UUIDs (deduplicated and sorted lexicographically in `ReserveBulkIncidentCreation`).
+  - `short_description`: required, 5–160 chars.
+  - `impact`, `urgency`: integers in `{1, 2, 3}`.
+  - `caller_mode`: `"sso_user"` (default) or `"generic_noc"`.
+- **Headers:** `Idempotency-Key: <uuid>` (optional; persisted in `idempotency_keys` with canonical payload hashing over sorted deduplicated `alert_ids` + request fields; replays `201 Created` with `Idempotency-Replayed: true`).
+- **Two-Phase Bulk Execution:**
+  1. **Tx 1 (`ReserveBulkIncidentCreation`):** Claims `Idempotency-Key` (if supplied), locks all selected `alerts` with `WHERE id = ANY($1::uuid[]) ORDER BY id ASC FOR UPDATE`. Verifies every alert exists (`404 ALERT_NOT_FOUND`) and is in `firing` or `acknowledged` state (`409 INVALID_STATE_TRANSITION`). Auto-acknowledges any `firing` alerts (`state = 'acknowledged'`, `version += 1`, `alert_acknowledged` audit event). Locks existing `servicenow_incidents` rows (`ORDER BY alert_id ASC FOR UPDATE`), rejecting if any alert is already `created`/`linked` (`409 INCIDENT_ALREADY_LINKED`) or non-stale `pending` (`409 INCIDENT_CREATION_IN_PROGRESS`). Collects all candidate correlation IDs across any alerts with prior `failed` or stale `pending` rows (`a.ID` + prior `snow_correlation_id` from `alert_audit_log`), reserves/updates `pending` rows, and logs `snow_incident_requested` with `snow_correlation_id`. Commits Tx 1.
+  2. **External Call:** Resolves caller (SSO + `noc` fallback), checks `FindIncidentByCorrelationID` across all retry candidate correlation IDs before issuing `POST /api/now/table/incident` once with `correlation_id = PrimaryAlertID`.
+  3. **Tx 2 (`FinalizeBulkIncidentCreated` / `FinalizeBulkIncidentFailed`):** Locks `idempotency_keys` then `alerts` in `ORDER BY id ASC FOR UPDATE`. On success, marks the primary alert's row `sync_status = 'created'` (`snow_incident_created`) and all sibling alerts' rows `sync_status = 'linked'` (`snow_incident_linked`) with the same `snow_sys_id` and `incident_number`, and stores the `201` response in `idempotency_keys`. On failure, marks all reserved rows `sync_status = 'failed'` (`snow_incident_failed`) and releases any `in_progress` idempotency claim while leaving all alerts `acknowledged`.
+- **Response `201 Created` (`CreateBulkIncidentResponse`):**
+```json
+{
+  "alert_ids": [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222"
+  ],
+  "servicenow_incident": {
+    "id": "e4f8a1b2-3c4d-4e5f-8a6b-9c0d1e2f3a4b",
+    "sync_status": "created",
+    "snow_sys_id": "51615243c0a801640139e875df691a31",
+    "incident_number": "INC0012345",
+    "incident_url": "https://corp.service-now.com/nav_to.do?uri=incident.do?sys_id=51615243c0a801640139e875df691a31",
+    "snow_state": 1,
+    "snow_state_label": "New",
+    "priority": 1,
+    "assignment_group": "Database SRE",
+    "caller_mode": "sso_user",
+    "caller_resolution_status": "sso_matched",
+    "snow_state_synced_at": "2026-11-25T16:13:05Z"
+  },
+  "warnings": []
+}
+```
+- **Error Responses:** `400` (`INVALID_REQUEST`, `VALIDATION_ERROR`), `403` (`FORBIDDEN_RBAC`), `404` (`ALERT_NOT_FOUND`), `409` (`INVALID_STATE_TRANSITION`, `INCIDENT_ALREADY_LINKED`, `INCIDENT_CREATION_IN_PROGRESS`), `422` (`SNOW_VALIDATION_REJECTED`), `429` (`RATE_LIMITED`), `502`/`503`/`504`.
+
+---
+
 #### `POST /api/v1/alerts/{alert_id}/servicenow/link`
 Links an existing ServiceNow incident (e.g., `INC0012345`) to an `acknowledged` alert without creating a new ticket.
 - **Required Permission:** `noc-alert-manager-app.incidents:write`
@@ -403,6 +511,7 @@ Because multiple NOC operators and Alertmanager webhook deliveries can target th
 1. **Row-Level Serialization in PostgreSQL (`SELECT ... FOR UPDATE`):**
    - Every state mutation (both operator actions and Alertmanager reconciliation) locks the target alert row inside a short (<50 ms) `READ COMMITTED` transaction before reading state, applying transition rules, incrementing `version`, and appending to `alert_audit_log`.
    - For Alertmanager batch payloads containing multiple alerts, alerts are **sorted deterministically by `(fingerprint, starts_at)`** before acquiring row locks to make PostgreSQL deadlocks impossible.
+   - For bulk ServiceNow incident creation (`POST /api/v1/servicenow/incidents/bulk`), `alert_ids` are deduplicated, sorted lexicographically, and locked via `ORDER BY id ASC FOR UPDATE` in both Tx 1 (`ReserveBulkIncidentCreation`) and Tx 2 (`FinalizeBulkIncidentCreated` / `FinalizeBulkIncidentFailed`). Similarly, `UpdateIncidentsBySysID` locks linked `alerts` in `ORDER BY a.id ASC FOR UPDATE` before locking `servicenow_incidents` in `ORDER BY s.alert_id ASC FOR UPDATE`.
 2. **Optimistic Concurrency Control (`version` Column) for Human Actions:**
    - Operator mutations require the `version` they last saw in the UI. Even after acquiring the row lock, if `db.version != req.version`, the transaction aborts cleanly and returns `409 Conflict` with the current row state. This prevents "lost updates" (e.g., Operator B dismissing an alert 2 seconds after Operator A acknowledged it and opened a ticket).
 3. **Never Hold DB Transactions Open Across External HTTP Calls:**
@@ -439,4 +548,7 @@ If an environment opts out of the thin `CallResource` Go backend and uses Grafan
 | `GRAFANA_PROXY_SHARED_TOKEN` | No | — | Required only if `ALLOW_LEGACY_PROXY_HEADER_AUTH=true`. |
 | `ALERTMANAGER_WEBHOOK_TOKEN` | Yes | — | Bearer token authenticating Alertmanager webhook requests. |
 | `ALERTMANAGER_MAX_PAYLOAD_BYTES` | No | `5242880` | Max request body size (`5 MiB`) for Alertmanager webhooks. |
+| `ALLOW_RETROSPECTIVE_INCIDENT_CREATE` | No | `false` | When `true`, allows creating/linking a ServiceNow incident on a `resolved` alert episode. |
+| `TLS_CERT_FILE` | No | — | Optional path to PEM TLS certificate for in-process TLS 1.2+ on `PORT` (must be paired with `TLS_KEY_FILE`). |
+| `TLS_KEY_FILE` | No | — | Optional path to PEM TLS private key for in-process TLS 1.2+ on `PORT` (must be paired with `TLS_CERT_FILE`). |
 | `SNOW_*` | Yes | — | ServiceNow integration env vars (fully specified in `docs/design/05-servicenow-integration.md`). |

@@ -1,0 +1,33 @@
+groups:
+  - name: noc-alert-manager-meta
+    rules:
+      - alert: NocAlertmanagerTruncatedAlerts
+        expr: increase(noc_alertmanager_truncated_alerts_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: noc-alert-manager-api
+        annotations:
+          summary: "Alertmanager webhook reported truncatedAlerts > 0"
+          description: >-
+            Alertmanager truncated alerts in webhook delivery over the last 5 minutes.
+            Ensure Alertmanager webhook receiver config sets max_alerts: 0.
+
+      - alert: NocSnowCallerFallbackSpike
+        expr: >-
+          increase(noc_snow_caller_resolution_total{status="fallback_noc"}[15m]) >= 5
+          and
+          (
+            increase(noc_snow_caller_resolution_total{status="fallback_noc"}[15m])
+            /
+            clamp_min(sum(increase(noc_snow_caller_resolution_total[15m])), 1)
+          ) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+          component: noc-alert-manager-api
+        annotations:
+          summary: "High ServiceNow SSO caller fallback rate (>25%)"
+          description: >-
+            More than 25% of ServiceNow caller resolutions over the past 15 minutes fell back
+            to the generic NOC caller account. Check IdP email mapping and sys_user lookup health.

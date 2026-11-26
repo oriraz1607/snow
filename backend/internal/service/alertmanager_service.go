@@ -179,10 +179,7 @@ func ValidateAndNormalizeAlertmanagerPayload(payload *model.AlertmanagerWebhookP
 		if alertName == "" {
 			alertName = "UnnamedAlert"
 		}
-		severity := strings.ToLower(strings.TrimSpace(labels["severity"]))
-		if severity == "" {
-			severity = "unknown"
-		}
+		severity := NormalizeSeverity(labels["severity"])
 
 		norm := model.NormalizedAlert{
 			Fingerprint:  fp,
@@ -265,4 +262,25 @@ func statusLabel(status int) string {
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// NormalizeSeverity normalizes common Prometheus/Alertmanager severity aliases into canonical
+// alert severity values ("critical", "warning", etc.) while preserving raw labels["severity"].
+func NormalizeSeverity(raw string) string {
+	norm := strings.ToLower(strings.TrimSpace(raw))
+	if norm == "" {
+		return "unknown"
+	}
+	switch norm {
+	case "critical", "crit", "p1", "sev1", "s1", "fatal", "emergency", "emerg",
+		"immediate", "disaster", "high", "major", "error", "err", "page", "blocker":
+		return "critical"
+	case "warning", "warn", "p2", "sev2", "s2", "medium", "med", "moderate", "minor":
+		return "warning"
+	default:
+		if len(norm) > 32 {
+			norm = norm[:32]
+		}
+		return norm
+	}
 }

@@ -28,7 +28,6 @@ import {
   generateUuid,
   getAlertEnvironment,
   getAlertSite,
-  getAlertTeam,
   highestSeverity,
 } from '../utils/format';
 import { getCurrentUser } from '../utils/permissions';
@@ -40,6 +39,7 @@ interface CreateIncidentModalProps {
   pluginSettings: AppPluginSettings;
   initialWorkNote?: string;
   onClose: () => void;
+  onConflict?: (err: ApiClientError) => void;
   onCreated: (
     alertIds: string[],
     result: { servicenow_incident: ServiceNowIncident; warnings?: string[] }
@@ -52,6 +52,17 @@ const IMPACT_URGENCY_OPTIONS: Array<SelectableValue<1 | 2 | 3>> = [
   { label: '3 - Low', value: 3 },
 ];
 
+function getSharedPrometheusTeam(alerts: Alert[]): string {
+  if (alerts.length === 0) {
+    return '';
+  }
+  const first = alerts[0].labels?.team?.trim() || '';
+  if (!first) {
+    return '';
+  }
+  return alerts.every((a) => (a.labels?.team?.trim() || '') === first) ? first : '';
+}
+
 export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   isOpen,
   alerts,
@@ -59,6 +70,7 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   pluginSettings,
   initialWorkNote = '',
   onClose,
+  onConflict,
   onCreated,
 }) => {
   const theme = useTheme2();
@@ -76,6 +88,7 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   const [idempotencyKey, setIdempotencyKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [isConflict, setIsConflict] = useState(false);
   const [canRetry, setCanRetry] = useState(false);
 
   // Track the initialized selection key so background queue polling never resets modal edits.
@@ -98,17 +111,22 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
     const topSeverity = highestSeverity(alerts);
     const mapped = defaultImpactUrgencyForSeverity(topSeverity);
 
-    let defaultGroup = metadata?.default_assignment_group || 'Infrastructure';
-    for (const a of alerts) {
-      const explicitGroup = a.labels?.assignment_group?.trim();
-      const teamName = getAlertTeam(a).team;
-      if (explicitGroup) {
-        defaultGroup = explicitGroup;
-        break;
-      }
-      if (teamName) {
-        defaultGroup = teamName;
-        break;
+    const sharedLabelTeam = getSharedPrometheusTeam(alerts);
+    const learnedGroup =
+      sharedLabelTeam && metadata?.team_assignment_groups
+        ? metadata.team_assignment_groups[sharedLabelTeam]?.trim() || ''
+        : '';
+
+    let defaultGroup = metadata?.default_assignment_group ?? '';
+    if (learnedGroup) {
+      defaultGroup = learnedGroup;
+    } else {
+      for (const a of alerts) {
+        const explicitGroup = a.labels?.assignment_group?.trim();
+        if (explicitGroup) {
+          defaultGroup = explicitGroup;
+          break;
+        }
       }
     }
 
@@ -126,6 +144,7 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
     setWorkNotes(initialWorkNote);
     setIdempotencyKey(generateUuid());
     setSubmitError(null);
+    setIsConflict(false);
     setCanRetry(false);
     setSubmitting(false);
   }, [isOpen, alerts, metadata, pluginSettings.defaultCallerMode, initialWorkNote]);
@@ -169,6 +188,11 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   }));
 
   const priority = calculateServiceNowPriority(impact, urgency);
+  const sharedLabelTeam = getSharedPrometheusTeam(alerts);
+  const learnedGroupForTeam =
+    sharedLabelTeam && metadata?.team_assignment_groups
+      ? metadata.team_assignment_groups[sharedLabelTeam]?.trim() || ''
+      : '';
   const priorityColor =
     priority.value === 1 ? 'red' : priority.value === 2 ? 'orange' : priority.value === 3 ? 'blue' : 'green';
   const genericNocLabel =
@@ -193,6 +217,7 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
     }
     setSubmitting(true);
     setSubmitError(null);
+    setIsConflict(false);
 
     try {
       if (isBulk) {
@@ -236,7 +261,36 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
       }
     } catch (err) {
       const apiErr = err as ApiClientError;
+      if (apiErr?.status === 409) {
+        const details = apiErr.details ?? {};
+        const conflictAlertId =
+          typeof details.alert_id === 'string'
+            ? details.alert_id
+            : alerts.length === 1
+              ? alerts[0].id
+              : '';
+        const conflictAlert = conflictAlertId ? alerts.find((a) => a.id === conflictAlertId) : undefined;
+        const conflictNum =
+          typeof details.incident_number === 'string' && details.incident_number
+            ? ` (${details.incident_number})`
+            : '';
+        const conflictState =
+          typeof details.current_state === 'string' && details.current_state
+            ? ` (current state: ${details.current_state})`
+            : '';
+        const alertPrefix = conflictAlert ? `${conflictAlert.alert_name}: ` : '';
+
+        setCanRetry(false);
+        setIsConflict(true);
+        setSubmitError(
+          `${alertPrefix}${apiErr.message || 'Alert state or linked incident changed.'}${conflictNum}${conflictState} Queue has been refreshed — review updated state or close this dialog.`
+        );
+        onConflict?.(apiErr);
+        return;
+      }
+
       const isTransient = apiErr?.status === 502 || apiErr?.status === 503 || apiErr?.status === 504;
+      setIsConflict(false);
       setCanRetry(isTransient);
       setSubmitError(
         isTransient
@@ -252,8 +306,14 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
     <Modal isOpen={isOpen} title={modalTitle} onDismiss={onClose} className={styles.modal}>
       <form onSubmit={handleSubmit}>
         {submitError && (
-          <div className={styles.errorBox}>
-            <GrafanaAlert severity="error" title="ServiceNow incident creation failed">
+          <div
+            className={styles.errorBox}
+            data-testid={isConflict ? 'create-modal-conflict-error' : 'create-modal-error'}
+          >
+            <GrafanaAlert
+              severity={isConflict ? 'warning' : 'error'}
+              title={isConflict ? 'Conflict — queue refreshed' : 'ServiceNow incident creation failed'}
+            >
               {submitError}
             </GrafanaAlert>
           </div>
@@ -332,7 +392,15 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
         </div>
 
         <div className={styles.gridRow}>
-          <Field label="Assignment Group" className={styles.gridItem}>
+          <Field
+            label="Assignment Group"
+            className={styles.gridItem}
+            description={
+              learnedGroupForTeam && assignmentGroup === learnedGroupForTeam
+                ? `Auto-selected from learned mapping for team "${sharedLabelTeam}".`
+                : undefined
+            }
+          >
             <Select
               aria-label="Assignment Group"
               options={groupOptions}

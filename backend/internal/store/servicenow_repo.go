@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,13 +19,26 @@ import (
 	"github.com/oriraz/grafana-snow-integration/backend/internal/model"
 )
 
-const stalePendingThreshold = 60 * time.Second
+const (
+	stalePendingThreshold = 60 * time.Second
+	idempotencyKeyTTL     = 24 * time.Hour
+)
+
+// IdempotencyMeta identifies a client-supplied Idempotency-Key and canonical request fingerprint.
+type IdempotencyMeta struct {
+	Key         string
+	Endpoint    string
+	RequestHash string
+}
 
 // IncidentReservation holds Tx 1 output before the outbound ServiceNow call runs.
 type IncidentReservation struct {
-	IncidentID string
-	Alert      model.AlertDetail
-	IsRetry    bool
+	IncidentID     string
+	Alert          model.AlertDetail
+	IsRetry        bool
+	Idempotency    IdempotencyMeta
+	Replayed       bool
+	ReplayResponse *model.CreateIncidentResponse
 }
 
 // SnowCreateResult carries parsed ServiceNow incident metadata into Tx 2.
@@ -60,6 +74,15 @@ type CallerResolution struct {
 	FallbackReason   *string
 }
 
+// AutoReopenState holds active linked alerts and loop-guard counters for an incident sys_id.
+type AutoReopenState struct {
+	SnowSysID          string
+	IncidentNumber     string
+	ActiveAlerts       []model.ActiveAlertSummary
+	MaxAutoReopenCount int
+	LastAutoReopenedAt *time.Time
+}
+
 // ServiceNowRepository manages PostgreSQL state for ServiceNow incidents, user cache, and gauges.
 type ServiceNowRepository struct {
 	pool *pgxpool.Pool
@@ -72,10 +95,14 @@ func NewServiceNowRepository(pool *pgxpool.Pool) *ServiceNowRepository {
 
 // BulkIncidentReservation holds Tx 1 output for creating one ServiceNow incident across multiple alerts.
 type BulkIncidentReservation struct {
-	PrimaryAlertID string
-	IncidentIDs    map[string]string
-	Alerts         []model.AlertDetail
-	IsRetry        bool
+	PrimaryAlertID      string
+	IncidentIDs         map[string]string
+	Alerts              []model.AlertDetail
+	IsRetry             bool
+	RetryCorrelationIDs []string
+	Idempotency         IdempotencyMeta
+	Replayed            bool
+	ReplayResponse      *model.CreateBulkIncidentResponse
 }
 
 // ReserveBulkIncidentCreation runs Tx 1 for multi-alert ServiceNow incident creation:
@@ -87,6 +114,7 @@ func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 	op auth.OperatorContext,
 	req model.CreateBulkIncidentRequest,
 	allowTriage bool,
+	idem IdempotencyMeta,
 ) (*BulkIncidentReservation, error) {
 	seen := make(map[string]struct{}, len(alertIDs))
 	sortedIDs := make([]string, 0, len(alertIDs))
@@ -113,6 +141,27 @@ func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Global lock order: idempotency_keys -> alerts -> servicenow_incidents -> alert_audit_log.
+	replayedBody, err := claimIdempotencyKeyTx(ctx, tx, op, idem)
+	if err != nil {
+		return nil, err
+	}
+	if replayedBody != nil {
+		var replayed model.CreateBulkIncidentResponse
+		if unmarshalErr := json.Unmarshal(replayedBody, &replayed); unmarshalErr != nil {
+			return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to decode cached idempotent response.").WithCause(unmarshalErr)
+		}
+		replayed.Replayed = true
+		if err := tx.Commit(ctx); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to commit idempotency replay.").WithCause(err)
+		}
+		return &BulkIncidentReservation{
+			Idempotency:    idem,
+			Replayed:       true,
+			ReplayResponse: &replayed,
+		}, nil
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT id::text, fingerprint, starts_at, ends_at, state::text, version,
@@ -238,38 +287,82 @@ func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 	}
 
 	primaryAlertID := sortedIDs[0]
-	isRetry := false
-	incidentIDs := make(map[string]string, len(sortedIDs))
+	retryCorrSet := make(map[string]struct{})
 
+	// Pass 1: Validate all existing incident states and collect every prior correlation ID
+	// across alerts with failed or stale pending reservations before modifying any rows.
+	for _, a := range alerts {
+		ex, exists := existingByAlert[a.ID]
+		if !exists {
+			continue
+		}
+		hadPriorAttempt := false
+		switch ex.Status {
+		case model.SnowSyncCreated, model.SnowSyncLinked:
+			return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentAlreadyLinked,
+				fmt.Sprintf("Alert %s already has a linked ServiceNow incident.", a.AlertName),
+			).WithDetails(map[string]any{
+				"alert_id":        a.ID,
+				"incident_id":     ex.ID,
+				"sync_status":     string(ex.Status),
+				"incident_number": ex.Number,
+				"snow_sys_id":     ex.SysID,
+			})
+		case model.SnowSyncPending:
+			if time.Since(ex.UpdatedAt) <= stalePendingThreshold {
+				return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentCreationInProgress,
+					fmt.Sprintf("ServiceNow incident creation is already in progress for alert %s.", a.AlertName),
+				).WithDetails(map[string]any{"alert_id": a.ID, "incident_id": ex.ID})
+			}
+			hadPriorAttempt = true
+		case model.SnowSyncFailed:
+			hadPriorAttempt = true
+		}
+
+		if hadPriorAttempt {
+			retryCorrSet[a.ID] = struct{}{}
+			priorRows, qErr := tx.Query(ctx, `
+				SELECT DISTINCT corr_id
+				FROM (
+					SELECT COALESCE(NULLIF(metadata->>'snow_correlation_id', ''), metadata->'bulk_alert_ids'->>0, '') AS corr_id
+					FROM alert_audit_log
+					WHERE alert_id = $1::uuid
+					  AND event_type = 'snow_incident_requested'
+					ORDER BY created_at DESC, id DESC
+					LIMIT 10
+				) sub
+				WHERE corr_id <> ''
+			`, a.ID)
+			if qErr != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed inspecting prior incident correlation IDs.").WithCause(qErr)
+			}
+			for priorRows.Next() {
+				var corrID string
+				if scanErr := priorRows.Scan(&corrID); scanErr != nil {
+					priorRows.Close()
+					return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed scanning prior correlation ID.").WithCause(scanErr)
+				}
+				retryCorrSet[corrID] = struct{}{}
+			}
+			priorRows.Close()
+			if err := priorRows.Err(); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed reading prior correlation IDs.").WithCause(err)
+			}
+		}
+	}
+
+	retryCorrelationIDs := make([]string, 0, len(retryCorrSet))
+	for corrID := range retryCorrSet {
+		retryCorrelationIDs = append(retryCorrelationIDs, corrID)
+	}
+	sort.Strings(retryCorrelationIDs)
+	isRetry := len(retryCorrelationIDs) > 0
+
+	incidentIDs := make(map[string]string, len(sortedIDs))
+	// Pass 2: Reserve/update pending rows and record consistent audit logs.
 	for _, a := range alerts {
 		ex, exists := existingByAlert[a.ID]
 		if exists {
-			switch ex.Status {
-			case model.SnowSyncCreated, model.SnowSyncLinked:
-				return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentAlreadyLinked,
-					fmt.Sprintf("Alert %s already has a linked ServiceNow incident.", a.AlertName),
-				).WithDetails(map[string]any{
-					"alert_id":        a.ID,
-					"incident_id":     ex.ID,
-					"sync_status":     string(ex.Status),
-					"incident_number": ex.Number,
-					"snow_sys_id":     ex.SysID,
-				})
-			case model.SnowSyncPending:
-				if time.Since(ex.UpdatedAt) <= stalePendingThreshold {
-					return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentCreationInProgress,
-						fmt.Sprintf("ServiceNow incident creation is already in progress for alert %s.", a.AlertName),
-					).WithDetails(map[string]any{"alert_id": a.ID, "incident_id": ex.ID})
-				}
-				if a.ID == primaryAlertID {
-					isRetry = true
-				}
-			case model.SnowSyncFailed:
-				if a.ID == primaryAlertID {
-					isRetry = true
-				}
-			}
-
 			var updatedIncID string
 			if err := tx.QueryRow(ctx, `
 				UPDATE servicenow_incidents
@@ -328,10 +421,11 @@ func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 			NewState:      &curState,
 			Comment:       model.StringPtrOrNil(req.WorkNotes),
 			Metadata: map[string]any{
-				"caller_mode":     string(req.CallerMode),
-				"is_retry":        isRetry,
-				"bulk_alert_ids":  sortedIDs,
-				"primary_alert":   a.ID == primaryAlertID,
+				"caller_mode":         string(req.CallerMode),
+				"is_retry":            isRetry,
+				"bulk_alert_ids":      sortedIDs,
+				"snow_correlation_id": primaryAlertID,
+				"primary_alert":       a.ID == primaryAlertID,
 			},
 		}); err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record bulk incident request audit event.").WithCause(err)
@@ -343,10 +437,12 @@ func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 	}
 
 	return &BulkIncidentReservation{
-		PrimaryAlertID: primaryAlertID,
-		IncidentIDs:    incidentIDs,
-		Alerts:         alerts,
-		IsRetry:        isRetry,
+		PrimaryAlertID:      primaryAlertID,
+		IncidentIDs:         incidentIDs,
+		Alerts:              alerts,
+		IsRetry:             isRetry,
+		RetryCorrelationIDs: retryCorrelationIDs,
+		Idempotency:         idem,
 	}, nil
 }
 
@@ -359,6 +455,7 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentCreated(
 	res SnowCreateResult,
 	caller CallerResolution,
 	adopted bool,
+	warnings []string,
 ) (*model.ServiceNowIncident, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -367,6 +464,10 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentCreated(
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	if err := lockIdempotencyKeyTx(ctx, tx, resv.Idempotency.Key); err != nil {
+		return nil, err
+	}
 
 	alertIDs := make([]string, 0, len(resv.Alerts))
 	for _, a := range resv.Alerts {
@@ -498,6 +599,14 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentCreated(
 		}
 	}
 
+	if err := completeIdempotencyKeyTx(ctx, tx, resv.Idempotency.Key, http.StatusCreated, &model.CreateBulkIncidentResponse{
+		AlertIDs:           alertIDs,
+		ServiceNowIncident: primaryInc,
+		Warnings:           warnings,
+	}); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to commit finalized bulk incident.").WithCause(err)
 	}
@@ -513,6 +622,10 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentFailed(ctx context.Context, r
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	if err := lockIdempotencyKeyTx(ctx, tx, resv.Idempotency.Key); err != nil {
+		return err
+	}
 
 	alertIDs := make([]string, 0, len(resv.Alerts))
 	for _, a := range resv.Alerts {
@@ -566,6 +679,11 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentFailed(ctx context.Context, r
 			return err
 		}
 	}
+
+	if err := releaseIdempotencyKeyTx(ctx, tx, resv.Idempotency.Key); err != nil {
+		return err
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -576,6 +694,7 @@ func (r *ServiceNowRepository) ReserveIncidentCreation(
 	op auth.OperatorContext,
 	req model.CreateIncidentRequest,
 	allowRetrospective bool,
+	idem IdempotencyMeta,
 ) (*IncidentReservation, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -584,6 +703,27 @@ func (r *ServiceNowRepository) ReserveIncidentCreation(
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Global lock order: idempotency_keys -> alerts -> servicenow_incidents -> alert_audit_log.
+	replayedBody, err := claimIdempotencyKeyTx(ctx, tx, op, idem)
+	if err != nil {
+		return nil, err
+	}
+	if replayedBody != nil {
+		var replayed model.CreateIncidentResponse
+		if unmarshalErr := json.Unmarshal(replayedBody, &replayed); unmarshalErr != nil {
+			return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to decode cached idempotent response.").WithCause(unmarshalErr)
+		}
+		replayed.Replayed = true
+		if err := tx.Commit(ctx); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to commit idempotency replay.").WithCause(err)
+		}
+		return &IncidentReservation{
+			Idempotency:    idem,
+			Replayed:       true,
+			ReplayResponse: &replayed,
+		}, nil
+	}
 
 	var alertRow model.AlertDetail
 	var stateStr string
@@ -710,8 +850,9 @@ func (r *ServiceNowRepository) ReserveIncidentCreation(
 		NewState:      &curState,
 		Comment:       model.StringPtrOrNil(req.WorkNotes),
 		Metadata: map[string]any{
-			"caller_mode": string(req.CallerMode),
-			"is_retry":    isRetry,
+			"caller_mode":         string(req.CallerMode),
+			"is_retry":            isRetry,
+			"snow_correlation_id": alertID,
 		},
 	}); err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record incident request audit event.").WithCause(err)
@@ -722,9 +863,10 @@ func (r *ServiceNowRepository) ReserveIncidentCreation(
 	}
 
 	return &IncidentReservation{
-		IncidentID: incidentID,
-		Alert:      alertRow,
-		IsRetry:    isRetry,
+		IncidentID:  incidentID,
+		Alert:       alertRow,
+		IsRetry:     isRetry,
+		Idempotency: idem,
 	}, nil
 }
 
@@ -738,6 +880,8 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 	res SnowCreateResult,
 	caller CallerResolution,
 	adopted bool,
+	idemKey string,
+	warnings []string,
 ) (*model.ServiceNowIncident, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -747,8 +891,12 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 		_ = tx.Rollback(ctx)
 	}()
 
+	if err := lockIdempotencyKeyTx(ctx, tx, idemKey); err != nil {
+		return nil, err
+	}
+
 	// Lock parent alert row before servicenow_incidents to preserve canonical lock order
-	// (alerts -> servicenow_incidents -> alert_audit_log) and prevent AB-BA deadlocks.
+	// (idempotency_keys -> alerts -> servicenow_incidents -> alert_audit_log) and prevent AB-BA deadlocks.
 	var lockedStateStr string
 	if err := tx.QueryRow(ctx, `SELECT state::text FROM alerts WHERE id = $1::uuid FOR UPDATE`, alertID).Scan(&lockedStateStr); err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert row.").WithCause(err)
@@ -838,6 +986,14 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 		}
 	}
 
+	if err := completeIdempotencyKeyTx(ctx, tx, idemKey, http.StatusCreated, &model.CreateIncidentResponse{
+		AlertID:            alertID,
+		ServiceNowIncident: &inc,
+		Warnings:           warnings,
+	}); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to commit finalized incident.").WithCause(err)
 	}
@@ -845,7 +1001,7 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 }
 
 // FinalizeIncidentFailed records a failed ServiceNow creation attempt while keeping the alert acknowledged.
-func (r *ServiceNowRepository) FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg string) error {
+func (r *ServiceNowRepository) FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg, idemKey string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -853,6 +1009,10 @@ func (r *ServiceNowRepository) FinalizeIncidentFailed(ctx context.Context, alert
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	if err := lockIdempotencyKeyTx(ctx, tx, idemKey); err != nil {
+		return err
+	}
 
 	var lockedStateStr string
 	if err := tx.QueryRow(ctx, `SELECT state::text FROM alerts WHERE id = $1::uuid FOR UPDATE`, alertID).Scan(&lockedStateStr); err != nil {
@@ -882,6 +1042,11 @@ func (r *ServiceNowRepository) FinalizeIncidentFailed(ctx context.Context, alert
 	}); err != nil {
 		return err
 	}
+
+	if err := releaseIdempotencyKeyTx(ctx, tx, idemKey); err != nil {
+		return err
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -1072,7 +1237,9 @@ func (r *ServiceNowRepository) GetAlertAndIncident(ctx context.Context, alertID 
 	return alertState, &inc, nil
 }
 
-// UpdateIncidentForAlert updates a single alert's linked incident after live sync.
+// UpdateIncidentForAlert updates a single alert's linked incident (and all siblings sharing snow_sys_id) after live sync.
+// Acquires row locks in canonical order (alerts ORDER BY id ASC -> servicenow_incidents ORDER BY alert_id ASC)
+// matching UpdateIncidentsBySysID and emits snow_state_synced audit logs for every updated sibling.
 func (r *ServiceNowRepository) UpdateIncidentForAlert(
 	ctx context.Context,
 	alertID string,
@@ -1087,45 +1254,151 @@ func (r *ServiceNowRepository) UpdateIncidentForAlert(
 		_ = tx.Rollback(ctx)
 	}()
 
-	var alertStateStr string
-	if err := tx.QueryRow(ctx, `SELECT state::text FROM alerts WHERE id = $1::uuid FOR UPDATE`, alertID).Scan(&alertStateStr); err != nil {
+	var alertFoundID string
+	var incID, snowSysID, syncStatusStr *string
+	err = tx.QueryRow(ctx, `
+		SELECT a.id::text, s.id::text, s.snow_sys_id, s.sync_status::text
+		FROM alerts a
+		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
+		WHERE a.id = $1::uuid
+	`, alertID).Scan(&alertFoundID, &incID, &snowSysID, &syncStatusStr)
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")
 		}
-		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert row.").WithCause(err)
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to query linked incident.").WithCause(err)
+	}
+	if incID == nil || syncStatusStr == nil {
+		return nil, apierror.New(http.StatusNotFound, apierror.CodeIncidentNotFound, "Linked ServiceNow incident not found.")
 	}
 
-	var prevState *int16
-	var snowSysID *string
-	err = tx.QueryRow(ctx, `
-		SELECT s.snow_state, s.snow_sys_id
-		FROM servicenow_incidents s
-		WHERE s.alert_id = $1::uuid
-		FOR UPDATE
-	`, alertID).Scan(&prevState, &snowSysID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	var alertState model.AlertState
+	if snowSysID != nil && *snowSysID != "" &&
+		(*syncStatusStr == string(model.SnowSyncCreated) || *syncStatusStr == string(model.SnowSyncLinked)) {
+		type targetRow struct {
+			IncidentID    string
+			AlertID       string
+			AlertState    model.AlertState
+			PrevSnowState *int16
+		}
+
+		alertRows, err := tx.Query(ctx, `
+			SELECT a.id::text, a.state::text
+			FROM alerts a
+			INNER JOIN servicenow_incidents s ON s.alert_id = a.id
+			WHERE s.snow_sys_id = $1 AND s.sync_status IN ('created', 'linked')
+			ORDER BY a.id ASC
+			FOR UPDATE OF a
+		`, *snowSysID)
+		if err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock sibling alerts for sync.").WithCause(err)
+		}
+		alertStates := make(map[string]model.AlertState)
+		for alertRows.Next() {
+			var aID, stStr string
+			if scanErr := alertRows.Scan(&aID, &stStr); scanErr != nil {
+				alertRows.Close()
+				return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed scanning sibling alert lock.").WithCause(scanErr)
+			}
+			alertStates[aID] = model.AlertState(stStr)
+		}
+		alertRows.Close()
+		if err := alertRows.Err(); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed reading sibling alert locks.").WithCause(err)
+		}
+
+		st, ok := alertStates[alertID]
+		if !ok {
 			return nil, apierror.New(http.StatusNotFound, apierror.CodeIncidentNotFound, "Linked ServiceNow incident not found.")
 		}
-		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock incident record.").WithCause(err)
-	}
-	alertState := model.AlertState(alertStateStr)
+		alertState = st
 
-	if snowSysID != nil && *snowSysID != "" {
-		if _, err := tx.Exec(ctx, `
-			UPDATE servicenow_incidents
-			SET snow_state = $2,
-				snow_state_label = $3,
-				priority = COALESCE($4, priority),
-				assignment_group = COALESCE($5, assignment_group),
-				snow_resolved_at = COALESCE($6, snow_resolved_at),
-				snow_closed_at = COALESCE($7, snow_closed_at),
-				snow_state_synced_at = NOW()
-			WHERE snow_sys_id = $1 AND sync_status IN ('created', 'linked')
-		`, *snowSysID, update.State, update.StateLabel, update.Priority, update.AssignmentGroup, update.ResolvedAt, update.ClosedAt); err != nil {
-			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update incident status.").WithCause(err)
+		incRows, err := tx.Query(ctx, `
+			SELECT s.id::text, s.alert_id::text, s.snow_state
+			FROM servicenow_incidents s
+			WHERE s.snow_sys_id = $1 AND s.sync_status IN ('created', 'linked')
+			ORDER BY s.alert_id ASC
+			FOR UPDATE
+		`, *snowSysID)
+		if err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock sibling incidents for sync.").WithCause(err)
+		}
+		var targets []targetRow
+		for incRows.Next() {
+			var t targetRow
+			if scanErr := incRows.Scan(&t.IncidentID, &t.AlertID, &t.PrevSnowState); scanErr != nil {
+				incRows.Close()
+				return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed scanning sibling incident.").WithCause(scanErr)
+			}
+			t.AlertState = alertStates[t.AlertID]
+			targets = append(targets, t)
+		}
+		incRows.Close()
+		if err := incRows.Err(); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed iterating sibling incidents.").WithCause(err)
+		}
+
+		for _, t := range targets {
+			if _, err := tx.Exec(ctx, `
+				UPDATE servicenow_incidents
+				SET snow_state = $2,
+					snow_state_label = $3,
+					priority = COALESCE($4, priority),
+					assignment_group = COALESCE($5, assignment_group),
+					snow_resolved_at = COALESCE($6, snow_resolved_at),
+					snow_closed_at = COALESCE($7, snow_closed_at),
+					snow_state_synced_at = NOW()
+				WHERE id = $1::uuid
+			`, t.IncidentID, update.State, update.StateLabel, update.Priority, update.AssignmentGroup, update.ResolvedAt, update.ClosedAt); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update incident status.").WithCause(err)
+			}
+
+			meta := map[string]any{
+				"snow_sys_id":         *snowSysID,
+				"previous_snow_state": t.PrevSnowState,
+				"new_snow_state":      update.State,
+				"new_snow_label":      update.StateLabel,
+			}
+			if t.AlertID != alertID {
+				meta["triggered_by_alert_id"] = alertID
+			}
+			if err := insertAuditLogTx(ctx, tx, auditEntry{
+				AlertID:       t.AlertID,
+				EventType:     model.AuditSnowStateSynced,
+				ActorType:     model.ActorOperator,
+				ActorLogin:    op.Login,
+				ActorEmail:    model.StringPtrOrNil(op.Email),
+				ActorRole:     model.StringPtrOrNil(op.Role),
+				PreviousState: &t.AlertState,
+				NewState:      &t.AlertState,
+				Metadata:      meta,
+			}); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record sync audit event.").WithCause(err)
+			}
 		}
 	} else {
+		var alertStateStr string
+		if err := tx.QueryRow(ctx, `SELECT state::text FROM alerts WHERE id = $1::uuid FOR UPDATE`, alertID).Scan(&alertStateStr); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")
+			}
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert row.").WithCause(err)
+		}
+		alertState = model.AlertState(alertStateStr)
+
+		var prevState *int16
+		if err := tx.QueryRow(ctx, `
+			SELECT s.snow_state
+			FROM servicenow_incidents s
+			WHERE s.alert_id = $1::uuid
+			FOR UPDATE
+		`, alertID).Scan(&prevState); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, apierror.New(http.StatusNotFound, apierror.CodeIncidentNotFound, "Linked ServiceNow incident not found.")
+			}
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock incident record.").WithCause(err)
+		}
+
 		if _, err := tx.Exec(ctx, `
 			UPDATE servicenow_incidents
 			SET snow_state = $2,
@@ -1139,24 +1412,24 @@ func (r *ServiceNowRepository) UpdateIncidentForAlert(
 		`, alertID, update.State, update.StateLabel, update.Priority, update.AssignmentGroup, update.ResolvedAt, update.ClosedAt); err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update incident status.").WithCause(err)
 		}
-	}
 
-	if err := insertAuditLogTx(ctx, tx, auditEntry{
-		AlertID:       alertID,
-		EventType:     model.AuditSnowStateSynced,
-		ActorType:     model.ActorOperator,
-		ActorLogin:    op.Login,
-		ActorEmail:    model.StringPtrOrNil(op.Email),
-		ActorRole:     model.StringPtrOrNil(op.Role),
-		PreviousState: &alertState,
-		NewState:      &alertState,
-		Metadata: map[string]any{
-			"previous_snow_state": prevState,
-			"new_snow_state":      update.State,
-			"new_snow_label":      update.StateLabel,
-		},
-	}); err != nil {
-		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record sync audit event.").WithCause(err)
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       alertID,
+			EventType:     model.AuditSnowStateSynced,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &alertState,
+			NewState:      &alertState,
+			Metadata: map[string]any{
+				"previous_snow_state": prevState,
+				"new_snow_state":      update.State,
+				"new_snow_label":      update.StateLabel,
+			},
+		}); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record sync audit event.").WithCause(err)
+		}
 	}
 
 	inc, err := getIncidentByAlertTx(ctx, tx, alertID)
@@ -1394,6 +1667,12 @@ func (r *ServiceNowRepository) PurgeExpiredUserCache(ctx context.Context) error 
 	return err
 }
 
+// PurgeExpiredIdempotencyKeys deletes expired rows from idempotency_keys.
+func (r *ServiceNowRepository) PurgeExpiredIdempotencyKeys(ctx context.Context) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM idempotency_keys WHERE expires_at <= NOW()`)
+	return err
+}
+
 // FetchOpenIncidentSysIDsForPoll selects up to limit open linked ServiceNow incident sys_ids oldest-synced first.
 func (r *ServiceNowRepository) FetchOpenIncidentSysIDsForPoll(ctx context.Context, limit int) ([]string, error) {
 	if limit <= 0 {
@@ -1424,13 +1703,28 @@ func (r *ServiceNowRepository) FetchOpenIncidentSysIDsForPoll(ctx context.Contex
 	return sysIDs, rows.Err()
 }
 
-// FetchPendingResolutionNotes finds resolved alerts with open tickets that have not received an auto resolution note.
+// FetchPendingResolutionNotes finds resolved alerts with open tickets that have not received an auto resolution note,
+// including sibling counts across shared snow_sys_id links for bulk-linked incidents.
 func (r *ServiceNowRepository) FetchPendingResolutionNotes(ctx context.Context, limit int) ([]model.PendingResolutionNote, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT s.id::text, a.id::text, s.snow_sys_id, s.incident_number, a.alert_name, a.resolved_at
+		SELECT s.id::text, a.id::text, s.snow_sys_id, COALESCE(s.incident_number, ''), a.alert_name, a.resolved_at,
+		       (
+		           SELECT COUNT(*)
+		           FROM servicenow_incidents s2
+		           WHERE s2.snow_sys_id = s.snow_sys_id
+		             AND s2.sync_status IN ('created', 'linked')
+		       ) AS total_linked_alerts,
+		       (
+		           SELECT COUNT(*)
+		           FROM servicenow_incidents s2
+		           INNER JOIN alerts a2 ON a2.id = s2.alert_id
+		           WHERE s2.snow_sys_id = s.snow_sys_id
+		             AND s2.sync_status IN ('created', 'linked')
+		             AND a2.state IN ('firing', 'acknowledged')
+		       ) AS remaining_active_siblings
 		FROM alerts a
 		INNER JOIN servicenow_incidents s ON s.alert_id = a.id
 		WHERE a.state = 'resolved'
@@ -1438,7 +1732,7 @@ func (r *ServiceNowRepository) FetchPendingResolutionNotes(ctx context.Context, 
 		  AND s.snow_state IN (1, 2, 3)
 		  AND s.resolution_note_posted_at IS NULL
 		  AND s.snow_sys_id IS NOT NULL
-		ORDER BY a.resolved_at ASC
+		ORDER BY a.resolved_at ASC, a.id ASC
 		LIMIT $1
 	`, limit)
 	if err != nil {
@@ -1449,7 +1743,16 @@ func (r *ServiceNowRepository) FetchPendingResolutionNotes(ctx context.Context, 
 	var items []model.PendingResolutionNote
 	for rows.Next() {
 		var item model.PendingResolutionNote
-		if err := rows.Scan(&item.IncidentID, &item.AlertID, &item.SnowSysID, &item.IncidentNumber, &item.AlertName, &item.ResolvedAt); err != nil {
+		if err := rows.Scan(
+			&item.IncidentID,
+			&item.AlertID,
+			&item.SnowSysID,
+			&item.IncidentNumber,
+			&item.AlertName,
+			&item.ResolvedAt,
+			&item.TotalLinkedAlerts,
+			&item.RemainingActiveSiblings,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -1459,6 +1762,33 @@ func (r *ServiceNowRepository) FetchPendingResolutionNotes(ctx context.Context, 
 
 // MarkResolutionNotePosted stamps resolution_note_posted_at and logs snow_work_note_posted.
 func (r *ServiceNowRepository) MarkResolutionNotePosted(ctx context.Context, incidentID, alertID, noteText string) error {
+	return r.MarkResolutionNotesPostedBatch(ctx, []model.PendingResolutionNote{{
+		IncidentID: incidentID,
+		AlertID:    alertID,
+	}}, noteText, "alert_resolved_open_ticket")
+}
+
+// MarkResolutionNotesPostedBatch atomically stamps resolution_note_posted_at and records
+// snow_work_note_posted audit events across one or more alerts in canonical lock order.
+func (r *ServiceNowRepository) MarkResolutionNotesPostedBatch(ctx context.Context, items []model.PendingResolutionNote, noteText, reason string) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	sorted := append([]model.PendingResolutionNote(nil), items...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].AlertID < sorted[j].AlertID
+	})
+
+	alertIDs := make([]string, 0, len(sorted))
+	seen := make(map[string]struct{}, len(sorted))
+	for _, it := range sorted {
+		if _, ok := seen[it.AlertID]; !ok {
+			seen[it.AlertID] = struct{}{}
+			alertIDs = append(alertIDs, it.AlertID)
+		}
+	}
+
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1467,31 +1797,63 @@ func (r *ServiceNowRepository) MarkResolutionNotePosted(ctx context.Context, inc
 		_ = tx.Rollback(ctx)
 	}()
 
-	var lockedStateStr string
-	if err := tx.QueryRow(ctx, `SELECT state::text FROM alerts WHERE id = $1::uuid FOR UPDATE`, alertID).Scan(&lockedStateStr); err != nil {
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, state::text
+		FROM alerts
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id ASC
+		FOR UPDATE
+	`, alertIDs)
+	if err != nil {
 		return err
 	}
-	resolved := model.AlertState(lockedStateStr)
-
-	if _, err := tx.Exec(ctx, `
-		UPDATE servicenow_incidents
-		SET resolution_note_posted_at = NOW()
-		WHERE id = $1::uuid AND resolution_note_posted_at IS NULL
-	`, incidentID); err != nil {
+	alertStates := make(map[string]model.AlertState, len(alertIDs))
+	for rows.Next() {
+		var id, st string
+		if scanErr := rows.Scan(&id, &st); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		alertStates[id] = model.AlertState(st)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
-	if err := insertAuditLogTx(ctx, tx, auditEntry{
-		AlertID:       alertID,
-		EventType:     model.AuditSnowWorkNotePosted,
-		ActorType:     model.ActorSystem,
-		ActorLogin:    "system",
-		PreviousState: &resolved,
-		NewState:      &resolved,
-		Comment:       &noteText,
-		Metadata:      map[string]any{"reason": "alert_resolved_open_ticket"},
-	}); err != nil {
-		return err
+	for _, it := range sorted {
+		if _, err := tx.Exec(ctx, `
+			UPDATE servicenow_incidents
+			SET resolution_note_posted_at = NOW()
+			WHERE id = $1::uuid AND resolution_note_posted_at IS NULL
+		`, it.IncidentID); err != nil {
+			return err
+		}
+
+		st := alertStates[it.AlertID]
+		meta := map[string]any{"reason": reason}
+		if it.SnowSysID != "" {
+			meta["snow_sys_id"] = it.SnowSysID
+		}
+		if it.IncidentNumber != "" {
+			meta["incident_number"] = it.IncidentNumber
+		}
+		if it.TotalLinkedAlerts > 0 {
+			meta["total_linked_alerts"] = it.TotalLinkedAlerts
+			meta["remaining_active_siblings"] = it.RemainingActiveSiblings
+		}
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       it.AlertID,
+			EventType:     model.AuditSnowWorkNotePosted,
+			ActorType:     model.ActorSystem,
+			ActorLogin:    "system",
+			PreviousState: &st,
+			NewState:      &st,
+			Comment:       &noteText,
+			Metadata:      meta,
+		}); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -1510,6 +1872,263 @@ func (r *ServiceNowRepository) FetchGaugeCounts(ctx context.Context) (model.Gaug
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
 	`).Scan(&c.Firing, &c.Acknowledged, &c.Dismissed, &c.ResolvedWithOpenTicket, &c.ActiveWithClosedTicket)
 	return c, err
+}
+
+// GetIncidentActiveStatus returns active (firing/acknowledged) alert episodes linked to snowSysID.
+func (r *ServiceNowRepository) GetIncidentActiveStatus(ctx context.Context, snowSysID string) (*model.IncidentActiveStatusResponse, error) {
+	alerts, err := r.listActiveAlertsForSysID(ctx, snowSysID)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to query active alerts for ServiceNow incident.").WithCause(err)
+	}
+	return &model.IncidentActiveStatusResponse{
+		SnowSysID:        snowSysID,
+		HasActiveAlerts:  len(alerts) > 0,
+		ActiveAlertCount: len(alerts),
+		ActiveAlerts:     alerts,
+	}, nil
+}
+
+// GetAutoReopenState loads active linked alerts and reopen loop-guard counters for snowSysID.
+func (r *ServiceNowRepository) GetAutoReopenState(ctx context.Context, snowSysID string) (*AutoReopenState, error) {
+	var st AutoReopenState
+	st.SnowSysID = snowSysID
+	err := r.pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(incident_number), ''),
+		       COALESCE(MAX(auto_reopen_count), 0),
+		       MAX(last_auto_reopened_at)
+		FROM servicenow_incidents
+		WHERE snow_sys_id = $1 AND sync_status IN ('created', 'linked')
+	`, snowSysID).Scan(&st.IncidentNumber, &st.MaxAutoReopenCount, &st.LastAutoReopenedAt)
+	if err != nil {
+		return nil, err
+	}
+	alerts, err := r.listActiveAlertsForSysID(ctx, snowSysID)
+	if err != nil {
+		return nil, err
+	}
+	st.ActiveAlerts = alerts
+	return &st, nil
+}
+
+func (r *ServiceNowRepository) listActiveAlertsForSysID(ctx context.Context, snowSysID string) ([]model.ActiveAlertSummary, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT a.id::text, a.alert_name, a.severity, a.state::text, a.starts_at
+		FROM servicenow_incidents s
+		INNER JOIN alerts a ON a.id = s.alert_id
+		WHERE s.snow_sys_id = $1
+		  AND s.sync_status IN ('created', 'linked')
+		  AND a.state IN ('firing', 'acknowledged')
+		ORDER BY a.starts_at ASC, a.id ASC
+	`, snowSysID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	alerts := make([]model.ActiveAlertSummary, 0)
+	for rows.Next() {
+		var a model.ActiveAlertSummary
+		var stateStr string
+		if scanErr := rows.Scan(&a.ID, &a.AlertName, &a.Severity, &stateStr, &a.StartsAt); scanErr != nil {
+			return nil, scanErr
+		}
+		a.State = model.AlertState(stateStr)
+		alerts = append(alerts, a)
+	}
+	return alerts, rows.Err()
+}
+
+// RecordIncidentAutoReopened updates linked rows after ServiceNow is patched back to 2 (In Progress),
+// increments loop-guard counters, and appends snow_incident_reopened audit entries.
+func (r *ServiceNowRepository) RecordIncidentAutoReopened(
+	ctx context.Context,
+	snowSysID string,
+	update SnowSyncUpdate,
+	workNote string,
+	triggerSource string,
+	activeAlertCount int,
+) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Database unavailable.").WithCause(err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	alertRows, err := tx.Query(ctx, `
+		SELECT a.id::text, a.state::text
+		FROM alerts a
+		INNER JOIN servicenow_incidents s ON s.alert_id = a.id
+		WHERE s.snow_sys_id = $1 AND s.sync_status IN ('created', 'linked')
+		ORDER BY a.id ASC
+		FOR UPDATE OF a
+	`, snowSysID)
+	if err != nil {
+		return err
+	}
+	alertStates := make(map[string]model.AlertState)
+	for alertRows.Next() {
+		var aID, stStr string
+		if scanErr := alertRows.Scan(&aID, &stStr); scanErr != nil {
+			alertRows.Close()
+			return scanErr
+		}
+		alertStates[aID] = model.AlertState(stStr)
+	}
+	alertRows.Close()
+	if err := alertRows.Err(); err != nil {
+		return err
+	}
+	if len(alertStates) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	type targetRow struct {
+		IncidentID    string
+		AlertID       string
+		IncNumber     *string
+		PrevCount     int
+		PrevSnowState *int16
+	}
+	incRows, err := tx.Query(ctx, `
+		SELECT s.id::text, s.alert_id::text, s.incident_number, s.auto_reopen_count, s.snow_state
+		FROM servicenow_incidents s
+		WHERE s.snow_sys_id = $1 AND s.sync_status IN ('created', 'linked')
+		ORDER BY s.alert_id ASC
+		FOR UPDATE
+	`, snowSysID)
+	if err != nil {
+		return err
+	}
+	var targets []targetRow
+	for incRows.Next() {
+		var t targetRow
+		if scanErr := incRows.Scan(&t.IncidentID, &t.AlertID, &t.IncNumber, &t.PrevCount, &t.PrevSnowState); scanErr != nil {
+			incRows.Close()
+			return scanErr
+		}
+		targets = append(targets, t)
+	}
+	incRows.Close()
+	if err := incRows.Err(); err != nil {
+		return err
+	}
+
+	stateLabel := update.StateLabel
+	if stateLabel == "" {
+		stateLabel = model.SnowStateLabel(update.State)
+	}
+
+	for _, t := range targets {
+		if _, err := tx.Exec(ctx, `
+			UPDATE servicenow_incidents
+			SET snow_state = $2,
+				snow_state_label = $3,
+				priority = COALESCE($4, priority),
+				assignment_group = COALESCE($5, assignment_group),
+				snow_resolved_at = NULL,
+				snow_state_synced_at = NOW(),
+				auto_reopen_count = auto_reopen_count + 1,
+				last_auto_reopened_at = NOW()
+			WHERE id = $1::uuid
+		`, t.IncidentID, update.State, stateLabel, update.Priority, update.AssignmentGroup); err != nil {
+			return err
+		}
+
+		st := alertStates[t.AlertID]
+		meta := map[string]any{
+			"snow_sys_id":         snowSysID,
+			"previous_snow_state": t.PrevSnowState,
+			"new_snow_state":      update.State,
+			"new_snow_label":      stateLabel,
+			"active_alert_count":  activeAlertCount,
+			"trigger_source":      triggerSource,
+			"attempt":             t.PrevCount + 1,
+		}
+		if t.IncNumber != nil && *t.IncNumber != "" {
+			meta["incident_number"] = *t.IncNumber
+		}
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       t.AlertID,
+			EventType:     model.AuditSnowIncidentReopened,
+			ActorType:     model.ActorSystem,
+			ActorLogin:    "system",
+			PreviousState: &st,
+			NewState:      &st,
+			Comment:       model.StringPtrOrNil(workNote),
+			Metadata:      meta,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// UpsertTeamAssignmentGroup records a learned Prometheus team -> ServiceNow assignment group mapping.
+func (r *ServiceNowRepository) UpsertTeamAssignmentGroup(ctx context.Context, team, assignmentGroup string, op auth.OperatorContext) error {
+	cleanTeam := strings.TrimSpace(team)
+	cleanGroup := strings.TrimSpace(assignmentGroup)
+	if cleanTeam == "" || cleanGroup == "" {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO team_assignment_group_mappings (team, assignment_group, updated_by, updated_by_email)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (team) DO UPDATE
+		SET assignment_group = EXCLUDED.assignment_group,
+			updated_by = EXCLUDED.updated_by,
+			updated_by_email = EXCLUDED.updated_by_email,
+			updated_at = NOW()
+	`, cleanTeam, cleanGroup, op.Login, model.StringPtrOrNil(op.Email))
+	return err
+}
+
+// LookupTeamAssignmentGroup looks up the learned ServiceNow assignment group for a Prometheus team label.
+func (r *ServiceNowRepository) LookupTeamAssignmentGroup(ctx context.Context, team string) (string, error) {
+	cleanTeam := strings.TrimSpace(team)
+	if cleanTeam == "" {
+		return "", nil
+	}
+	var group string
+	err := r.pool.QueryRow(ctx, `
+		SELECT assignment_group
+		FROM team_assignment_group_mappings
+		WHERE team = $1
+	`, cleanTeam).Scan(&group)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(group), nil
+}
+
+// ListTeamAssignmentGroups returns all learned team -> assignment_group mappings.
+func (r *ServiceNowRepository) ListTeamAssignmentGroups(ctx context.Context) (map[string]string, error) {
+	out := make(map[string]string)
+	rows, err := r.pool.Query(ctx, `
+		SELECT team, assignment_group
+		FROM team_assignment_group_mappings
+		ORDER BY team ASC
+	`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var team, group string
+		if scanErr := rows.Scan(&team, &group); scanErr != nil {
+			return out, scanErr
+		}
+		if strings.TrimSpace(team) != "" && strings.TrimSpace(group) != "" {
+			out[strings.TrimSpace(team)] = strings.TrimSpace(group)
+		}
+	}
+	return out, rows.Err()
 }
 
 func getIncidentByAlertTx(ctx context.Context, tx pgx.Tx, alertID string) (*model.ServiceNowIncident, error) {
@@ -1537,4 +2156,135 @@ func getIncidentByAlertTx(ctx context.Context, tx pgx.Tx, alertID string) (*mode
 	inc.CallerMode = model.SnowCallerMode(callerModeStr)
 	inc.CallerResolutionStatus = model.SnowCallerResolutionStatus(callerResStr)
 	return &inc, nil
+}
+
+func claimIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, op auth.OperatorContext, idem IdempotencyMeta) ([]byte, error) {
+	if strings.TrimSpace(idem.Key) == "" {
+		return nil, nil
+	}
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO idempotency_keys (
+			idempotency_key, endpoint, request_hash, actor_login, status, expires_at
+		)
+		VALUES ($1, $2, $3, $4, 'in_progress', NOW() + INTERVAL '24 hours')
+		ON CONFLICT (idempotency_key) DO NOTHING
+	`, idem.Key, idem.Endpoint, idem.RequestHash, op.Login)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to claim idempotency key.").WithCause(err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil, nil
+	}
+
+	var storedEndpoint, storedHash, status string
+	var responseBody []byte
+	var updatedAt, expiresAt time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT endpoint, request_hash, status, response_body, updated_at, expires_at
+		FROM idempotency_keys
+		WHERE idempotency_key = $1
+		FOR UPDATE
+	`, idem.Key).Scan(&storedEndpoint, &storedHash, &status, &responseBody, &updatedAt, &expiresAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if _, insErr := tx.Exec(ctx, `
+				INSERT INTO idempotency_keys (
+					idempotency_key, endpoint, request_hash, actor_login, status, expires_at
+				)
+				VALUES ($1, $2, $3, $4, 'in_progress', NOW() + INTERVAL '24 hours')
+			`, idem.Key, idem.Endpoint, idem.RequestHash, op.Login); insErr != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to insert idempotency key.").WithCause(insErr)
+			}
+			return nil, nil
+		}
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock idempotency key.").WithCause(err)
+	}
+
+	if !expiresAt.After(time.Now()) {
+		if _, err := tx.Exec(ctx, `
+			UPDATE idempotency_keys
+			SET endpoint = $2,
+				request_hash = $3,
+				actor_login = $4,
+				status = 'in_progress',
+				response_status = NULL,
+				response_body = NULL,
+				expires_at = NOW() + INTERVAL '24 hours'
+			WHERE idempotency_key = $1
+		`, idem.Key, idem.Endpoint, idem.RequestHash, op.Login); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to reclaim expired idempotency key.").WithCause(err)
+		}
+		return nil, nil
+	}
+
+	if storedEndpoint != idem.Endpoint || storedHash != idem.RequestHash {
+		return nil, apierror.New(http.StatusConflict, apierror.CodeIdempotencyKeyConflict,
+			"Idempotency-Key was already used for a different request payload or endpoint.")
+	}
+
+	if status == "completed" && len(responseBody) > 0 {
+		return responseBody, nil
+	}
+
+	if time.Since(updatedAt) <= stalePendingThreshold {
+		return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentCreationInProgress,
+			"A request with this Idempotency-Key is already in progress.")
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE idempotency_keys
+		SET status = 'in_progress',
+			actor_login = $2,
+			response_status = NULL,
+			response_body = NULL,
+			expires_at = NOW() + INTERVAL '24 hours'
+		WHERE idempotency_key = $1
+	`, idem.Key, op.Login); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to refresh stale idempotency key.").WithCause(err)
+	}
+	return nil, nil
+}
+
+func lockIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, key string) error {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	var dummy string
+	err := tx.QueryRow(ctx, `SELECT idempotency_key FROM idempotency_keys WHERE idempotency_key = $1 FOR UPDATE`, key).Scan(&dummy)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock idempotency key.").WithCause(err)
+	}
+	return nil
+}
+
+func completeIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, key string, statusCode int, payload any) error {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to encode idempotent response.").WithCause(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE idempotency_keys
+		SET status = 'completed',
+			response_status = $2,
+			response_body = $3::jsonb,
+			expires_at = NOW() + INTERVAL '24 hours'
+		WHERE idempotency_key = $1
+	`, key, statusCode, string(raw)); err != nil {
+		return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to persist idempotency response.").WithCause(err)
+	}
+	return nil
+}
+
+func releaseIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, key string) error {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM idempotency_keys WHERE idempotency_key = $1 AND status = 'in_progress'`, key); err != nil {
+		return err
+	}
+	return nil
 }

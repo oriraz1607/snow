@@ -46,6 +46,7 @@ func NewAPIRouter(
 
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/acknowledge", alerts.Acknowledge)
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/unacknowledge", alerts.Unacknowledge)
+			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/bulk/dismiss", alerts.BulkDismiss)
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/dismiss", alerts.Dismiss)
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/reopen", alerts.Reopen)
 			op.With(auth.RequirePermission(auth.PermAlertsTriage)).Post("/alerts/{alert_id}/notes", alerts.AddNote)
@@ -64,6 +65,9 @@ func NewAPIRouter(
 
 		v1.With(auth.ServiceNowWebhookMiddleware(cfg.SnowInboundWebhookSecret, cfg.AlertmanagerMaxPayloadBytes)).
 			Post("/webhooks/servicenow", webhooks.ServiceNow)
+
+		v1.With(auth.ServiceNowWebhookMiddleware(cfg.SnowInboundWebhookSecret, cfg.AlertmanagerMaxPayloadBytes)).
+			Get("/integrations/servicenow/incidents/{snow_sys_id}/active-status", snow.IncidentActiveStatus)
 	})
 
 	return r

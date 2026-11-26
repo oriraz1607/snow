@@ -47,7 +47,11 @@ type Config struct {
 	SnowPollInterval             time.Duration
 	SnowAutoPostResolvedNote     bool
 	SnowNoteWorkerInterval       time.Duration
+	SnowAutoReopenCooldown       time.Duration
+	SnowAutoReopenMaxAttempts    int
 	AllowRetrospectiveIncident   bool
+	TLSCertFile                  string
+	TLSKeyFile                   string
 }
 
 // Load parses and validates environment variables into Config.
@@ -76,6 +80,8 @@ func Load() (*Config, error) {
 		DefaultAssignmentGroup:      strings.TrimSpace(os.Getenv("SNOW_DEFAULT_ASSIGNMENT_GROUP")),
 		DefaultCategory:             envOrDefault("SNOW_DEFAULT_CATEGORY", "Infrastructure"),
 		SnowInboundWebhookSecret:    os.Getenv("SNOW_INBOUND_WEBHOOK_SECRET"),
+		TLSCertFile:                 strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
+		TLSKeyFile:                  strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
 	}
 
 	var err error
@@ -112,6 +118,18 @@ func Load() (*Config, error) {
 	}
 	cfg.SnowNoteWorkerInterval = time.Duration(noteWorkerSec) * time.Second
 
+	reopenCooldownSec, err := envInt64("SNOW_AUTO_REOPEN_COOLDOWN_SECONDS", 300, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SnowAutoReopenCooldown = time.Duration(reopenCooldownSec) * time.Second
+
+	reopenMaxAttempts, err := envInt32("SNOW_AUTO_REOPEN_MAX_ATTEMPTS", 3, 0)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SnowAutoReopenMaxAttempts = int(reopenMaxAttempts)
+
 	if cfg.SnowAutoPostResolvedNote, err = envBool("SNOW_AUTO_POST_RESOLVED_NOTE", true); err != nil {
 		return nil, err
 	}
@@ -146,6 +164,10 @@ func (c *Config) validate() error {
 	}
 	if c.DefaultCallerSysID == "" {
 		return fmt.Errorf("SNOW_DEFAULT_NOC_CALLER_SYS_ID is required")
+	}
+
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return fmt.Errorf("TLS_CERT_FILE and TLS_KEY_FILE must both be set when configuring in-process TLS")
 	}
 
 	switch c.SnowAuthMode {
@@ -185,7 +207,10 @@ func (c Config) LogValue() slog.Value {
 		slog.String("default_caller_username", c.DefaultCallerUsername),
 		slog.Duration("snow_http_timeout", c.SnowHTTPTimeout),
 		slog.Duration("snow_poll_interval", c.SnowPollInterval),
+		slog.Duration("snow_auto_reopen_cooldown", c.SnowAutoReopenCooldown),
+		slog.Int("snow_auto_reopen_max_attempts", c.SnowAutoReopenMaxAttempts),
 		slog.Bool("snow_auto_post_resolved_note", c.SnowAutoPostResolvedNote),
+		slog.Bool("tls_enabled", c.TLSCertFile != "" && c.TLSKeyFile != ""),
 	)
 }
 

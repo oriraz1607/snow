@@ -46,10 +46,13 @@ All credentials are supplied strictly via environment variables (injected at run
 | `SNOW_DEFAULT_NOC_CALLER_USERNAME` | No | `noc` | Display/fallback username for logs and UI labels. |
 | `SNOW_DEFAULT_ASSIGNMENT_GROUP` | No | `""` | Fallback `assignment_group` name or `sys_id` when alert labels do not specify one. |
 | `SNOW_DEFAULT_CATEGORY` | No | `Infrastructure` | Default `incident.category` choice value (`[UNVERIFIED]` — confirm choice list on target instance). |
-| `SNOW_INBOUND_WEBHOOK_SECRET` | If push sync | — | Shared HMAC-SHA256 secret authenticating `POST /api/v1/webhooks/servicenow`. |
+| `SNOW_INBOUND_WEBHOOK_SECRET` | If push sync / BR | — | Shared secret (`X-SNOW-Signature-256` HMAC-SHA256 or Bearer token) authenticating `POST /api/v1/webhooks/servicenow` and `GET /api/v1/integrations/servicenow/incidents/{snow_sys_id}/active-status`. |
 | `SNOW_HTTP_TIMEOUT_SECONDS` | No | `15` | Per-request HTTP timeout to ServiceNow Table API. |
 | `SNOW_POLL_INTERVAL_SECONDS` | No | `120` | Background poller interval for syncing open linked incidents (`snow_state IN (1, 2, 3)`). |
+| `SNOW_AUTO_REOPEN_COOLDOWN_SECONDS` | No | `300` | Per-incident cooldown window before re-attempting auto-reopen when a ticket moves to `6 (Resolved)` while alerts remain active. |
+| `SNOW_AUTO_REOPEN_MAX_ATTEMPTS` | No | `3` | Maximum automatic reopens (`6 → 2`) allowed per linked incident before leaving `snow_state = 6` and surfacing the UI warning badge. |
 | `SNOW_AUTO_POST_RESOLVED_NOTE` | No | `true` | If `true`, posts an informational work note to ServiceNow when a linked alert resolves while the ticket is still open. |
+| `SNOW_NOTE_WORKER_INTERVAL_SECONDS` | No | `15` | Background interval for scanning resolved alerts needing an automatic ServiceNow resolution work note. |
 
 ---
 
@@ -70,22 +73,24 @@ flowchart TD
     Mode -->|Yes| UseNocExplicit["caller_sys_id = SNOW_DEFAULT_NOC_CALLER_SYS_ID\nstatus = 'generic_noc_selected'"]
 
     Mode -->|No: sso_user| HasEmail{"operator.Email\nnon-empty?"}
-    HasEmail -->|No| FallbackNoEmail["Fallback to SNOW_DEFAULT_NOC_CALLER_SYS_ID\nstatus = 'fallback_noc'\nreason = 'Grafana session has no email'"]
+    HasEmail -->|No| FallbackUser["Lookup by user_name=<operator.Login>\n(cache key user:<login>)"]
 
     HasEmail -->|Yes| CacheCheck["Check snow_user_cache\nWHERE email = lower(operator.Email)\nAND expires_at > NOW()"]
     CacheCheck --> CacheHit{"Valid cache hit?"}
     CacheHit -->|Yes & snow_sys_id != NULL| UseMatched["caller_sys_id = cached.snow_sys_id\nstatus = 'sso_matched'"]
-    CacheHit -->|Yes & snow_sys_id == NULL| FallbackCachedMiss["Fallback to SNOW_DEFAULT_NOC_CALLER_SYS_ID\nstatus = 'fallback_noc'\nreason = 'Cached negative lookup'"]
+    CacheHit -->|Yes & snow_sys_id == NULL| FallbackUser
 
     CacheHit -->|No| QuerySnow["GET /api/now/table/sys_user?\nsysparm_query=email=<email>^active=true\n&sysparm_fields=sys_id,user_name,email&sysparm_limit=1\n(timeout: 3s)"]
     QuerySnow --> QueryOK{"200 OK &\nlen(result) == 1?"}
     QueryOK -->|Yes| CachePos["Upsert snow_user_cache (TTL 6h)\ncaller_sys_id = result[0].sys_id\nstatus = 'sso_matched'"]
-    QueryOK -->|200 OK & len == 0| CacheNeg["Upsert snow_user_cache (NULL, TTL 5m)\nFallback to SNOW_DEFAULT_NOC_CALLER_SYS_ID\nstatus = 'fallback_noc'"]
+    QueryOK -->|200 OK & len == 0| CacheNeg["Upsert snow_user_cache (NULL, TTL 5m)\nProceed to user_name=<operator.Login>"]
+    CacheNeg --> FallbackUser
     QueryOK -->|HTTP Error / Timeout| FallbackErr["Do NOT cache error\nFallback to SNOW_DEFAULT_NOC_CALLER_SYS_ID\nstatus = 'fallback_noc'\nreason = 'sys_user lookup failed/timed out'"]
 ```
 
+- **Login (`user_name`) Fallback:** If `operator.Email` is empty OR email lookup finds no active `sys_user` (definite miss), `CallerResolver` automatically falls back to `LookupUserByUsername(operator.Login)` (cached in `snow_user_cache` under `user:<login>`) before falling back to `SNOW_DEFAULT_NOC_CALLER_SYS_ID`.
 - **Secondary Safety Net:** If `POST /api/now/table/incident` with the matched `caller_sys_id` is rejected by a ServiceNow Business Rule/ACL with `400`/`403` referencing `caller_id`, the client retries **once** with `SNOW_DEFAULT_NOC_CALLER_SYS_ID`, sets `caller_resolution_status = 'fallback_noc'`, and appends the operator's SSO identity to `work_notes`.
-- **Auditability:** Regardless of whether `sso_matched`, `generic_noc_selected`, or `fallback_noc` is used, `work_notes` always records `Initiated in Grafana by: <operator.Name> (<operator.Email>)`.
+- **Auditability:** Regardless of whether `sso_matched`, `generic_noc_selected`, or `fallback_noc` is used, `work_notes` always records `[Grafana NOC] Initiated in Grafana by: <Name> (<Login>, <Email>).` (omitting empty fields cleanly).
 - **Note on `opened_by` vs `caller_id`:** By default, ServiceNow sets `opened_by` to the authenticated API service account unless an instance ACL/script permits overriding `opened_by` (`[UNVERIFIED]` — confirm on target ServiceNow instance whether `opened_by` is writable by the service account; this design sets `caller_id` unconditionally and treats overriding `opened_by` as optional).
 
 ---
@@ -96,7 +101,7 @@ flowchart TD
 
 **Request URL:**
 ```http
-POST ${SNOW_INSTANCE_URL}/api/now/table/incident?sysparm_fields=sys_id,number,state,impact,urgency,priority,assignment_group,caller_id,opened_at,sys_updated_on&sysparm_display_value=all
+POST ${SNOW_INSTANCE_URL}/api/now/table/incident?sysparm_fields=sys_id,number,state,impact,urgency,priority,assignment_group,caller_id,opened_at,sys_updated_on&sysparm_display_value=all&sysparm_input_display_value=true
 Authorization: Bearer <access_token>
 Accept: application/json
 Content-Type: application/json
@@ -127,10 +132,10 @@ Content-Type: application/json
 | `description` | Operator-edited modal input; default structured summary of alert timestamps, labels, annotations, `generator_url`, `runbook_url`, and Grafana deep link. | Gives responders full context without switching tools. |
 | `impact` | `"1"` (High), `"2"` (Medium), `"3"` (Low). Default derived from `alerts.severity` (`critical`→`1`, `warning`→`2`, `info`/`unknown`→`3`). | OOB ServiceNow choice integers (serialized as strings or ints). |
 | `urgency` | `"1"` (High), `"2"` (Medium), `"3"` (Low). Default matches `impact`. | ServiceNow Data Lookup Rules auto-calculate read-only `priority` (`1`–`5`). |
-| `assignment_group` | Operator-selected group; pre-filled from `labels["assignment_group"]` → `labels["team"]` → `SNOW_DEFAULT_ASSIGNMENT_GROUP`. | Accepts group `sys_id` or exact display name (when `sysparm_input_display_value=true` or resolved `sys_id`). |
+| `assignment_group` | Operator-selected group; pre-selected from learned `team_assignment_group_mappings[labels["team"]]` (only when Prometheus `labels["team"]` is mapped — never blindly copied) → `labels["assignment_group"]` → `SNOW_DEFAULT_ASSIGNMENT_GROUP`. | Accepts group `sys_id` or exact display name (sent with `sysparm_input_display_value=true`). Creating an incident for alert(s) sharing a non-empty Prometheus `labels["team"]` persists the learned mapping in PostgreSQL. |
 | `category` | Operator-selected category; default `SNOW_DEFAULT_CATEGORY`. | `[UNVERIFIED]` — confirm exact valid choice values in target SNOW instance (`sys_choice` table for `incident.category`). |
 | `caller_id` | Resolved `sys_user.sys_id` (from SSO email) or `SNOW_DEFAULT_NOC_CALLER_SYS_ID`. | Always populated with a valid `sys_id`. |
-| `correlation_id` | `alerts.id` (UUID string of this specific alert episode). | Primary idempotency & deduplication key in ServiceNow. |
+| `correlation_id` | `alerts.id` for single-alert creation, or `PrimaryAlertID` (lexicographically smallest selected alert UUID) for bulk creation. | Primary idempotency & deduplication key in ServiceNow. |
 | `correlation_display` | Static `"Grafana NOC Alert Manager"`. | Identifies the originating integration in ServiceNow UI. |
 | `contact_type` | Static `"monitoring"` (or `"event"` — `[UNVERIFIED]` confirm allowed `contact_type` choice value on target SNOW instance). | Optional; omit if restricted by instance choice policy. |
 | `work_notes` | Operator note + Grafana operator identity + fallback explanation (if `fallback_noc`). | Written to internal Activity Stream (not customer-visible `comments`). |
@@ -197,6 +202,30 @@ Content-Type: application/json
 
 ---
 
+### 4.6 Bulk Multi-Alert Incident Creation & Linking (`POST /api/v1/servicenow/incidents/bulk`)
+
+Operators can select between `1` and `50` alerts (`firing` or `acknowledged`, without an existing active/pending incident) and open a single ServiceNow incident covering all of them:
+
+1. **Phase 1 — Deterministic Reservation & Auto-Ack (`ReserveBulkIncidentCreation`):**
+   - Claims `Idempotency-Key` in `idempotency_keys` (if supplied), deduplicates and sorts `alert_ids` lexicographically, and sets `PrimaryAlertID = sortedIDs[0]`.
+   - Locks all selected `alerts` in `ORDER BY id ASC FOR UPDATE`. Rejects missing alerts (`404`) or alerts not in `firing`/`acknowledged` (`409 INVALID_STATE_TRANSITION`).
+   - If any selected alert is `firing`, verifies `noc-alert-manager-app.alerts:triage` (`403 FORBIDDEN_RBAC` if absent) and auto-acknowledges it inside Tx 1 (`state = 'acknowledged'`, `version += 1`, `alert_acknowledged` audit event with `auto_acknowledged_by_incident: true`).
+   - Locks existing `servicenow_incidents` rows (`ORDER BY alert_id ASC FOR UPDATE`), rejecting if any alert is already `created`/`linked` (`409 INCIDENT_ALREADY_LINKED`) or non-stale `pending` (`409 INCIDENT_CREATION_IN_PROGRESS`).
+   - Collects all candidate correlation IDs across every alert with a prior `failed` or stale `pending` row (including `a.ID` and prior `snow_correlation_id` values from `alert_audit_log`), reserves/updates `pending` rows in `servicenow_incidents`, and logs `snow_incident_requested` (including `"snow_correlation_id": PrimaryAlertID`), then commits Tx 1.
+2. **Phase 2 — Single Outbound ServiceNow Creation (`CreateBulkIncident`):**
+   - Resolves caller via `CallerResolver` (SSO + `noc` fallback).
+   - If any alert in the batch had a prior `failed` or stale `pending` row, checks `FindIncidentByCorrelationID` across every candidate correlation ID before issuing `POST /api/now/table/incident` with `correlation_id = PrimaryAlertID` and a combined description listing every included alert (`formatBulkDefaultDescription`).
+   - Applies the same one-time `caller_id` rejection fallback to `SNOW_DEFAULT_NOC_CALLER_SYS_ID`.
+3. **Phase 3 — Bulk Finalization (`FinalizeBulkIncidentCreated` / `FinalizeBulkIncidentFailed`):**
+   - Locks `idempotency_keys` then all selected `alerts` in `ORDER BY id ASC FOR UPDATE`.
+   - On success, updates the primary alert's `servicenow_incidents` row to `sync_status = 'created'` (`snow_incident_created`) and all sibling alerts' rows to `sync_status = 'linked'` (`snow_incident_linked`), all pointing to the same `snow_sys_id`, `incident_number`, and `incident_url`, and persists the `201` response in `idempotency_keys`.
+   - On failure, marks every reserved row `sync_status = 'failed'` (`snow_incident_failed`) and releases any `in_progress` idempotency claim while keeping all alerts `acknowledged` for safe retry.
+4. **Sibling-Aware Sync & Resolution Notes:**
+   - Manual `/sync` (`UpdateIncidentForAlert`) acquires canonical row locks across all sibling `alerts` (`ORDER BY id ASC FOR UPDATE OF a`) and `servicenow_incidents` (`ORDER BY alert_id ASC FOR UPDATE`) sharing `snow_sys_id` and records `snow_state_synced` audit rows for every updated sibling.
+   - The resolution-note worker checks remaining active siblings on `snow_sys_id`: while any sibling remains `firing`/`acknowledged`, it posts a partial-recovery progress note instructing ServiceNow to keep the ticket open; once all linked alerts resolve, it posts a consolidated recovery/closure nudge and stamps `resolution_note_posted_at` across all resolved pending rows.
+
+---
+
 ## 5. Bi-Directional & Link-Back State Synchronization
 
 To guarantee the NOC console always knows whether the engineering team has resolved a ServiceNow ticket — especially after an alert stops firing — the design combines **real-time push (webhook)** with a **self-healing background poller**.
@@ -223,7 +252,7 @@ Configure an asynchronous **ServiceNow Business Rule** (after update on `inciden
 ```
 - **Go API Processing:**
   1. Verifies HMAC signature with `hmac.Equal`.
-  2. Finds all `servicenow_incidents` matching `snow_sys_id = $1` (handles both newly created and manually linked alerts).
+  2. Locks all linked `alerts` (`ORDER BY a.id ASC FOR UPDATE OF a`) and then all `servicenow_incidents` matching `snow_sys_id = $1` (`ORDER BY s.alert_id ASC FOR UPDATE`), atomically updating newly created, manually linked, and bulk-linked sibling alerts.
   3. Updates `snow_state`, `snow_state_label`, `priority`, `assignment_group`, `snow_resolved_at`, `snow_closed_at`, `snow_state_synced_at = NOW()`.
   4. Inserts `snow_state_synced` into `alert_audit_log` (recording previous → new SNOW state and `updated_by` / `close_notes`).
   5. **Drift Reconciliation:**
@@ -235,11 +264,12 @@ Configure an asynchronous **ServiceNow Business Rule** (after update on `inciden
 ServiceNow Business Rules can be skipped, misconfigured, or fail during transient network blips. Therefore, a lightweight background goroutine in the Go API runs every `SNOW_POLL_INTERVAL_SECONDS` (default `120s`, using a PostgreSQL advisory lock `pg_try_advisory_lock` so only one API replica polls at a time):
 1. Queries up to `50` oldest-synced open tickets using `idx_snow_incidents_open_sync`:
    ```sql
-   SELECT DISTINCT snow_sys_id
+   SELECT DISTINCT ON (snow_sys_id) snow_sys_id
    FROM servicenow_incidents
    WHERE sync_status IN ('created', 'linked')
      AND snow_state IN (1, 2, 3)
-   ORDER BY snow_state_synced_at ASC NULLS FIRST
+     AND snow_sys_id IS NOT NULL
+   ORDER BY snow_sys_id, snow_state_synced_at ASC NULLS FIRST
    LIMIT 50;
    ```
 2. Fetches them in a **single batched Table API request**:
@@ -248,6 +278,21 @@ ServiceNow Business Rules can be skipped, misconfigured, or fail during transien
    ```
 3. Updates `servicenow_incidents` rows and appends `snow_state_synced` audit events only when `snow_state` or `assignment_group` actually changed.
 4. Updates Prometheus gauge `noc_alerts_resolved_with_open_snow_incident` so NOC leads can even alert on stale unclosed tickets!
+
+### 5.3 Preventing Premature Ticket Closure While Alerts Are Active
+
+Three complementary safeguards protect against resolving or closing ServiceNow incidents while linked Prometheus alerts are still firing/acknowledged:
+
+1. **Before-Update ServiceNow Business Rule (Checked-In Artifact Only):**
+   - [`docs/servicenow/prevent-close-active-alert-br.js`](../servicenow/prevent-close-active-alert-br.js) is a ready-to-deploy `before` update Business Rule on `incident` (scoped to `correlation_display == 'Grafana NOC Alert Manager'` when `state` changes to `6` or `7`).
+   - Calls `GET /api/v1/integrations/servicenow/incidents/{snow_sys_id}/active-status` authenticated with `Authorization: Bearer <SNOW_INBOUND_WEBHOOK_SECRET>` (from ServiceNow System Property `x_grafana_noc.webhook_secret`) with a `3000ms` timeout.
+   - Fails **open** on timeout/5xx/missing property and supports an `admin` / `x_grafana_noc.override_role` escape hatch so engineers are never locked out during API outages.
+   - Calls `current.setAbortAction(true)` + `gs.addErrorMessage(...)` when `has_active_alerts === true`.
+2. **Backend Auto-Reopen Safety Net (`6 → 2`):**
+   - Whenever the inbound webhook or drift poller detects a linked incident transitioned to `6 (Resolved)` while one or more linked alerts remain `firing` or `acknowledged`, the Go API PATCHes `incident` back to `2 (In Progress)` with an attributed `[Grafana NOC] Auto-reopened: ...` work note and records `snow_incident_reopened` audit events.
+   - Enforces per-incident concurrency serialization, a configurable cooldown (`SNOW_AUTO_REOPEN_COOLDOWN_SECONDS`, default `300s`), and an attempt cap (`SNOW_AUTO_REOPEN_MAX_ATTEMPTS`, default `3`) to prevent infinite reopen loops. Tickets in `7 (Closed)` or `8 (Canceled)` are never auto-reopened.
+3. **Grafana Closed-Ticket Warning Fallback:**
+   - When a ticket moves to `7 (Closed)` / `8 (Canceled)` or auto-reopen is skipped/fails while an alert remains active, `GET /api/v1/alerts` surfaces `summary.active_closed_ticket > 0` and the **Acknowledged** KPI card displays a red warning badge visible from the default **Firing** view.
 
 ---
 

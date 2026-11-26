@@ -20,11 +20,14 @@ import {
   ServiceNowMetadataResponse,
 } from '../types/api';
 import {
+  formatDurationBetween,
+  formatDurationSeconds,
   formatRelativeTime,
   formatUtcTimestamp,
   getAlertEnvironment,
   getAlertSite,
   getAlertTeam,
+  getOpenIncidentDismissBlockReason,
 } from '../utils/format';
 import {
   displayStateColor,
@@ -86,6 +89,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   const [detail, setDetail] = useState<AlertDetail | null>(null);
   const [history, setHistory] = useState<AlertHistoryResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMoreEpisodes, setLoadingMoreEpisodes] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -100,7 +104,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
     try {
       const [detailResp, historyResp] = await Promise.all([
         alertApi.getAlert(id, signal),
-        alertApi.getAlertHistory(id, signal),
+        alertApi.getAlertHistory(id, signal, { limit: 20, offset: 0 }),
       ]);
       if (!signal?.aborted) {
         setDetail(detailResp);
@@ -177,9 +181,42 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
     }
   };
 
+  const handleLoadMoreEpisodes = async () => {
+    if (!detail || !history || loadingMoreEpisodes || !history.has_more) {
+      return;
+    }
+    setLoadingMoreEpisodes(true);
+    try {
+      const nextResp = await alertApi.getAlertHistory(detail.id, undefined, {
+        limit: 20,
+        offset: history.previous_episodes.length,
+      });
+      setHistory((prev) => {
+        if (!prev) {
+          return nextResp;
+        }
+        const seen = new Set(prev.previous_episodes.map((ep) => ep.id));
+        const appended = (nextResp.previous_episodes ?? []).filter((ep) => !seen.has(ep.id));
+        return {
+          ...prev,
+          previous_episodes: [...prev.previous_episodes, ...appended],
+          previous_episodes_total:
+            nextResp.previous_episodes_total ?? prev.previous_episodes_total,
+          has_more: nextResp.has_more ?? false,
+        };
+      });
+    } finally {
+      setLoadingMoreEpisodes(false);
+    }
+  };
+
   const inc = detail?.servicenow_incident ?? null;
   const hasLinkedIncident =
     Boolean(inc) && (inc?.sync_status === 'created' || inc?.sync_status === 'linked');
+  const openIncidentDismissReason = detail ? getOpenIncidentDismissBlockReason(detail) : undefined;
+  const totalPreviousEpisodes =
+    history?.previous_episodes_total ??
+    Math.max(history?.previous_episodes.length ?? 0, detail?.previous_episode_count ?? 0);
 
   const resolvedNudgeText = detail
     ? `Alert resolved in Prometheus at ${formatUtcTimestamp(detail.resolved_at || detail.ends_at)}. Please verify recovery and resolve/close this incident.`
@@ -227,6 +264,11 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
               <span className={styles.metaChip}>env: {getAlertEnvironment(detail)}</span>
             )}
             {getAlertSite(detail) && <span className={styles.metaChip}>site: {getAlertSite(detail)}</span>}
+            {detail.dismissed_by && (
+              <span className={styles.metaText} data-testid="drawer-dismissed-by">
+                Dismissed by <strong>{detail.dismissed_by}</strong> ({formatRelativeTime(detail.dismissed_at)} ago)
+              </span>
+            )}
             {detail.acknowledged_by && (
               <span className={styles.metaText}>
                 Acked by <strong>{detail.acknowledged_by}</strong> ({formatRelativeTime(detail.acknowledged_at)} ago)
@@ -435,8 +477,59 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                 Unacknowledge
               </GatedButton>
               <GatedButton
+                allowed={canTriage && !openIncidentDismissReason}
+                disabledReason={
+                  !canTriage
+                    ? DISABLED_TRIAGE_REASON
+                    : openIncidentDismissReason || DISABLED_TRIAGE_REASON
+                }
+                variant="destructive"
+                fill="outline"
+                size="sm"
+                onClick={() => onOpenDismiss(detail)}
+              >
+                Dismiss
+              </GatedButton>
+            </div>
+          )}
+
+          {detail.state === 'acknowledged' && hasLinkedIncident && (
+            <div className={styles.pinnedBar} data-testid="drawer-action-bar">
+              <GatedButton
+                allowed={canWriteIncidents}
+                disabledReason={DISABLED_INCIDENT_REASON}
+                variant="primary"
+                size="sm"
+                onClick={() => onOpenWorkNote(detail)}
+              >
+                Post Work Note
+              </GatedButton>
+              <GatedButton
+                allowed={canWriteIncidents}
+                disabledReason={DISABLED_INCIDENT_REASON}
+                variant="secondary"
+                size="sm"
+                disabled={syncing}
+                onClick={handleManualSync}
+              >
+                {syncing ? 'Refreshing...' : 'Refresh Status'}
+              </GatedButton>
+              <GatedButton
                 allowed={canTriage}
                 disabledReason={DISABLED_TRIAGE_REASON}
+                variant="secondary"
+                size="sm"
+                onClick={() => onOpenAddNote(detail)}
+              >
+                Add Note
+              </GatedButton>
+              <GatedButton
+                allowed={canTriage && !openIncidentDismissReason}
+                disabledReason={
+                  !canTriage
+                    ? DISABLED_TRIAGE_REASON
+                    : openIncidentDismissReason || DISABLED_TRIAGE_REASON
+                }
                 variant="destructive"
                 fill="outline"
                 size="sm"
@@ -468,8 +561,12 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                 Add Note
               </GatedButton>
               <GatedButton
-                allowed={canTriage}
-                disabledReason={DISABLED_TRIAGE_REASON}
+                allowed={canTriage && !openIncidentDismissReason}
+                disabledReason={
+                  !canTriage
+                    ? DISABLED_TRIAGE_REASON
+                    : openIncidentDismissReason || DISABLED_TRIAGE_REASON
+                }
                 variant="destructive"
                 fill="outline"
                 size="sm"
@@ -507,7 +604,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
               onChangeTab={() => setActiveTab('audit')}
             />
             <Tab
-              label={`Past Episodes (${history?.previous_episodes.length ?? detail.previous_episode_count})`}
+              label={`Previous Occurrences (${totalPreviousEpisodes})`}
               active={activeTab === 'episodes'}
               onChangeTab={() => setActiveTab('episodes')}
             />
@@ -553,6 +650,78 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                     ))}
                 </tbody>
               </table>
+
+              <div className={styles.prevOccurrencesCard} data-testid="drawer-previous-occurrences">
+                <div className={styles.prevOccurrencesHeader}>
+                  <h4 className={styles.subheading} style={{ margin: 0 }}>
+                    Previous Occurrences ({totalPreviousEpisodes})
+                  </h4>
+                  {(history?.previous_episodes.length ?? 0) > 0 && (
+                    <Button
+                      variant="secondary"
+                      fill="text"
+                      size="sm"
+                      onClick={() => setActiveTab('episodes')}
+                    >
+                      View full history →
+                    </Button>
+                  )}
+                </div>
+                {(history?.previous_episodes ?? []).length === 0 ? (
+                  <div className={styles.metaText}>
+                    No prior firings recorded for this alert fingerprint.
+                  </div>
+                ) : (
+                  <div className={styles.occurrenceList}>
+                    {(history?.previous_episodes ?? []).slice(0, 3).map((ep) => {
+                      const epDuration =
+                        typeof ep.duration_seconds === 'number'
+                          ? formatDurationSeconds(ep.duration_seconds)
+                          : formatDurationBetween(ep.starts_at, ep.resolved_at || ep.ends_at);
+                      return (
+                        <div key={ep.id} className={styles.occurrenceItem}>
+                          <div className={styles.occurrenceTop}>
+                            <div className={styles.occurrenceBadges}>
+                              <Badge text={stateLabel(ep.state)} color={stateColor(ep.state)} />
+                              <span className={styles.metaText}>{epDuration}</span>
+                            </div>
+                            <span className={styles.metaText}>{formatUtcTimestamp(ep.starts_at)}</span>
+                          </div>
+                          <div className={styles.occurrenceMeta}>
+                            {ep.acknowledged_by && <span>Acked by {ep.acknowledged_by}</span>}
+                            {ep.dismissed_by && (
+                              <span>
+                                Dismissed by {ep.dismissed_by}
+                                {ep.dismiss_reason ? ` (${ep.dismiss_reason})` : ''}
+                              </span>
+                            )}
+                            {ep.incident_number && (
+                              <span>
+                                {ep.incident_url ? (
+                                  <a href={ep.incident_url} target="_blank" rel="noreferrer">
+                                    {ep.incident_number} ↗
+                                  </a>
+                                ) : (
+                                  ep.incident_number
+                                )}{' '}
+                                ({ep.snow_state_label || 'Unknown'})
+                              </span>
+                            )}
+                            <Button
+                              variant="secondary"
+                              fill="text"
+                              size="sm"
+                              onClick={() => onSelectEpisodeId(ep.id)}
+                            >
+                              Open
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -671,40 +840,81 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
           )}
 
           {activeTab === 'episodes' && (
-            <div className={styles.tabBody}>
+            <div className={styles.tabBody} data-testid="drawer-episodes-tab">
               {(history?.previous_episodes ?? []).length === 0 ? (
                 <div className={styles.emptyTab}>No earlier episodes recorded for this fingerprint.</div>
               ) : (
-                <table className={styles.subTable}>
-                  <thead>
-                    <tr>
-                      <th>Started</th>
-                      <th>State</th>
-                      <th>Incident</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {history?.previous_episodes.map((ep) => (
-                      <tr key={ep.id}>
-                        <td>{formatUtcTimestamp(ep.starts_at)}</td>
-                        <td>
-                          <Badge text={stateLabel(ep.state)} color={stateColor(ep.state)} />
-                        </td>
-                        <td>
-                          {ep.incident_number
-                            ? `${ep.incident_number} (${ep.snow_state_label || 'Unknown'})`
-                            : '—'}
-                        </td>
-                        <td>
-                          <Button variant="secondary" fill="text" size="sm" onClick={() => onSelectEpisodeId(ep.id)}>
-                            Open
-                          </Button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <>
+                  <div className={styles.occurrenceList}>
+                    {history?.previous_episodes.map((ep) => {
+                      const epDuration =
+                        typeof ep.duration_seconds === 'number'
+                          ? formatDurationSeconds(ep.duration_seconds)
+                          : formatDurationBetween(ep.starts_at, ep.resolved_at || ep.ends_at);
+                      return (
+                        <div key={ep.id} className={styles.occurrenceItem}>
+                          <div className={styles.occurrenceTop}>
+                            <div className={styles.occurrenceBadges}>
+                              {ep.severity && (
+                                <Badge text={ep.severity} color={severityColor(ep.severity)} />
+                              )}
+                              <Badge text={stateLabel(ep.state)} color={stateColor(ep.state)} />
+                              <span className={styles.metaText}>Duration: {epDuration}</span>
+                            </div>
+                            <Button
+                              variant="secondary"
+                              fill="text"
+                              size="sm"
+                              onClick={() => onSelectEpisodeId(ep.id)}
+                            >
+                              Open
+                            </Button>
+                          </div>
+                          <div className={styles.metaText}>
+                            Started: {formatUtcTimestamp(ep.starts_at)}
+                            {ep.resolved_at ? ` · Resolved: ${formatUtcTimestamp(ep.resolved_at)}` : ''}
+                          </div>
+                          {(ep.acknowledged_by || ep.dismissed_by) && (
+                            <div className={styles.metaText}>
+                              {ep.acknowledged_by ? `Acked by ${ep.acknowledged_by}` : ''}
+                              {ep.acknowledged_by && ep.dismissed_by ? ' · ' : ''}
+                              {ep.dismissed_by
+                                ? `Dismissed by ${ep.dismissed_by}${ep.dismiss_reason ? ` — ${ep.dismiss_reason}` : ''}`
+                                : ''}
+                            </div>
+                          )}
+                          {ep.incident_number && (
+                            <div className={styles.metaText}>
+                              Ticket:{' '}
+                              {ep.incident_url ? (
+                                <a href={ep.incident_url} target="_blank" rel="noreferrer">
+                                  {ep.incident_number} ↗
+                                </a>
+                              ) : (
+                                ep.incident_number
+                              )}{' '}
+                              ({ep.snow_state_label || 'Unknown'})
+                              {ep.assignment_group ? ` · Group: ${ep.assignment_group}` : ''}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {history?.has_more && (
+                    <div className={styles.loadMoreRow}>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={loadingMoreEpisodes}
+                        data-testid="drawer-episodes-load-more"
+                        onClick={() => void handleLoadMoreEpisodes()}
+                      >
+                        {loadingMoreEpisodes ? 'Loading...' : 'Load more'}
+                      </Button>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -918,5 +1128,58 @@ const getStyles = (theme: GrafanaTheme2) => ({
     border-radius: ${theme.shape.radius.default};
     white-space: pre-wrap;
     font-size: ${theme.typography.bodySmall.fontSize};
+  `,
+  prevOccurrencesCard: css`
+    margin-top: ${theme.spacing(1)};
+    padding: ${theme.spacing(1.25)};
+    border: 1px solid ${theme.colors.border.weak};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.secondary};
+  `,
+  prevOccurrencesHeader: css`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+    margin-bottom: ${theme.spacing(1)};
+  `,
+  occurrenceList: css`
+    display: flex;
+    flex-direction: column;
+    gap: ${theme.spacing(1)};
+  `,
+  occurrenceItem: css`
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: ${theme.spacing(1)};
+    border: 1px solid ${theme.colors.border.weak};
+    border-radius: ${theme.shape.radius.default};
+    background: ${theme.colors.background.primary};
+  `,
+  occurrenceTop: css`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+    flex-wrap: wrap;
+  `,
+  occurrenceBadges: css`
+    display: inline-flex;
+    align-items: center;
+    gap: ${theme.spacing(0.75)};
+  `,
+  occurrenceMeta: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+    font-size: ${theme.typography.bodySmall.fontSize};
+    color: ${theme.colors.text.secondary};
+  `,
+  loadMoreRow: css`
+    display: flex;
+    justify-content: center;
+    padding-top: ${theme.spacing(0.5)};
   `,
 });

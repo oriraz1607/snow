@@ -97,6 +97,7 @@ Content-Type: `application/json`
 | `alerts[i].labels["severity"]` | Lowercased; fallback to `"unknown"` if absent. | `alerts.severity` |
 | `alerts[i].annotations` | JSON object (default `{}` if omitted). | `alerts.annotations` (`JSONB`) |
 | `alerts[i].generatorURL` | Optional string. | `alerts.generator_url` |
+| `alerts[i].labels["team"]` / `alert_fingerprint_teams` | On new episode insert (`insertNewFiringAlertTx` or direct `resolved` insert): if `labels["team"]` is non-empty, `assigned_team*` stays `NULL` (Prometheus label takes precedence); if absent, `lookupFingerprintTeamTx` copies `team`, `tagged_by`, `updated_at` from `alert_fingerprint_teams` matching `fingerprint`. | `alerts.assigned_team`, `alerts.assigned_team_by`, `alerts.assigned_team_at` |
 
 ---
 
@@ -148,6 +149,7 @@ flowchart TD
 | **Network reorder: `firing` repeat arrives *after* `resolved` for the same `(fingerprint, startsAt)`** | `FoundExact` finds the row in `state = 'resolved'`. Because `resolved` is terminal for that `(fingerprint, startsAt)`, the stale `firing` delivery is safely ignored instead of resurrecting a closed episode. |
 | **Alert resolves before NOC ever saw the initial `firing` webhook (e.g., short flapping alert during outage)** | `incoming.status == 'resolved'` with no prior row inserts a single `resolved` episode directly so historical audit accuracy is preserved without paging/cluttering the active `firing` queue. |
 | **Alert resolves while ServiceNow incident is still open (`snow_state IN (1, 2, 3)`)** | Transitions `alerts.state = 'resolved'` and records `resolved_at`. Immediately matches the `resolved_open_ticket` drift query. If `SNOW_AUTO_POST_RESOLVED_NOTE=true` and `resolution_note_posted_at IS NULL`, enqueues an **asynchronous** (non-blocking!) background task to post a work note to ServiceNow so webhook latency never depends on ServiceNow availability. |
+| **Alert re-fires after an operator previously tagged its team (`POST /api/v1/alerts/{id}/team`)** | Episode 2 still starts fresh (`state = 'firing'`, `acknowledged_by = NULL`, `version = 1`), but `lookupFingerprintTeamTx` (`alertmanager_repo.go`) checks `alert_fingerprint_teams` when `labels["team"]` is missing and copies `assigned_team`, `assigned_team_by`, and `assigned_team_at` onto the new episode automatically. If the new webhook now carries a Prometheus `team` label, the label takes precedence (`team_source = "label"`). |
 
 ---
 

@@ -34,6 +34,10 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	if err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Unable to query alert summary counts.").WithCause(err)
 	}
+	filterOptions, err := r.getFilterOptions(ctx)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Unable to query alert filter options.").WithCause(err)
+	}
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -44,7 +48,7 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	}
 	sortOrder := filter.Sort
 	if sortOrder == "" {
-		sortOrder = model.SortStartsAtDesc
+		sortOrder = model.SortSeverityDesc
 	}
 
 	where := make([]string, 0, 10)
@@ -65,10 +69,12 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 			stateClauses = append(stateClauses, fmt.Sprintf("a.state = ANY(%s::alert_state[])", ph))
 		}
 		if filter.NonActiveAcknowledged {
-			stateClauses = append(stateClauses, "(a.state = 'resolved' AND a.acknowledged_at IS NOT NULL)")
+			stateClauses = append(stateClauses, "(a.state = 'resolved' AND a.acknowledged_at IS NOT NULL AND a.dismissed_at IS NULL)")
 		}
 		where = append(where, "("+strings.Join(stateClauses, " OR ")+")")
 	}
+
+	where = append(where, "a.severity IN ('critical', 'warning')")
 
 	if len(filter.Severities) > 0 {
 		sevs := make([]string, len(filter.Severities))
@@ -76,7 +82,40 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 			sevs[i] = strings.ToLower(strings.TrimSpace(s))
 		}
 		ph := addArg(sevs)
-		where = append(where, fmt.Sprintf("LOWER(a.severity) = ANY(%s::text[])", ph))
+		where = append(where, fmt.Sprintf("a.severity = ANY(%s::text[])", ph))
+	}
+
+	if len(filter.Environments) > 0 {
+		ph := addArg(filter.Environments)
+		where = append(where, fmt.Sprintf("COALESCE(NULLIF(BTRIM(a.labels->>'environment'), ''), NULLIF(BTRIM(a.labels->>'env'), '')) = ANY(%s::text[])", ph))
+	}
+
+	if len(filter.Sites) > 0 {
+		ph := addArg(filter.Sites)
+		where = append(where, fmt.Sprintf("NULLIF(BTRIM(a.labels->>'site'), '') = ANY(%s::text[])", ph))
+	}
+
+	if len(filter.Teams) > 0 {
+		var namedTeams []string
+		includeUntagged := false
+		for _, tm := range filter.Teams {
+			if tm == "__untagged__" {
+				includeUntagged = true
+			} else {
+				namedTeams = append(namedTeams, tm)
+			}
+		}
+		var teamClauses []string
+		if len(namedTeams) > 0 {
+			ph := addArg(namedTeams)
+			teamClauses = append(teamClauses, fmt.Sprintf("COALESCE(NULLIF(BTRIM(a.labels->>'team'), ''), NULLIF(BTRIM(a.assigned_team), '')) = ANY(%s::text[])", ph))
+		}
+		if includeUntagged {
+			teamClauses = append(teamClauses, "(NULLIF(BTRIM(a.labels->>'team'), '') IS NULL AND NULLIF(BTRIM(a.assigned_team), '') IS NULL)")
+		}
+		if len(teamClauses) > 0 {
+			where = append(where, "("+strings.Join(teamClauses, " OR ")+")")
+		}
 	}
 
 	switch filter.IncidentDrift {
@@ -121,7 +160,7 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	if filter.Search != "" {
 		pattern := "%" + escapeLikePattern(filter.Search) + "%"
 		ph := addArg(pattern)
-		where = append(where, fmt.Sprintf("(a.alert_name ILIKE %s ESCAPE '\\' OR COALESCE(a.annotations->>'summary', '') ILIKE %s ESCAPE '\\' OR a.fingerprint ILIKE %s ESCAPE '\\' OR COALESCE(s.incident_number, '') ILIKE %s ESCAPE '\\')", ph, ph, ph, ph))
+		where = append(where, fmt.Sprintf("(a.alert_name ILIKE %s ESCAPE '\\' OR COALESCE(a.annotations->>'summary', '') ILIKE %s ESCAPE '\\' OR a.fingerprint ILIKE %s ESCAPE '\\' OR COALESCE(s.incident_number, '') ILIKE %s ESCAPE '\\' OR COALESCE(a.labels->>'team', '') ILIKE %s ESCAPE '\\' OR COALESCE(a.assigned_team, '') ILIKE %s ESCAPE '\\')", ph, ph, ph, ph, ph, ph))
 	}
 
 	if filter.From != nil {
@@ -133,7 +172,22 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 		where = append(where, fmt.Sprintf("a.starts_at <= %s", ph))
 	}
 
-	const severityRankExpr = `CASE LOWER(a.severity) WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END`
+	const severityRankExpr = `CASE a.severity WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END`
+
+	countWhereSQL := ""
+	if len(where) > 0 {
+		countWhereSQL = "WHERE " + strings.Join(where, " AND ")
+	}
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM alerts a
+		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
+		%s
+	`, countWhereSQL)
+	var filteredTotal int64
+	if err := r.pool.QueryRow(ctx, countQuery, args...).Scan(&filteredTotal); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to count matching alerts.").WithCause(err)
+	}
 
 	if filter.Cursor != nil {
 		c := filter.Cursor
@@ -174,6 +228,8 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 
 	var orderClause string
 	switch sortOrder {
+	case model.SortStartsAtDesc:
+		orderClause = "a.starts_at DESC, a.id DESC"
 	case model.SortStartsAtAsc:
 		orderClause = "a.starts_at ASC, a.id ASC"
 	case model.SortSeverityDesc:
@@ -181,8 +237,8 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	case model.SortResolvedAtDesc:
 		orderClause = "a.resolved_at DESC NULLS LAST, a.id DESC"
 	default:
-		sortOrder = model.SortStartsAtDesc
-		orderClause = "a.starts_at DESC, a.id DESC"
+		sortOrder = model.SortSeverityDesc
+		orderClause = severityRankExpr + " ASC, a.starts_at DESC, a.id DESC"
 	}
 
 	whereSQL := ""
@@ -249,10 +305,66 @@ func (r *AlertRepository) ListAlerts(ctx context.Context, filter model.ListAlert
 	}
 
 	return &model.ListAlertsResponse{
-		Summary:    summary,
-		Items:      items,
-		NextCursor: nextCursor,
+		Summary:       summary,
+		FilterOptions: filterOptions,
+		FilteredTotal: filteredTotal,
+		Items:         items,
+		NextCursor:    nextCursor,
 	}, nil
+}
+
+func (r *AlertRepository) getFilterOptions(ctx context.Context) (model.FilterOptions, error) {
+	opts := model.FilterOptions{
+		Environments: []string{},
+		Sites:        []string{},
+		Teams:        []string{},
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT 'env' AS kind, val
+		FROM (
+			SELECT DISTINCT COALESCE(NULLIF(BTRIM(labels->>'environment'), ''), NULLIF(BTRIM(labels->>'env'), '')) AS val
+			FROM alerts
+			WHERE severity IN ('critical', 'warning')
+		) e
+		WHERE val IS NOT NULL
+		UNION ALL
+		SELECT 'site' AS kind, val
+		FROM (
+			SELECT DISTINCT NULLIF(BTRIM(labels->>'site'), '') AS val
+			FROM alerts
+			WHERE severity IN ('critical', 'warning')
+		) s
+		WHERE val IS NOT NULL
+		UNION ALL
+		SELECT 'team' AS kind, val
+		FROM (
+			SELECT DISTINCT COALESCE(NULLIF(BTRIM(labels->>'team'), ''), NULLIF(BTRIM(assigned_team), '')) AS val
+			FROM alerts
+			WHERE severity IN ('critical', 'warning')
+		) t
+		WHERE val IS NOT NULL
+		ORDER BY kind, val
+	`)
+	if err != nil {
+		return opts, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var kind, val string
+		if err := rows.Scan(&kind, &val); err != nil {
+			return opts, err
+		}
+		switch kind {
+		case "env":
+			opts.Environments = append(opts.Environments, val)
+		case "site":
+			opts.Sites = append(opts.Sites, val)
+		case "team":
+			opts.Teams = append(opts.Teams, val)
+		}
+	}
+	return opts, rows.Err()
 }
 
 func (r *AlertRepository) getSummaryCounts(ctx context.Context) (model.SummaryCounts, error) {
@@ -260,14 +372,23 @@ func (r *AlertRepository) getSummaryCounts(ctx context.Context) (model.SummaryCo
 	err := r.pool.QueryRow(ctx, `
 		SELECT
 			COUNT(*) FILTER (WHERE a.state = 'firing') AS firing,
+			COUNT(*) FILTER (WHERE a.state = 'firing' AND a.severity = 'critical') AS firing_critical,
+			COUNT(*) FILTER (WHERE a.state = 'firing' AND a.severity = 'warning') AS firing_warning,
 			COUNT(*) FILTER (WHERE a.state = 'acknowledged') AS acknowledged,
 			COUNT(*) FILTER (WHERE a.state = 'acknowledged' AND (s.id IS NULL OR s.sync_status NOT IN ('created', 'linked'))) AS acknowledged_without_incident,
-			COUNT(*) FILTER (WHERE a.state = 'resolved' AND a.acknowledged_at IS NOT NULL) AS non_active_acknowledged,
+			COUNT(*) FILTER (WHERE a.state = 'resolved' AND a.acknowledged_at IS NOT NULL AND a.dismissed_at IS NULL) AS non_active_acknowledged,
 			COUNT(*) FILTER (WHERE a.state = 'dismissed') AS dismissed,
-			COUNT(*) FILTER (WHERE a.state = 'resolved' AND s.sync_status IN ('created', 'linked') AND s.snow_state IN (1, 2, 3)) AS resolved_open_ticket
+			COUNT(*) FILTER (WHERE a.state = 'resolved') AS resolved,
+			COUNT(*) FILTER (WHERE a.state = 'resolved' AND s.sync_status IN ('created', 'linked') AND s.snow_state IN (1, 2, 3)) AS resolved_open_ticket,
+			COUNT(*) FILTER (WHERE a.state IN ('firing', 'acknowledged') AND s.sync_status IN ('created', 'linked') AND s.snow_state IN (6, 7, 8)) AS active_closed_ticket
 		FROM alerts a
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
-	`).Scan(&s.Firing, &s.Acknowledged, &s.AcknowledgedWithoutIncident, &s.NonActiveAcknowledged, &s.Dismissed, &s.ResolvedOpenTicket)
+		WHERE a.severity IN ('critical', 'warning')
+	`).Scan(
+		&s.Firing, &s.FiringCritical, &s.FiringWarning,
+		&s.Acknowledged, &s.AcknowledgedWithoutIncident, &s.NonActiveAcknowledged,
+		&s.Dismissed, &s.Resolved, &s.ResolvedOpenTicket, &s.ActiveClosedTicket,
+	)
 	return s, err
 }
 
@@ -308,8 +429,18 @@ func (r *AlertRepository) GetAlert(ctx context.Context, alertID string) (*model.
 	return detail, nil
 }
 
-// GetAlertHistory returns the full audit timeline and previous episodes for alertID.
-func (r *AlertRepository) GetAlertHistory(ctx context.Context, alertID string) (*model.AlertHistoryResponse, error) {
+// GetAlertHistory returns the full audit timeline and paginated previous episodes for alertID.
+func (r *AlertRepository) GetAlertHistory(ctx context.Context, alertID string, limit, offset int) (*model.AlertHistoryResponse, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
 	var fingerprint string
 	err := r.pool.QueryRow(ctx, `SELECT fingerprint FROM alerts WHERE id = $1::uuid`, alertID).Scan(&fingerprint)
 	if err != nil {
@@ -324,26 +455,54 @@ func (r *AlertRepository) GetAlertHistory(ctx context.Context, alertID string) (
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to load audit history.").WithCause(err)
 	}
 
+	var totalPrev int64
+	if err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM alerts
+		WHERE fingerprint = $1 AND id <> $2::uuid
+	`, fingerprint, alertID).Scan(&totalPrev); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to count previous episodes.").WithCause(err)
+	}
+
 	prevRows, err := r.pool.Query(ctx, `
-		SELECT a.id::text, a.starts_at, a.resolved_at, a.state::text, s.incident_number, s.snow_state_label
+		SELECT a.id::text, a.starts_at, a.ends_at, a.resolved_at, a.state::text, a.severity,
+		       a.acknowledged_by, a.acknowledged_at, a.dismissed_by, a.dismissed_at, a.dismiss_reason,
+		       s.incident_number, s.snow_state_label, s.incident_url, s.assignment_group
 		FROM alerts a
 		LEFT JOIN servicenow_incidents s ON s.alert_id = a.id
 		WHERE a.fingerprint = $1 AND a.id <> $2::uuid
 		ORDER BY a.starts_at DESC, a.id DESC
-	`, fingerprint, alertID)
+		LIMIT $3 OFFSET $4
+	`, fingerprint, alertID, limit, offset)
 	if err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to query previous episodes.").WithCause(err)
 	}
 	defer prevRows.Close()
 
+	now := time.Now().UTC()
 	prev := make([]model.PreviousEpisodeSummary, 0)
 	for prevRows.Next() {
 		var p model.PreviousEpisodeSummary
 		var st string
-		if err := prevRows.Scan(&p.ID, &p.StartsAt, &p.ResolvedAt, &st, &p.IncidentNumber, &p.SnowStateLabel); err != nil {
+		if err := prevRows.Scan(
+			&p.ID, &p.StartsAt, &p.EndsAt, &p.ResolvedAt, &st, &p.Severity,
+			&p.AcknowledgedBy, &p.AcknowledgedAt, &p.DismissedBy, &p.DismissedAt, &p.DismissReason,
+			&p.IncidentNumber, &p.SnowStateLabel, &p.IncidentURL, &p.AssignmentGroup,
+		); err != nil {
 			return nil, apierror.New(http.StatusInternalServerError, apierror.CodeInternalError, "Failed to scan previous episode.").WithCause(err)
 		}
 		p.State = model.AlertState(st)
+		endRef := now
+		if p.ResolvedAt != nil {
+			endRef = *p.ResolvedAt
+		} else if p.EndsAt != nil {
+			endRef = *p.EndsAt
+		}
+		dur := int64(endRef.Sub(p.StartsAt).Seconds())
+		if dur < 0 {
+			dur = 0
+		}
+		p.DurationSeconds = dur
 		prev = append(prev, p)
 	}
 	if err := prevRows.Err(); err != nil {
@@ -351,10 +510,14 @@ func (r *AlertRepository) GetAlertHistory(ctx context.Context, alertID string) (
 	}
 
 	return &model.AlertHistoryResponse{
-		AlertID:          alertID,
-		Fingerprint:      fingerprint,
-		AuditEvents:      events,
-		PreviousEpisodes: prev,
+		AlertID:               alertID,
+		Fingerprint:           fingerprint,
+		AuditEvents:           events,
+		PreviousEpisodes:      prev,
+		PreviousEpisodesTotal: totalPrev,
+		Limit:                 limit,
+		Offset:                offset,
+		HasMore:               int64(offset+len(prev)) < totalPrev,
 	}, nil
 }
 
@@ -488,6 +651,38 @@ func (r *AlertRepository) DismissAlert(ctx context.Context, alertID string, op a
 			return conflictSnapshotError(apierror.CodeConflictStaleVersion, fmt.Sprintf("Alert state has changed since version %d; refresh and retry.", version), locked)
 		}
 
+		var openIncNum *string
+		var openSnowState int16
+		err = tx.QueryRow(ctx, `
+			SELECT incident_number, snow_state
+			FROM servicenow_incidents
+			WHERE alert_id = $1::uuid
+			  AND sync_status IN ('created', 'linked')
+			  AND snow_state IN (1, 2, 3)
+			FOR UPDATE
+		`, alertID).Scan(&openIncNum, &openSnowState)
+		if err == nil {
+			incLabel := "linked ticket"
+			if openIncNum != nil && strings.TrimSpace(*openIncNum) != "" {
+				incLabel = strings.TrimSpace(*openIncNum)
+			}
+			return apierror.New(
+				http.StatusConflict,
+				apierror.CodeAlertHasOpenIncident,
+				fmt.Sprintf("Cannot dismiss alert %s while ServiceNow incident %s is open.", locked.AlertName, incLabel),
+			).WithDetails(map[string]any{
+				"alert_id":        locked.ID,
+				"alert_name":      locked.AlertName,
+				"incident_number": openIncNum,
+				"snow_state":      openSnowState,
+				"current_state":   string(locked.State),
+				"current_version": locked.Version,
+			})
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to check linked ServiceNow incident.").WithCause(err)
+		}
+
 		if _, err := tx.Exec(ctx, `
 			UPDATE alerts
 			SET state = 'dismissed',
@@ -526,7 +721,169 @@ func (r *AlertRepository) DismissAlert(ctx context.Context, alertID string, op a
 	return result, nil
 }
 
-// ReopenAlert transitions dismissed -> firing under row lock and optimistic version check.
+// BulkDismissAlerts atomically transitions up to 100 firing/acknowledged alerts to dismissed.
+func (r *AlertRepository) BulkDismissAlerts(ctx context.Context, alertIDs []string, op auth.OperatorContext, reason string) (*model.BulkDismissResponse, error) {
+	sortedIDs := append([]string(nil), alertIDs...)
+	sort.Strings(sortedIDs)
+
+	var resp *model.BulkDismissResponse
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, alert_name, state::text, version, acknowledged_by, dismissed_by
+			FROM alerts
+			WHERE id = ANY($1::uuid[])
+			ORDER BY id ASC
+			FOR UPDATE
+		`, sortedIDs)
+		if err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert episodes for bulk dismiss.").WithCause(err)
+		}
+
+		type lockedBulkRow struct {
+			lockedAlertSnapshot
+			AlertName string
+		}
+		var locked []lockedBulkRow
+		for rows.Next() {
+			var r lockedBulkRow
+			var st string
+			if err := rows.Scan(&r.ID, &r.AlertName, &st, &r.Version, &r.AcknowledgedBy, &r.DismissedBy); err != nil {
+				rows.Close()
+				return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to scan locked alerts.").WithCause(err)
+			}
+			r.State = model.AlertState(st)
+			locked = append(locked, r)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed iterating locked alerts.").WithCause(err)
+		}
+		rows.Close()
+
+		if len(locked) != len(sortedIDs) {
+			return apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "One or more selected alert episodes were not found.")
+		}
+
+		nameByID := make(map[string]string, len(locked))
+		for _, row := range locked {
+			nameByID[row.ID] = row.AlertName
+			if !model.CanDismiss(row.State) {
+				return conflictSnapshotError(
+					apierror.CodeInvalidStateTransition,
+					fmt.Sprintf("Cannot dismiss alert %s in %q state.", row.AlertName, row.State),
+					row.lockedAlertSnapshot,
+				)
+			}
+		}
+
+		openRows, err := tx.Query(ctx, `
+			SELECT alert_id::text, incident_number, snow_state
+			FROM servicenow_incidents
+			WHERE alert_id = ANY($1::uuid[])
+			  AND sync_status IN ('created', 'linked')
+			  AND snow_state IN (1, 2, 3)
+			ORDER BY alert_id ASC
+			FOR UPDATE
+		`, sortedIDs)
+		if err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to check linked ServiceNow incidents for bulk dismiss.").WithCause(err)
+		}
+		type openBlocker struct {
+			AlertID        string
+			AlertName      string
+			IncidentNumber *string
+			SnowState      int16
+		}
+		var blockers []openBlocker
+		for openRows.Next() {
+			var b openBlocker
+			if scanErr := openRows.Scan(&b.AlertID, &b.IncidentNumber, &b.SnowState); scanErr != nil {
+				openRows.Close()
+				return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed scanning open incident links.").WithCause(scanErr)
+			}
+			b.AlertName = nameByID[b.AlertID]
+			blockers = append(blockers, b)
+		}
+		openRows.Close()
+		if err := openRows.Err(); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed reading open incident links.").WithCause(err)
+		}
+		if len(blockers) > 0 {
+			summaryLabels := make([]string, 0, len(blockers))
+			blockerDetails := make([]map[string]any, 0, len(blockers))
+			for _, b := range blockers {
+				incLabel := "linked ticket"
+				if b.IncidentNumber != nil && strings.TrimSpace(*b.IncidentNumber) != "" {
+					incLabel = strings.TrimSpace(*b.IncidentNumber)
+				}
+				summaryLabels = append(summaryLabels, fmt.Sprintf("%s (%s)", b.AlertName, incLabel))
+				blockerDetails = append(blockerDetails, map[string]any{
+					"alert_id":        b.AlertID,
+					"alert_name":      b.AlertName,
+					"incident_number": b.IncidentNumber,
+					"snow_state":      b.SnowState,
+				})
+			}
+			first := blockers[0]
+			return apierror.New(
+				http.StatusConflict,
+				apierror.CodeAlertHasOpenIncident,
+				fmt.Sprintf("Cannot dismiss alerts while ServiceNow incident(s) are open: %s.", strings.Join(summaryLabels, ", ")),
+			).WithDetails(map[string]any{
+				"alert_id":        first.AlertID,
+				"alert_name":      first.AlertName,
+				"incident_number": first.IncidentNumber,
+				"snow_state":      first.SnowState,
+				"blocking_alerts": blockerDetails,
+			})
+		}
+
+		if _, err := tx.Exec(ctx, `
+			UPDATE alerts
+			SET state = 'dismissed',
+				version = version + 1,
+				dismissed_by = $2,
+				dismissed_by_email = $3,
+				dismissed_at = NOW(),
+				dismiss_reason = $4
+			WHERE id = ANY($1::uuid[])
+		`, sortedIDs, op.Login, model.StringPtrOrNil(op.Email), reason); err != nil {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to bulk-dismiss alerts.").WithCause(err)
+		}
+
+		next := model.AlertStateDismissed
+		for _, row := range locked {
+			prev := row.State
+			if err := insertAuditLogTx(ctx, tx, auditEntry{
+				AlertID:       row.ID,
+				EventType:     model.AuditAlertDismissed,
+				ActorType:     model.ActorOperator,
+				ActorLogin:    op.Login,
+				ActorEmail:    model.StringPtrOrNil(op.Email),
+				ActorRole:     model.StringPtrOrNil(op.Role),
+				PreviousState: &prev,
+				NewState:      &next,
+				Comment:       &reason,
+				Metadata: map[string]any{
+					"bulk_dismiss": true,
+					"bulk_count":   len(locked),
+				},
+			}); err != nil {
+				return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record bulk dismiss audit log.").WithCause(err)
+			}
+		}
+
+		resp = &model.BulkDismissResponse{
+			DismissedCount: len(locked),
+			AlertIDs:       sortedIDs,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
 func (r *AlertRepository) ReopenAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, comment string) (*model.Alert, error) {
 	var result *model.Alert
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
@@ -546,6 +903,9 @@ func (r *AlertRepository) ReopenAlert(ctx context.Context, alertID string, op au
 			UPDATE alerts
 			SET state = 'firing',
 				version = version + 1,
+				acknowledged_by = NULL,
+				acknowledged_by_email = NULL,
+				acknowledged_at = NULL,
 				dismissed_by = NULL,
 				dismissed_by_email = NULL,
 				dismissed_at = NULL,
@@ -639,17 +999,28 @@ func (r *AlertRepository) TagAlertTeam(ctx context.Context, alertID string, op a
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
 		var fingerprint, stateStr string
 		var prevTeam *string
+		var labelsRaw []byte
 		err := tx.QueryRow(ctx, `
-			SELECT fingerprint, state::text, assigned_team
+			SELECT fingerprint, state::text, assigned_team, labels
 			FROM alerts
 			WHERE id = $1::uuid
 			FOR UPDATE
-		`, alertID).Scan(&fingerprint, &stateStr, &prevTeam)
+		`, alertID).Scan(&fingerprint, &stateStr, &prevTeam, &labelsRaw)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")
 			}
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert episode.").WithCause(err)
+		}
+
+		labels := unmarshalStringMap(labelsRaw)
+		if labelTeam := strings.TrimSpace(labels["team"]); labelTeam != "" {
+			return apierror.New(http.StatusConflict, apierror.CodeTeamManagedByLabel,
+				fmt.Sprintf("Alert team is managed by Prometheus label %q and cannot be overridden.", labelTeam),
+			).WithDetails(map[string]any{
+				"team":        labelTeam,
+				"team_source": "label",
+			})
 		}
 
 		if _, err := tx.Exec(ctx, `
@@ -778,6 +1149,7 @@ func (r *AlertRepository) listAuditEvents(ctx context.Context, alertID string, l
 
 type lockedAlertSnapshot struct {
 	ID             string
+	AlertName      string
 	State          model.AlertState
 	Version        int
 	AcknowledgedBy *string
@@ -788,11 +1160,11 @@ func lockAlertForTriage(ctx context.Context, tx pgx.Tx, alertID string) (lockedA
 	var snap lockedAlertSnapshot
 	var st string
 	err := tx.QueryRow(ctx, `
-		SELECT id::text, state::text, version, acknowledged_by, dismissed_by
+		SELECT id::text, alert_name, state::text, version, acknowledged_by, dismissed_by
 		FROM alerts
 		WHERE id = $1::uuid
 		FOR UPDATE
-	`, alertID).Scan(&snap.ID, &st, &snap.Version, &snap.AcknowledgedBy, &snap.DismissedBy)
+	`, alertID).Scan(&snap.ID, &snap.AlertName, &st, &snap.Version, &snap.AcknowledgedBy, &snap.DismissedBy)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return snap, apierror.New(http.StatusNotFound, apierror.CodeAlertNotFound, "Alert episode not found.")

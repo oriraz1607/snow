@@ -7,6 +7,8 @@ import {
   ApiErrorEnvelope,
   AppPluginSettings,
   AuditEvent,
+  BulkDismissRequest,
+  BulkDismissResponse,
   CreateBulkIncidentRequest,
   CreateBulkIncidentResponse,
   CreateIncidentRequest,
@@ -157,6 +159,15 @@ export function buildAlertsQueryString(query: ListAlertsQuery): string {
   if (query.severities && query.severities.length > 0) {
     params.set('severity', query.severities.join(','));
   }
+  if (query.environments && query.environments.length > 0) {
+    params.set('env', query.environments.join(','));
+  }
+  if (query.sites && query.sites.length > 0) {
+    params.set('site', query.sites.join(','));
+  }
+  if (query.teams && query.teams.length > 0) {
+    params.set('team', query.teams.join(','));
+  }
   if (query.incident_drift && query.incident_drift !== 'all') {
     params.set('incident_drift', query.incident_drift);
   }
@@ -175,6 +186,12 @@ export function buildAlertsQueryString(query: ListAlertsQuery): string {
   }
   if (query.search?.trim()) {
     params.set('search', query.search.trim());
+  }
+  if (query.from) {
+    params.set('from', query.from);
+  }
+  if (query.to) {
+    params.set('to', query.to);
   }
   if (query.sort) {
     params.set('sort', query.sort);
@@ -198,8 +215,23 @@ export const alertApi = {
     return requestResource<AlertDetail>(`/alerts/${encodeURIComponent(alertId)}`, { signal });
   },
 
-  getAlertHistory(alertId: string, signal?: AbortSignal): Promise<AlertHistoryResponse> {
-    return requestResource<AlertHistoryResponse>(`/alerts/${encodeURIComponent(alertId)}/history`, { signal });
+  getAlertHistory(
+    alertId: string,
+    signal?: AbortSignal,
+    pagination?: { limit?: number; offset?: number }
+  ): Promise<AlertHistoryResponse> {
+    const params = new URLSearchParams();
+    if (typeof pagination?.limit === 'number') {
+      params.set('limit', String(pagination.limit));
+    }
+    if (typeof pagination?.offset === 'number') {
+      params.set('offset', String(pagination.offset));
+    }
+    const qs = params.toString();
+    return requestResource<AlertHistoryResponse>(
+      `/alerts/${encodeURIComponent(alertId)}/history${qs ? `?${qs}` : ''}`,
+      { signal }
+    );
   },
 
   acknowledgeAlert(alertId: string, payload: StateMutationRequest): Promise<Alert> {
@@ -218,6 +250,13 @@ export const alertApi = {
 
   dismissAlert(alertId: string, payload: DismissRequest): Promise<Alert> {
     return requestResource<Alert>(`/alerts/${encodeURIComponent(alertId)}/dismiss`, {
+      method: 'POST',
+      data: payload,
+    });
+  },
+
+  bulkDismissAlerts(payload: BulkDismissRequest): Promise<BulkDismissResponse> {
+    return requestResource<BulkDismissResponse>('/alerts/bulk/dismiss', {
       method: 'POST',
       data: payload,
     });
