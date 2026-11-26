@@ -303,7 +303,13 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   };
 
   return (
-    <Modal isOpen={isOpen} title={modalTitle} onDismiss={onClose} className={styles.modal}>
+    <Modal
+      isOpen={isOpen}
+      title={modalTitle}
+      onDismiss={onClose}
+      closeOnBackdropClick={false}
+      className={styles.modal}
+    >
       <form onSubmit={handleSubmit}>
         {submitError && (
           <div

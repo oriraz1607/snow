@@ -125,7 +125,7 @@ services:
         condition: service_healthy
 
   grafana:
-    image: docker.io/grafana/grafana:11.6.0
+    image: docker.io/grafana/grafana:13.3.2
     ports:
       - "3000:3000"
     environment:

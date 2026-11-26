@@ -30,6 +30,8 @@ const config: Configuration = {
     '@grafana/slate-react',
     'react',
     'react-dom',
+    'react/jsx-runtime',
+    'react/jsx-dev-runtime',
     'react-redux',
     'redux',
     'rxjs',

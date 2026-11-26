@@ -18,7 +18,7 @@
     "links": []
   },
   "dependencies": {
-    "grafanaDependency": ">=11.3.0",
+    "grafanaDependency": ">=13.2.0",
     "plugins": []
   },
   "includes": [
