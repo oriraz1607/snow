@@ -45,7 +45,6 @@ jest.mock('../api/client', () => {
       listAlerts: jest.fn(),
       getAlert: jest.fn(),
       getAlertHistory: jest.fn(),
-      acknowledgeAlert: jest.fn(),
       unacknowledgeAlert: jest.fn(),
       dismissAlert: jest.fn(),
       bulkDismissAlerts: jest.fn(),
@@ -198,7 +197,6 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
   beforeEach(() => {
     jest.clearAllMocks();
     mockedApi.listAlerts.mockReset();
-    mockedApi.acknowledgeAlert.mockReset();
     mockedApi.dismissAlert.mockReset();
     mockedApi.bulkDismissAlerts.mockReset();
     mockedApi.createIncident.mockReset();
@@ -246,6 +244,7 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     expect(screen.getByTestId('kpi-card-firing')).toHaveTextContent('1 critical · 0 warning');
     expect(screen.getByTestId('kpi-card-acknowledged')).toBeInTheDocument();
+    expect(screen.getByTestId('kpi-card-acknowledged')).not.toHaveTextContent('without ticket');
     expect(screen.getByTestId('kpi-card-non_active_acknowledged')).toBeInTheDocument();
     expect(screen.getByTestId('kpi-card-dismissed')).toBeInTheDocument();
 
@@ -288,10 +287,10 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     expect(within(screen.getByTestId('site-quick-select')).getByRole('button', { name: 'eu-west-1' })).toBeInTheDocument();
   });
 
-  it('displays 409 Conflict toast when Acknowledge fails via the 3-squares menu and refreshes the queue', async () => {
+  it('exposes Acknowledge & Create/Link actions on firing rows (no standalone Acknowledge) and handles 409 conflict with queue refresh', async () => {
     const user = userEvent.setup();
     const firingAlert = makeAlert({ state: 'firing', version: 1 });
-    const ackedByBob = makeAlert({
+    const linkedByBob = makeAlert({
       state: 'acknowledged',
       version: 2,
       acknowledged_by: 'bob.jones',
@@ -300,13 +299,13 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     mockedApi.listAlerts
       .mockResolvedValueOnce(makeQueueResponse([firingAlert]))
-      .mockResolvedValueOnce(makeQueueResponse([ackedByBob]));
+      .mockResolvedValueOnce(makeQueueResponse([linkedByBob]));
 
-    mockedApi.acknowledgeAlert.mockRejectedValueOnce(
-      new ApiClientError(409, 'CONFLICT_STALE_VERSION', 'Stale version', {
-        current_version: 2,
+    mockedApi.createIncident.mockRejectedValueOnce(
+      new ApiClientError(409, 'INCIDENT_ALREADY_LINKED', 'Alert already has a linked ServiceNow incident.', {
+        alert_id: firingAlert.id,
+        incident_number: 'INC0008888',
         current_state: 'acknowledged',
-        acknowledged_by: 'bob.jones',
       })
     );
 
@@ -322,14 +321,21 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     await user.click(screen.getByTestId(`row-actions-trigger-${firingAlert.id}`));
     const menu = await screen.findByTestId(`row-actions-menu-${firingAlert.id}`);
-    await user.click(within(menu).getByRole('menuitem', { name: 'Acknowledge' }));
+    expect(within(menu).queryByRole('menuitem', { name: 'Acknowledge' })).not.toBeInTheDocument();
+    expect(within(menu).getByRole('menuitem', { name: 'Acknowledge & Link Incident...' })).toBeEnabled();
+    await user.click(within(menu).getByRole('menuitem', { name: 'Acknowledge & Create Incident' }));
 
-    await waitFor(() => expect(screen.getByTestId('conflict-toast')).toBeInTheDocument());
-    expect(screen.getByTestId('conflict-toast')).toHaveTextContent('bob.jones');
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Acknowledge & Create Incident' }));
+
+    await waitFor(() =>
+      expect(within(dialog).getByTestId('create-modal-conflict-error')).toBeInTheDocument()
+    );
+    expect(within(dialog).getByTestId('create-modal-conflict-error')).toHaveTextContent('INC0008888');
     await waitFor(() => expect(mockedApi.listAlerts).toHaveBeenCalledTimes(2));
   });
 
-  it('shows ServiceNow column on Acknowledged tab only, creates incident via 3-squares menu, and surfaces fallback banner', async () => {
+  it('shows ServiceNow column on Acknowledged tab only, creates incident directly from firing row via 3-squares menu, and surfaces fallback banner', async () => {
     const user = userEvent.setup();
     const firingAlert = makeAlert({ state: 'firing', version: 1 });
     const ackedAlert = makeAlert({
@@ -359,12 +365,10 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     mockedApi.listAlerts
       .mockResolvedValueOnce(makeQueueResponse([firingAlert]))
-      .mockResolvedValueOnce(makeQueueResponse([ackedAlert]))
-      .mockResolvedValueOnce(makeQueueResponse([ackedAlert]))
+      .mockResolvedValueOnce(makeQueueResponse([linkedAlert]))
       .mockResolvedValueOnce(makeQueueResponse([linkedAlert]));
-    mockedApi.acknowledgeAlert.mockResolvedValueOnce(ackedAlert);
     mockedApi.createIncident.mockResolvedValueOnce({
-      alert_id: ackedAlert.id,
+      alert_id: firingAlert.id,
       servicenow_incident: linkedAlert.servicenow_incident!,
       warnings: ['Caller fell back to generic NOC user because editor@corp.example was not found.'],
     });
@@ -382,28 +386,25 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     );
     expect(screen.queryByRole('columnheader', { name: 'ServiceNow' })).not.toBeInTheDocument();
 
-    // Acknowledge via 3-squares menu
+    // Acknowledge & Create Incident directly on firing alert via 3-squares menu (uses single endpoint)
     await user.click(screen.getByTestId(`row-actions-trigger-${firingAlert.id}`));
-    await user.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Acknowledge' }));
-    await waitFor(() => expect(mockedApi.acknowledgeAlert).toHaveBeenCalledTimes(1));
-
-    // Click Acknowledged KPI tab -> ServiceNow column appears and inline action-bar row stays absent
-    await user.click(screen.getByTestId('kpi-card-acknowledged'));
-    await waitFor(() => expect(screen.getByRole('columnheader', { name: 'ServiceNow' })).toBeInTheDocument());
-    expect(screen.queryByTestId(`action-bar-${ackedAlert.id}`)).not.toBeInTheDocument();
-
-    await user.click(screen.getByTestId(`row-actions-trigger-${ackedAlert.id}`));
     await user.click(
-      within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Create ServiceNow Incident' })
+      within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Acknowledge & Create Incident' })
     );
 
     await waitFor(() => expect(screen.getByLabelText('Short Description')).toBeInTheDocument());
     await user.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: 'Create ServiceNow Incident' })
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Acknowledge & Create Incident' })
     );
 
+    await waitFor(() => expect(mockedApi.createIncident).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByTestId('fallback-warning-banner')).toBeInTheDocument());
     expect(screen.getByTestId('fallback-warning-banner')).toHaveTextContent('INC0000001');
+
+    // Click Acknowledged KPI tab -> ServiceNow column appears and inline action-bar row stays absent
+    await user.click(screen.getByTestId('kpi-card-acknowledged'));
+    await waitFor(() => expect(screen.getByRole('columnheader', { name: 'ServiceNow' })).toBeInTheDocument());
+    expect(screen.queryByTestId(`action-bar-${linkedAlert.id}`)).not.toBeInTheDocument();
   });
 
   it('creates one ServiceNow ticket for multiple selected firing alerts', async () => {
@@ -455,15 +456,17 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     const bulkBar = screen.getByTestId('bulk-selection-bar');
     expect(bulkBar).toHaveTextContent('2 alerts selected');
-    expect(bulkBar).toHaveTextContent('2 firing alerts auto-ack on SNOW create');
+    expect(bulkBar).toHaveTextContent('2 firing alerts acknowledged on ticket creation');
 
     await user.click(
-      within(bulkBar).getByRole('button', { name: 'Create Single ServiceNow Incident (2)' })
+      within(bulkBar).getByRole('button', { name: 'Acknowledge & Create Single Incident (2)' })
     );
 
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByTestId('selected-alerts-summary')).toHaveTextContent('Included Alerts (2)');
-    await user.click(within(dialog).getByRole('button', { name: 'Create Single Incident (2)' }));
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Acknowledge & Create Single Incident (2)' })
+    );
 
     await waitFor(() => expect(mockedApi.createBulkIncident).toHaveBeenCalledTimes(1));
     expect(mockedApi.createBulkIncident.mock.calls[0][0].alert_ids).toEqual([alertA.id, alertB.id]);
@@ -532,20 +535,18 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     expect(within(viewerTeamSection).getByRole('button', { name: 'Tag Team' })).toBeDisabled();
   });
 
-  it('preserves modal inputs across background polling and reuses Idempotency-Key on 503 retry', async () => {
+  it('preserves modal inputs across background polling and reuses Idempotency-Key on 503 retry for a firing alert', async () => {
     const user = userEvent.setup();
-    const ackedAlert = makeAlert({
-      state: 'acknowledged',
-      version: 2,
-      acknowledged_by: 'editor.user',
-      acknowledged_at: '2026-11-25T16:12:00Z',
+    const firingAlert = makeAlert({
+      state: 'firing',
+      version: 1,
     });
 
-    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([ackedAlert]));
+    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([firingAlert]));
     mockedApi.createIncident
       .mockRejectedValueOnce(new ApiClientError(503, 'SNOW_UNAVAILABLE', 'ServiceNow down'))
       .mockResolvedValueOnce({
-        alert_id: ackedAlert.id,
+        alert_id: firingAlert.id,
         servicenow_incident: {
           id: 'inc-rec-2',
           sync_status: 'created',
@@ -570,15 +571,12 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
       />
     );
 
-    await waitFor(() => expect(screen.getByTestId('kpi-card-acknowledged')).toBeInTheDocument());
-    await user.click(screen.getByTestId('kpi-card-acknowledged'));
-
     await waitFor(() =>
-      expect(screen.getByTestId(`row-actions-trigger-${ackedAlert.id}`)).toBeInTheDocument()
+      expect(screen.getByTestId(`row-actions-trigger-${firingAlert.id}`)).toBeInTheDocument()
     );
-    await user.click(screen.getByTestId(`row-actions-trigger-${ackedAlert.id}`));
+    await user.click(screen.getByTestId(`row-actions-trigger-${firingAlert.id}`));
     await user.click(
-      within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Create ServiceNow Incident' })
+      within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Acknowledge & Create Incident' })
     );
 
     const shortDescInput = screen.getByLabelText('Short Description');
@@ -589,9 +587,10 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     expect(screen.getByLabelText('Short Description')).toHaveValue('Custom operator incident title');
 
     await user.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: 'Create ServiceNow Incident' })
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Acknowledge & Create Incident' })
     );
     await waitFor(() => expect(screen.getByRole('button', { name: 'Retry Creation' })).toBeInTheDocument());
+    expect(screen.getByTestId('create-modal-error')).toHaveTextContent('remain firing');
     expect(screen.getByLabelText('Short Description')).toHaveValue('Custom operator incident title');
 
     await user.click(screen.getByRole('button', { name: 'Retry Creation' }));
@@ -601,6 +600,36 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     const secondIdemKey = mockedApi.createIncident.mock.calls[1][2];
     expect(firstIdemKey).toBeTruthy();
     expect(secondIdemKey).toBe(firstIdemKey);
+  });
+
+  it('shows Acknowledge & Create Incident and Link Existing Incident in AlertDetailDrawer for firing alerts without standalone Acknowledge', async () => {
+    const user = userEvent.setup();
+    const firingAlert = makeAlert({ state: 'firing', version: 1 });
+    mockedApi.listAlerts.mockResolvedValue(makeQueueResponse([firingAlert]));
+    mockedApi.getAlert.mockResolvedValue(makeDetail(firingAlert));
+    mockedApi.getAlertHistory.mockResolvedValue({
+      alert_id: firingAlert.id,
+      fingerprint: firingAlert.fingerprint,
+      audit_events: [],
+      previous_episodes: [],
+    });
+
+    render(
+      <AlertQueuePage
+        pluginSettings={{ pollIntervalSeconds: 60 }}
+        selectedAlertId={firingAlert.id}
+        onSelectAlertId={jest.fn()}
+      />
+    );
+
+    const drawerBar = await screen.findByTestId('drawer-action-bar');
+    expect(within(drawerBar).queryByRole('button', { name: 'Acknowledge' })).not.toBeInTheDocument();
+    expect(within(drawerBar).getByRole('button', { name: 'Acknowledge & Create Incident' })).toBeEnabled();
+    expect(within(drawerBar).getByRole('button', { name: 'Link Existing Incident' })).toBeEnabled();
+
+    await user.click(within(drawerBar).getByRole('button', { name: 'Link Existing Incident' }));
+    expect(await screen.findByTestId('link-modal-ack-notice')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Acknowledge & Link Incident' })).toBeInTheDocument();
   });
 
   it('disables triage/incident controls in 3-squares menu for Viewer and blocks ConfigPage for non-Admins', async () => {
@@ -622,7 +651,9 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     );
     await user.click(screen.getByTestId(`row-actions-trigger-${firingAlert.id}`));
     const menu = await screen.findByRole('menu');
-    expect(within(menu).getByRole('menuitem', { name: 'Acknowledge' })).toBeDisabled();
+    expect(within(menu).queryByRole('menuitem', { name: 'Acknowledge' })).not.toBeInTheDocument();
+    expect(within(menu).getByRole('menuitem', { name: 'Acknowledge & Create Incident' })).toBeDisabled();
+    expect(within(menu).getByRole('menuitem', { name: 'Acknowledge & Link Incident...' })).toBeDisabled();
     expect(within(menu).getByRole('menuitem', { name: 'Dismiss...' })).toBeDisabled();
     expect(within(menu).getByRole('menuitem', { name: 'View Details' })).toBeEnabled();
     unmount();
@@ -779,7 +810,7 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     mockedApi.listAlerts
       .mockResolvedValueOnce(makeQueueResponse([firingA]))
       .mockResolvedValueOnce(makeQueueResponse([ackedByServer]));
-    mockedApi.createBulkIncident.mockRejectedValueOnce(
+    mockedApi.createIncident.mockRejectedValueOnce(
       new ApiClientError(409, 'INCIDENT_ALREADY_LINKED', 'Alert already has a linked ServiceNow incident.', {
         alert_id: firingA.id,
         incident_number: 'INC0099001',
@@ -799,12 +830,12 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     await user.click(screen.getByLabelText('Select FiringAlertA'));
     await user.click(
       within(screen.getByTestId('bulk-selection-bar')).getByRole('button', {
-        name: 'Create ServiceNow Incident',
+        name: 'Acknowledge & Create Incident',
       })
     );
 
     const dialog = await screen.findByRole('dialog');
-    await user.click(within(dialog).getByRole('button', { name: 'Create ServiceNow Incident' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Acknowledge & Create Incident' }));
 
     await waitFor(() =>
       expect(within(dialog).getByTestId('create-modal-conflict-error')).toBeInTheDocument()
@@ -972,8 +1003,9 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     await waitFor(() => expect(screen.getByTestId('kpi-card-firing')).toBeInTheDocument());
     const badge = screen.getByTestId('kpi-active-closed-ticket-badge');
-    expect(badge).toHaveTextContent('2 closed tickets');
+    expect(badge).toHaveTextContent('2 closed');
     expect(screen.getByTestId('kpi-card-acknowledged')).toContainElement(badge);
+    expect(screen.getByTestId('kpi-card-acknowledged')).not.toHaveTextContent('without ticket');
   });
 
   it('uses learned team_assignment_groups instead of blindly copying team label in CreateIncidentModal', async () => {

@@ -30,7 +30,6 @@ interface AlertTableProps {
   onToggleSelectAll: (selectableIds: string[], selectAll: boolean) => void;
   onSelectAlert: (alert: Alert) => void;
   onOpenConfluenceEdit: (alert: Alert) => void;
-  onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
   onReopen: (alert: Alert) => void;
   onOpenDismiss: (alert: Alert) => void;
@@ -59,7 +58,6 @@ export const AlertTable: React.FC<AlertTableProps> = ({
   onToggleSelectAll,
   onSelectAlert,
   onOpenConfluenceEdit,
-  onAcknowledge,
   onUnacknowledge,
   onReopen,
   onOpenDismiss,
@@ -390,7 +388,6 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                     canTriage={canTriage}
                     canWriteIncidents={canWriteIncidents}
                     busy={isBusy}
-                    onAcknowledge={onAcknowledge}
                     onUnacknowledge={onUnacknowledge}
                     onReopen={onReopen}
                     onOpenDismiss={onOpenDismiss}

@@ -28,13 +28,13 @@ var snowSysIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // IncidentRepository abstracts PostgreSQL operations needed by IncidentService.
 type IncidentRepository interface {
-	ReserveIncidentCreation(ctx context.Context, alertID string, op auth.OperatorContext, req model.CreateIncidentRequest, allowRetrospective bool, idem store.IdempotencyMeta) (*store.IncidentReservation, error)
+	ReserveIncidentCreation(ctx context.Context, alertID string, op auth.OperatorContext, req model.CreateIncidentRequest, allowTriage bool, allowRetrospective bool, idem store.IdempotencyMeta) (*store.IncidentReservation, error)
 	FinalizeIncidentCreated(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool, idemKey string, warnings []string) (*model.ServiceNowIncident, error)
 	FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg, idemKey string) error
 	ReserveBulkIncidentCreation(ctx context.Context, alertIDs []string, op auth.OperatorContext, req model.CreateBulkIncidentRequest, allowTriage bool, idem store.IdempotencyMeta) (*store.BulkIncidentReservation, error)
 	FinalizeBulkIncidentCreated(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, res store.SnowCreateResult, caller store.CallerResolution, adopted bool, warnings []string) (*model.ServiceNowIncident, error)
 	FinalizeBulkIncidentFailed(ctx context.Context, resv *store.BulkIncidentReservation, op auth.OperatorContext, errMsg string) error
-	SaveLinkedIncident(ctx context.Context, alertID string, op auth.OperatorContext, snowInc store.SnowCreateResult, allowRetrospective bool) (*model.IncidentSyncResponse, error)
+	SaveLinkedIncident(ctx context.Context, alertID string, op auth.OperatorContext, snowInc store.SnowCreateResult, allowTriage bool, allowRetrospective bool) (*model.IncidentSyncResponse, error)
 	GetAlertAndIncident(ctx context.Context, alertID string) (model.AlertState, *model.ServiceNowIncident, error)
 	UpdateIncidentForAlert(ctx context.Context, alertID string, op auth.OperatorContext, update store.SnowSyncUpdate) (*model.IncidentSyncResponse, error)
 	UpdateIncidentsBySysID(ctx context.Context, sysID string, update store.SnowSyncUpdate, actorType model.ActorType, actorLogin string, logOnlyOnChange bool) (int, error)
@@ -131,9 +131,10 @@ func (s *IncidentService) CreateIncident(
 	}
 
 	idemMeta := buildSingleIdempotencyMeta(idempotencyKey, alertID, req)
+	allowTriage := auth.HasPermission(op, auth.PermAlertsTriage)
 
 	// Phase 1: Tx 1 reserve pending row (no HTTP inside DB transaction).
-	resv, err := s.repo.ReserveIncidentCreation(ctx, alertID, op, req, s.cfg.AllowRetrospectiveIncident, idemMeta)
+	resv, err := s.repo.ReserveIncidentCreation(ctx, alertID, op, req, allowTriage, s.cfg.AllowRetrospectiveIncident, idemMeta)
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +393,8 @@ func (s *IncidentService) LinkIncident(
 		return nil, apierror.New(http.StatusNotFound, apierror.CodeIncidentNotFound, fmt.Sprintf("ServiceNow incident %s was not found.", num))
 	}
 
-	resp, err := s.repo.SaveLinkedIncident(ctx, alertID, op, found.ToCreateResult(), s.cfg.AllowRetrospectiveIncident)
+	allowTriage := auth.HasPermission(op, auth.PermAlertsTriage)
+	resp, err := s.repo.SaveLinkedIncident(ctx, alertID, op, found.ToCreateResult(), allowTriage, s.cfg.AllowRetrospectiveIncident)
 	if err != nil {
 		return nil, err
 	}

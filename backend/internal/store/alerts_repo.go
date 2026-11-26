@@ -617,68 +617,17 @@ func (r *AlertRepository) GetAlertHistory(ctx context.Context, alertID string, l
 	}, nil
 }
 
-// AcknowledgeAlert transitions firing -> acknowledged under row lock and optimistic version check.
-func (r *AlertRepository) AcknowledgeAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, comment string) (*model.Alert, error) {
-	var result *model.Alert
-	err := r.withTx(ctx, func(tx pgx.Tx) error {
-		locked, err := lockAlertForTriage(ctx, tx, alertID)
-		if err != nil {
-			return err
-		}
-
-		// Idempotent retry by the same operator immediately following acknowledgement.
-		if locked.State == model.AlertStateAcknowledged &&
-			locked.AcknowledgedBy != nil && *locked.AcknowledgedBy == op.Login &&
-			locked.Version == version+1 {
-			result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
-			return err
-		}
-
-		if !model.CanAcknowledge(locked.State) {
-			return conflictSnapshotError(apierror.CodeInvalidStateTransition, fmt.Sprintf("Cannot acknowledge alert in %q state.", locked.State), locked)
-		}
-		if locked.Version != version {
-			return conflictSnapshotError(apierror.CodeConflictStaleVersion, fmt.Sprintf("Alert state has changed since version %d; refresh and retry.", version), locked)
-		}
-
-		if _, err := tx.Exec(ctx, `
-			UPDATE alerts
-			SET state = 'acknowledged',
-				version = version + 1,
-				acknowledged_by = $2,
-				acknowledged_by_email = $3,
-				acknowledged_at = NOW()
-			WHERE id = $1::uuid
-		`, alertID, op.Login, model.StringPtrOrNil(op.Email)); err != nil {
-			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to acknowledge alert.").WithCause(err)
-		}
-
-		prev := model.AlertStateFiring
-		next := model.AlertStateAcknowledged
-		if err := insertAuditLogTx(ctx, tx, auditEntry{
-			AlertID:       alertID,
-			EventType:     model.AuditAlertAcknowledged,
-			ActorType:     model.ActorOperator,
-			ActorLogin:    op.Login,
-			ActorEmail:    model.StringPtrOrNil(op.Email),
-			ActorRole:     model.StringPtrOrNil(op.Role),
-			PreviousState: &prev,
-			NewState:      &next,
-			Comment:       model.StringPtrOrNil(comment),
-		}); err != nil {
-			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record audit log.").WithCause(err)
-		}
-
-		result, err = getAlertItemTx(ctx, tx, alertID, r.confluenceAllowedHosts)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+// AcknowledgeAlert is disabled as a standalone transition because acknowledging an alert requires a ServiceNow incident.
+func (r *AlertRepository) AcknowledgeAlert(_ context.Context, _ string, _ auth.OperatorContext, _ int, _ string) (*model.Alert, error) {
+	return nil, apierror.New(
+		http.StatusConflict,
+		apierror.CodeTicketRequiredForAck,
+		"Alerts cannot be acknowledged without a ServiceNow incident. Create or link a ServiceNow incident to acknowledge this alert.",
+	)
 }
 
-// UnacknowledgeAlert transitions acknowledged -> firing under row lock and optimistic version check.
+// UnacknowledgeAlert transitions acknowledged -> firing under row lock and optimistic version check,
+// blocking unacknowledgement if a ServiceNow incident is created or linked.
 func (r *AlertRepository) UnacknowledgeAlert(ctx context.Context, alertID string, op auth.OperatorContext, version int, comment string) (*model.Alert, error) {
 	var result *model.Alert
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
@@ -692,6 +641,38 @@ func (r *AlertRepository) UnacknowledgeAlert(ctx context.Context, alertID string
 		}
 		if locked.Version != version {
 			return conflictSnapshotError(apierror.CodeConflictStaleVersion, fmt.Sprintf("Alert state has changed since version %d; refresh and retry.", version), locked)
+		}
+
+		var linkedIncID string
+		var linkedIncNum *string
+		var linkedSyncStatus string
+		incErr := tx.QueryRow(ctx, `
+			SELECT id::text, incident_number, sync_status::text
+			FROM servicenow_incidents
+			WHERE alert_id = $1::uuid
+			  AND sync_status IN ('created', 'linked')
+			FOR UPDATE
+		`, alertID).Scan(&linkedIncID, &linkedIncNum, &linkedSyncStatus)
+		if incErr == nil {
+			incLabel := "linked ticket"
+			if linkedIncNum != nil && strings.TrimSpace(*linkedIncNum) != "" {
+				incLabel = strings.TrimSpace(*linkedIncNum)
+			}
+			return apierror.New(
+				http.StatusConflict,
+				apierror.CodeAlertHasOpenIncident,
+				fmt.Sprintf("Cannot unacknowledge alert while ServiceNow incident %s is linked.", incLabel),
+			).WithDetails(map[string]any{
+				"alert_id":        locked.ID,
+				"incident_id":     linkedIncID,
+				"incident_number": linkedIncNum,
+				"sync_status":     linkedSyncStatus,
+				"current_state":   string(locked.State),
+				"current_version": locked.Version,
+			})
+		}
+		if !errors.Is(incErr, pgx.ErrNoRows) {
+			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to inspect linked ServiceNow incident.").WithCause(incErr)
 		}
 
 		if _, err := tx.Exec(ctx, `
@@ -747,17 +728,34 @@ func (r *AlertRepository) DismissAlert(ctx context.Context, alertID string, op a
 			return conflictSnapshotError(apierror.CodeConflictStaleVersion, fmt.Sprintf("Alert state has changed since version %d; refresh and retry.", version), locked)
 		}
 
+		var incID string
+		var incSyncStatus string
 		var openIncNum *string
-		var openSnowState int16
+		var openSnowState *int16
 		err = tx.QueryRow(ctx, `
-			SELECT incident_number, snow_state
+			SELECT id::text, sync_status::text, incident_number, snow_state
 			FROM servicenow_incidents
 			WHERE alert_id = $1::uuid
-			  AND sync_status IN ('created', 'linked')
-			  AND snow_state IN (1, 2, 3)
+			  AND (
+			    (sync_status IN ('created', 'linked') AND snow_state IN (1, 2, 3))
+			    OR (sync_status = 'pending' AND updated_at >= NOW() - INTERVAL '60 seconds')
+			  )
 			FOR UPDATE
-		`, alertID).Scan(&openIncNum, &openSnowState)
+		`, alertID).Scan(&incID, &incSyncStatus, &openIncNum, &openSnowState)
 		if err == nil {
+			if incSyncStatus == string(model.SnowSyncPending) {
+				return apierror.New(
+					http.StatusConflict,
+					apierror.CodeIncidentCreationInProgress,
+					fmt.Sprintf("Cannot dismiss alert %s while ServiceNow incident creation is in progress.", locked.AlertName),
+				).WithDetails(map[string]any{
+					"alert_id":        locked.ID,
+					"alert_name":      locked.AlertName,
+					"incident_id":     incID,
+					"current_state":   string(locked.State),
+					"current_version": locked.Version,
+				})
+			}
 			incLabel := "linked ticket"
 			if openIncNum != nil && strings.TrimSpace(*openIncNum) != "" {
 				incLabel = strings.TrimSpace(*openIncNum)
@@ -873,11 +871,13 @@ func (r *AlertRepository) BulkDismissAlerts(ctx context.Context, alertIDs []stri
 		}
 
 		openRows, err := tx.Query(ctx, `
-			SELECT alert_id::text, incident_number, snow_state
+			SELECT id::text, alert_id::text, sync_status::text, incident_number, snow_state
 			FROM servicenow_incidents
 			WHERE alert_id = ANY($1::uuid[])
-			  AND sync_status IN ('created', 'linked')
-			  AND snow_state IN (1, 2, 3)
+			  AND (
+			    (sync_status IN ('created', 'linked') AND snow_state IN (1, 2, 3))
+			    OR (sync_status = 'pending' AND updated_at >= NOW() - INTERVAL '60 seconds')
+			  )
 			ORDER BY alert_id ASC
 			FOR UPDATE
 		`, sortedIDs)
@@ -885,29 +885,36 @@ func (r *AlertRepository) BulkDismissAlerts(ctx context.Context, alertIDs []stri
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to check linked ServiceNow incidents for bulk dismiss.").WithCause(err)
 		}
 		type openBlocker struct {
+			IncidentID     string
 			AlertID        string
 			AlertName      string
+			SyncStatus     string
 			IncidentNumber *string
-			SnowState      int16
+			SnowState      *int16
 		}
-		var blockers []openBlocker
+		var openBlockers []openBlocker
+		var pendingBlockers []openBlocker
 		for openRows.Next() {
 			var b openBlocker
-			if scanErr := openRows.Scan(&b.AlertID, &b.IncidentNumber, &b.SnowState); scanErr != nil {
+			if scanErr := openRows.Scan(&b.IncidentID, &b.AlertID, &b.SyncStatus, &b.IncidentNumber, &b.SnowState); scanErr != nil {
 				openRows.Close()
 				return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed scanning open incident links.").WithCause(scanErr)
 			}
 			b.AlertName = nameByID[b.AlertID]
-			blockers = append(blockers, b)
+			if b.SyncStatus == string(model.SnowSyncPending) {
+				pendingBlockers = append(pendingBlockers, b)
+			} else {
+				openBlockers = append(openBlockers, b)
+			}
 		}
 		openRows.Close()
 		if err := openRows.Err(); err != nil {
 			return apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed reading open incident links.").WithCause(err)
 		}
-		if len(blockers) > 0 {
-			summaryLabels := make([]string, 0, len(blockers))
-			blockerDetails := make([]map[string]any, 0, len(blockers))
-			for _, b := range blockers {
+		if len(openBlockers) > 0 {
+			summaryLabels := make([]string, 0, len(openBlockers))
+			blockerDetails := make([]map[string]any, 0, len(openBlockers))
+			for _, b := range openBlockers {
 				incLabel := "linked ticket"
 				if b.IncidentNumber != nil && strings.TrimSpace(*b.IncidentNumber) != "" {
 					incLabel = strings.TrimSpace(*b.IncidentNumber)
@@ -920,7 +927,7 @@ func (r *AlertRepository) BulkDismissAlerts(ctx context.Context, alertIDs []stri
 					"snow_state":      b.SnowState,
 				})
 			}
-			first := blockers[0]
+			first := openBlockers[0]
 			return apierror.New(
 				http.StatusConflict,
 				apierror.CodeAlertHasOpenIncident,
@@ -931,6 +938,22 @@ func (r *AlertRepository) BulkDismissAlerts(ctx context.Context, alertIDs []stri
 				"incident_number": first.IncidentNumber,
 				"snow_state":      first.SnowState,
 				"blocking_alerts": blockerDetails,
+			})
+		}
+		if len(pendingBlockers) > 0 {
+			first := pendingBlockers[0]
+			names := make([]string, 0, len(pendingBlockers))
+			for _, b := range pendingBlockers {
+				names = append(names, b.AlertName)
+			}
+			return apierror.New(
+				http.StatusConflict,
+				apierror.CodeIncidentCreationInProgress,
+				fmt.Sprintf("Cannot dismiss alerts while ServiceNow incident creation is in progress: %s.", strings.Join(names, ", ")),
+			).WithDetails(map[string]any{
+				"alert_id":    first.AlertID,
+				"alert_name":  first.AlertName,
+				"incident_id": first.IncidentID,
 			})
 		}
 

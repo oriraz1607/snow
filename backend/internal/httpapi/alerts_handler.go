@@ -118,22 +118,11 @@ func (h *AlertsHandler) Acknowledge(w http.ResponseWriter, r *http.Request) {
 		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "alert_id must be a valid UUID."))
 		return
 	}
-	var req model.StateMutationRequest
-	if err := decodeJSONBody(w, r, &req); err != nil {
-		apierror.Write(w, r, err)
-		return
-	}
-	if req.Version < 1 {
-		apierror.Write(w, r, apierror.New(http.StatusBadRequest, apierror.CodeValidationError, "version must be >= 1."))
-		return
-	}
-	op, _ := auth.OperatorFromContext(r.Context())
-	updated, err := h.repo.AcknowledgeAlert(r.Context(), alertID, op, req.Version, req.Comment)
-	if err != nil {
-		apierror.Write(w, r, err)
-		return
-	}
-	apierror.WriteJSON(w, http.StatusOK, updated)
+	apierror.Write(w, r, apierror.New(
+		http.StatusConflict,
+		apierror.CodeTicketRequiredForAck,
+		"Alerts cannot be acknowledged without a ServiceNow incident. Create or link a ServiceNow incident to acknowledge this alert.",
+	))
 }
 
 // Unacknowledge handles POST /api/v1/alerts/{alert_id}/unacknowledge.

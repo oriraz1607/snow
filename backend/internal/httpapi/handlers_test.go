@@ -210,6 +210,31 @@ func TestServiceNowHandlerIdempotencyKey(t *testing.T) {
 	})
 }
 
+func TestAlertsHandlerAcknowledgeRequiresTicket(t *testing.T) {
+	const alertUUID = "11111111-1111-4111-8111-111111111111"
+	h := NewAlertsHandler(&stubAlertStore{})
+	r := chi.NewRouter()
+	r.Post("/api/v1/alerts/{alert_id}/acknowledge", h.Acknowledge)
+
+	t.Run("rejects invalid alert UUID with 400", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/not-a-uuid/acknowledge", bytes.NewReader([]byte(`{"version":1}`)))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("rejects standalone acknowledge with 409 TICKET_REQUIRED_FOR_ACKNOWLEDGE", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/"+alertUUID+"/acknowledge", bytes.NewReader([]byte(`{"version":1}`)))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict || !bytes.Contains(rec.Body.Bytes(), []byte(apierror.CodeTicketRequiredForAck)) {
+			t.Fatalf("expected 409 %s, got %d (%s)", apierror.CodeTicketRequiredForAck, rec.Code, rec.Body.String())
+		}
+	})
+}
+
 func TestAlertsHandlerTagTeamLabelConflict(t *testing.T) {
 	const alertUUID = "11111111-1111-4111-8111-111111111111"
 	repo := &stubAlertStore{

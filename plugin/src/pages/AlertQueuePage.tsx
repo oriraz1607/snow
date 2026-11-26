@@ -329,39 +329,6 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     [refresh]
   );
 
-  const handleAcknowledge = useCallback(
-    async (alert: Alert) => {
-      setBusyAlertId(alert.id);
-      try {
-        const updated = await alertApi.acknowledgeAlert(alert.id, { version: alert.version });
-        upsertAlert(updated);
-        if (quickFilter === 'firing') {
-          setToast({
-            severity: 'success',
-            title: `Acknowledged ${alert.alert_name}`,
-            message: 'Moved to the Acknowledged tab.',
-          });
-        }
-        setDrawerRefreshTrigger((n) => n + 1);
-        void refresh();
-      } catch (err) {
-        const apiErr = err as ApiClientError;
-        if (apiErr?.status === 409) {
-          handleConflict(apiErr);
-        } else {
-          setToast({
-            severity: 'error',
-            title: 'Acknowledge failed',
-            message: apiErr?.message || 'Unable to acknowledge alert.',
-          });
-        }
-      } finally {
-        setBusyAlertId(null);
-      }
-    },
-    [handleConflict, quickFilter, refresh, upsertAlert]
-  );
-
   const handleUnacknowledge = useCallback(
     async (alert: Alert) => {
       setBusyAlertId(alert.id);
@@ -489,8 +456,8 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
           title: `Created ${incNum}`,
           message:
             alertIds.length > 1
-              ? `ServiceNow incident ${incNum} created and linked to ${alertIds.length} alerts.`
-              : `ServiceNow incident ${incNum} linked to alert.`,
+              ? `ServiceNow incident ${incNum} created and ${alertIds.length} alerts acknowledged.`
+              : `ServiceNow incident ${incNum} created and alert acknowledged.`,
         });
       }
     },
@@ -501,17 +468,20 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     (resp: IncidentSyncResponse) => {
       const target = linkModalAlert;
       setLinkModalAlert(null);
-      if (target) {
+      if (target && target.state === 'acknowledged') {
         upsertAlert({
           ...target,
           servicenow_incident: resp.servicenow_incident,
           incident_drift_status: resp.incident_drift_status,
         });
       }
+      const wasFiring = target?.state === 'firing';
       setToast({
         severity: 'success',
         title: `Linked ${resp.servicenow_incident.incident_number || 'Incident'}`,
-        message: 'Existing ServiceNow incident linked to alert episode.',
+        message: wasFiring
+          ? 'Existing ServiceNow incident linked and alert acknowledged.'
+          : 'Existing ServiceNow incident linked to alert episode.',
       });
       setDrawerRefreshTrigger((n) => n + 1);
       void refresh();
@@ -651,7 +621,6 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
           setFocusConfluenceOnOpen(true);
           onSelectAlertId(alert.id);
         }}
-        onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
         onOpenDismiss={(alert) => setDismissModalAlerts([alert])}
@@ -692,7 +661,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
             </strong>
             {selectedFiringForSnowCount > 0 && (
               <span className={styles.bulkNote}>
-                ({selectedFiringForSnowCount} firing alert{selectedFiringForSnowCount === 1 ? '' : 's'} auto-ack on SNOW create)
+                ({selectedFiringForSnowCount} firing alert{selectedFiringForSnowCount === 1 ? '' : 's'} acknowledged on ticket creation)
               </span>
             )}
             {blockedDismissAlerts.length > 0 && (
@@ -730,8 +699,12 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
                 onClick={() => setCreateModalAlerts(incidentEligibleAlerts)}
               >
                 {incidentEligibleAlerts.length > 1
-                  ? `Create Single ServiceNow Incident (${incidentEligibleAlerts.length})`
-                  : 'Create ServiceNow Incident'}
+                  ? selectedFiringForSnowCount > 0
+                    ? `Acknowledge & Create Single Incident (${incidentEligibleAlerts.length})`
+                    : `Create Single ServiceNow Incident (${incidentEligibleAlerts.length})`
+                  : selectedFiringForSnowCount > 0
+                    ? 'Acknowledge & Create Incident'
+                    : 'Create ServiceNow Incident'}
               </GatedButton>
             )}
             <Button
@@ -827,7 +800,6 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
           void refresh();
         }}
         focusConfluence={focusConfluenceOnOpen}
-        onAcknowledge={(alert) => void handleAcknowledge(alert)}
         onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
         onReopen={(alert) => void handleReopen(alert)}
         onOpenDismiss={(alert) => setDismissModalAlerts([alert])}

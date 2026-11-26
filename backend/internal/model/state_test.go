@@ -15,7 +15,7 @@ func TestAlertStateTransitions(t *testing.T) {
 		attachNormal bool
 		attachRetro  bool
 	}{
-		{AlertStateFiring, true, false, true, false, false, false},
+		{AlertStateFiring, true, false, true, false, true, true},
 		{AlertStateAcknowledged, false, true, true, false, true, true},
 		{AlertStateDismissed, false, false, false, true, false, false},
 		{AlertStateResolved, false, false, false, false, false, true},

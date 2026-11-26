@@ -238,13 +238,6 @@ export const alertApi = {
     );
   },
 
-  acknowledgeAlert(alertId: string, payload: StateMutationRequest): Promise<Alert> {
-    return requestResource<Alert>(`/alerts/${encodeURIComponent(alertId)}/acknowledge`, {
-      method: 'POST',
-      data: payload,
-    });
-  },
-
   unacknowledgeAlert(alertId: string, payload: StateMutationRequest): Promise<Alert> {
     return requestResource<Alert>(`/alerts/${encodeURIComponent(alertId)}/unacknowledge`, {
       method: 'POST',

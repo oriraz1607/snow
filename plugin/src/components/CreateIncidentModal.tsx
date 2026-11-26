@@ -203,12 +203,16 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
   const trimmedShort = shortDescription.trim();
   const shortInvalid = trimmedShort.length < 5 || trimmedShort.length > 160;
   const firingCount = alerts.filter((a) => a.state === 'firing').length;
-  const isBulk = alerts.length > 1 || firingCount > 0;
+  const isBulk = alerts.length > 1;
 
   const modalTitle =
     alerts.length > 1
-      ? `Create Single ServiceNow Incident (${alerts.length} alerts)`
-      : `Create ServiceNow Incident — ${alerts[0].alert_name}`;
+      ? firingCount > 0
+        ? `Acknowledge & Create Single ServiceNow Incident (${alerts.length} alerts)`
+        : `Create Single ServiceNow Incident (${alerts.length} alerts)`
+      : firingCount > 0
+        ? `Acknowledge & Create ServiceNow Incident — ${alerts[0].alert_name}`
+        : `Create ServiceNow Incident — ${alerts[0].alert_name}`;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -294,7 +298,9 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
       setCanRetry(isTransient);
       setSubmitError(
         isTransient
-          ? `ServiceNow returned HTTP ${apiErr.status}: ${apiErr.message}. Alert(s) remain acknowledged — retry safely with the preserved form and idempotency key.`
+          ? firingCount > 0
+            ? `ServiceNow returned HTTP ${apiErr.status}: ${apiErr.message}. Alert(s) remain firing until the incident is created — retry safely with the preserved form and idempotency key.`
+            : `ServiceNow returned HTTP ${apiErr.status}: ${apiErr.message}. Alert(s) remain acknowledged — retry safely with the preserved form and idempotency key.`
           : apiErr?.message || 'Failed to create ServiceNow incident.'
       );
     } finally {
@@ -331,7 +337,7 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
               <strong>Included Alerts ({alerts.length})</strong>
               {firingCount > 0 && (
                 <span className={styles.autoAckNote}>
-                  {firingCount} firing alert{firingCount === 1 ? '' : 's'} will be auto-acknowledged
+                  {firingCount} firing alert{firingCount === 1 ? '' : 's'} will be acknowledged once the incident is created
                 </span>
               )}
             </div>
@@ -479,8 +485,12 @@ export const CreateIncidentModal: React.FC<CreateIncidentModalProps> = ({
                 : canRetry
                   ? 'Retry Creation'
                   : alerts.length > 1
-                    ? `Create Single Incident (${alerts.length})`
-                    : 'Create ServiceNow Incident'}
+                    ? firingCount > 0
+                      ? `Acknowledge & Create Single Incident (${alerts.length})`
+                      : `Create Single Incident (${alerts.length})`
+                    : firingCount > 0
+                      ? 'Acknowledge & Create Incident'
+                      : 'Create ServiceNow Incident'}
             </Button>
           </div>
         </div>

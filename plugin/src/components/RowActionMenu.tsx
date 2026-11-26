@@ -25,7 +25,6 @@ export interface RowActionMenuProps {
   canTriage: boolean;
   canWriteIncidents: boolean;
   busy?: boolean;
-  onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
   onReopen: (alert: Alert) => void;
   onOpenDismiss: (alert: Alert) => void;
@@ -48,7 +47,6 @@ export const RowActionMenu: React.FC<RowActionMenuProps> = ({
   canTriage,
   canWriteIncidents,
   busy = false,
-  onAcknowledge,
   onUnacknowledge,
   onReopen,
   onOpenDismiss,
@@ -69,24 +67,26 @@ export const RowActionMenu: React.FC<RowActionMenuProps> = ({
 
   const items: MenuItemDef[] = [];
   if (alert.state === 'firing') {
+    const canAckWithTicket = canWriteIncidents && canTriage && !busy;
+    const ackWithTicketReason = !canWriteIncidents
+      ? DISABLED_INCIDENT_REASON
+      : !canTriage
+        ? DISABLED_TRIAGE_REASON
+        : undefined;
     items.push(
       {
-        id: 'acknowledge',
-        label: 'Acknowledge',
-        allowed: canTriage && !busy,
-        disabledReason: !canTriage ? DISABLED_TRIAGE_REASON : undefined,
-        onSelect: () => onAcknowledge(alert),
+        id: 'create_incident',
+        label: 'Acknowledge & Create Incident',
+        allowed: canAckWithTicket,
+        disabledReason: ackWithTicketReason,
+        onSelect: () => onOpenCreateIncident(alert),
       },
       {
-        id: 'create_incident',
-        label: 'Create ServiceNow Incident',
-        allowed: canWriteIncidents && canTriage && !busy,
-        disabledReason: !canWriteIncidents
-          ? DISABLED_INCIDENT_REASON
-          : !canTriage
-            ? DISABLED_TRIAGE_REASON
-            : undefined,
-        onSelect: () => onOpenCreateIncident(alert),
+        id: 'link_incident',
+        label: 'Acknowledge & Link Incident...',
+        allowed: canAckWithTicket,
+        disabledReason: ackWithTicketReason,
+        onSelect: () => onOpenLinkIncident(alert),
       },
       {
         id: 'dismiss',

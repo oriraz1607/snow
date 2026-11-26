@@ -106,8 +106,8 @@ type BulkIncidentReservation struct {
 }
 
 // ReserveBulkIncidentCreation runs Tx 1 for multi-alert ServiceNow incident creation:
-// locks selected alerts deterministically, auto-acknowledges any firing alerts, and reserves
-// pending incident rows for every alert without holding DB locks during HTTP calls.
+// locks selected alerts deterministically, validates triage permissions for firing alerts,
+// and reserves pending incident rows without mutating alert states before ServiceNow confirms creation.
 func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 	ctx context.Context,
 	alertIDs []string,
@@ -213,43 +213,7 @@ func (r *ServiceNowRepository) ReserveBulkIncidentCreation(
 			).WithDetails(map[string]any{"alert_id": a.ID, "current_state": string(a.State), "current_version": a.Version})
 		}
 		if a.State == model.AlertStateFiring && !allowTriage {
-			return nil, apierror.New(http.StatusForbidden, apierror.CodeForbiddenRBAC, "Triage permission is required to auto-acknowledge firing alerts.")
-		}
-	}
-
-	for i := range alerts {
-		a := &alerts[i]
-		if a.State == model.AlertStateFiring {
-			if _, err := tx.Exec(ctx, `
-				UPDATE alerts
-				SET state = 'acknowledged',
-					version = version + 1,
-					acknowledged_by = $2,
-					acknowledged_by_email = $3,
-					acknowledged_at = NOW()
-				WHERE id = $1::uuid
-			`, a.ID, op.Login, model.StringPtrOrNil(op.Email)); err != nil {
-				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to auto-acknowledge firing alert.").WithCause(err)
-			}
-			prev := model.AlertStateFiring
-			next := model.AlertStateAcknowledged
-			comment := "Auto-acknowledged while creating ServiceNow incident."
-			if err := insertAuditLogTx(ctx, tx, auditEntry{
-				AlertID:       a.ID,
-				EventType:     model.AuditAlertAcknowledged,
-				ActorType:     model.ActorOperator,
-				ActorLogin:    op.Login,
-				ActorEmail:    model.StringPtrOrNil(op.Email),
-				ActorRole:     model.StringPtrOrNil(op.Role),
-				PreviousState: &prev,
-				NewState:      &next,
-				Comment:       &comment,
-				Metadata:      map[string]any{"auto_acknowledged_by_incident": true},
-			}); err != nil {
-				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to log auto-acknowledgement.").WithCause(err)
-			}
-			a.State = model.AlertStateAcknowledged
-			a.Version++
+			return nil, apierror.New(http.StatusForbidden, apierror.CodeForbiddenRBAC, "Triage permission is required to acknowledge firing alerts when creating a ServiceNow incident.")
 		}
 	}
 
@@ -499,6 +463,36 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentCreated(
 		return nil, err
 	}
 
+	autoAcked := make(map[string]bool, len(alertIDs))
+	for _, aID := range alertIDs {
+		curState := lockedStates[aID]
+		if curState == model.AlertStateFiring {
+			if _, execErr := tx.Exec(ctx, `
+				UPDATE alerts
+				SET state = 'acknowledged',
+					version = version + 1,
+					acknowledged_by = $2,
+					acknowledged_by_email = $3,
+					acknowledged_at = NOW()
+				WHERE id = $1::uuid
+			`, aID, op.Login, model.StringPtrOrNil(op.Email)); execErr != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to acknowledge firing alert on bulk incident creation.").WithCause(execErr)
+			}
+			autoAcked[aID] = true
+			lockedStates[aID] = model.AlertStateAcknowledged
+		} else if curState == model.AlertStateResolved {
+			if _, execErr := tx.Exec(ctx, `
+				UPDATE alerts
+				SET acknowledged_by = COALESCE(acknowledged_by, $2),
+					acknowledged_by_email = COALESCE(acknowledged_by_email, $3),
+					acknowledged_at = COALESCE(acknowledged_at, NOW())
+				WHERE id = $1::uuid
+			`, aID, op.Login, model.StringPtrOrNil(op.Email)); execErr != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record retrospective acknowledgement metadata.").WithCause(execErr)
+			}
+		}
+	}
+
 	var primaryInc *model.ServiceNowIncident
 	for _, aID := range alertIDs {
 		incID := resv.IncidentIDs[aID]
@@ -558,6 +552,31 @@ func (r *ServiceNowRepository) FinalizeBulkIncidentCreated(
 		}
 
 		st := lockedStates[aID]
+		if autoAcked[aID] {
+			prevAck := model.AlertStateFiring
+			nextAck := model.AlertStateAcknowledged
+			ackComment := "Acknowledged on ServiceNow incident creation."
+			if err := insertAuditLogTx(ctx, tx, auditEntry{
+				AlertID:       aID,
+				EventType:     model.AuditAlertAcknowledged,
+				ActorType:     model.ActorOperator,
+				ActorLogin:    op.Login,
+				ActorEmail:    model.StringPtrOrNil(op.Email),
+				ActorRole:     model.StringPtrOrNil(op.Role),
+				PreviousState: &prevAck,
+				NewState:      &nextAck,
+				Comment:       &ackComment,
+				Metadata: map[string]any{
+					"auto_acknowledged_by_incident": true,
+					"incident_number":               res.Number,
+					"snow_sys_id":                   res.SysID,
+					"bulk_count":                    len(alertIDs),
+				},
+			}); err != nil {
+				return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to log bulk acknowledgement.").WithCause(err)
+			}
+		}
+
 		if err := insertAuditLogTx(ctx, tx, auditEntry{
 			AlertID:       aID,
 			EventType:     auditType,
@@ -693,6 +712,7 @@ func (r *ServiceNowRepository) ReserveIncidentCreation(
 	alertID string,
 	op auth.OperatorContext,
 	req model.CreateIncidentRequest,
+	allowTriage bool,
 	allowRetrospective bool,
 	idem IdempotencyMeta,
 ) (*IncidentReservation, error) {
@@ -752,8 +772,12 @@ func (r *ServiceNowRepository) ReserveIncidentCreation(
 
 	if !model.CanAttachIncident(alertRow.State, allowRetrospective) {
 		return nil, apierror.New(http.StatusConflict, apierror.CodeInvalidStateTransition,
-			fmt.Sprintf("Alert must be acknowledged before creating a ServiceNow incident (current state: %s).", alertRow.State),
+			fmt.Sprintf("Alert must be firing or acknowledged before creating a ServiceNow incident (current state: %s).", alertRow.State),
 		).WithDetails(map[string]any{"current_state": string(alertRow.State), "current_version": alertRow.Version})
+	}
+	if alertRow.State == model.AlertStateFiring && !allowTriage {
+		return nil, apierror.New(http.StatusForbidden, apierror.CodeForbiddenRBAC,
+			"Triage permission is required to acknowledge firing alerts when creating a ServiceNow incident.")
 	}
 
 	var existingID string
@@ -902,6 +926,32 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to lock alert row.").WithCause(err)
 	}
 	alertState = model.AlertState(lockedStateStr)
+	autoAcked := false
+	if alertState == model.AlertStateFiring {
+		if _, execErr := tx.Exec(ctx, `
+			UPDATE alerts
+			SET state = 'acknowledged',
+				version = version + 1,
+				acknowledged_by = $2,
+				acknowledged_by_email = $3,
+				acknowledged_at = NOW()
+			WHERE id = $1::uuid
+		`, alertID, op.Login, model.StringPtrOrNil(op.Email)); execErr != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to acknowledge firing alert on incident creation.").WithCause(execErr)
+		}
+		autoAcked = true
+		alertState = model.AlertStateAcknowledged
+	} else if alertState == model.AlertStateResolved {
+		if _, execErr := tx.Exec(ctx, `
+			UPDATE alerts
+			SET acknowledged_by = COALESCE(acknowledged_by, $2),
+				acknowledged_by_email = COALESCE(acknowledged_by_email, $3),
+				acknowledged_at = COALESCE(acknowledged_at, NOW())
+			WHERE id = $1::uuid
+		`, alertID, op.Login, model.StringPtrOrNil(op.Email)); execErr != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record retrospective acknowledgement metadata.").WithCause(execErr)
+		}
+	}
 
 	var inc model.ServiceNowIncident
 	var syncStatusStr, callerModeStr, callerResStr string
@@ -946,6 +996,30 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 	inc.SyncStatus = model.SnowSyncStatus(syncStatusStr)
 	inc.CallerMode = model.SnowCallerMode(callerModeStr)
 	inc.CallerResolutionStatus = model.SnowCallerResolutionStatus(callerResStr)
+
+	if autoAcked {
+		prevAck := model.AlertStateFiring
+		nextAck := model.AlertStateAcknowledged
+		ackComment := "Acknowledged on ServiceNow incident creation."
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       alertID,
+			EventType:     model.AuditAlertAcknowledged,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &prevAck,
+			NewState:      &nextAck,
+			Comment:       &ackComment,
+			Metadata: map[string]any{
+				"auto_acknowledged_by_incident": true,
+				"incident_number":               res.Number,
+				"snow_sys_id":                   res.SysID,
+			},
+		}); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record acknowledgement audit event.").WithCause(err)
+		}
+	}
 
 	if err := insertAuditLogTx(ctx, tx, auditEntry{
 		AlertID:       alertID,
@@ -1000,7 +1074,7 @@ func (r *ServiceNowRepository) FinalizeIncidentCreated(
 	return &inc, nil
 }
 
-// FinalizeIncidentFailed records a failed ServiceNow creation attempt while keeping the alert acknowledged.
+// FinalizeIncidentFailed records a failed ServiceNow creation attempt without acknowledging firing alerts.
 func (r *ServiceNowRepository) FinalizeIncidentFailed(ctx context.Context, alertID, incidentID string, alertState model.AlertState, op auth.OperatorContext, errMsg, idemKey string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -1050,12 +1124,14 @@ func (r *ServiceNowRepository) FinalizeIncidentFailed(ctx context.Context, alert
 	return tx.Commit(ctx)
 }
 
-// SaveLinkedIncident links an existing ServiceNow incident to an alert episode.
+// SaveLinkedIncident links an existing ServiceNow incident to an alert episode,
+// atomically acknowledging a firing alert in the same transaction.
 func (r *ServiceNowRepository) SaveLinkedIncident(
 	ctx context.Context,
 	alertID string,
 	op auth.OperatorContext,
 	snowInc SnowCreateResult,
+	allowTriage bool,
 	allowRetrospective bool,
 ) (*model.IncidentSyncResponse, error) {
 	tx, err := r.pool.Begin(ctx)
@@ -1083,28 +1159,55 @@ func (r *ServiceNowRepository) SaveLinkedIncident(
 	alertState := model.AlertState(stateStr)
 	if !model.CanAttachIncident(alertState, allowRetrospective) {
 		return nil, apierror.New(http.StatusConflict, apierror.CodeInvalidStateTransition,
-			fmt.Sprintf("Alert must be acknowledged before linking a ServiceNow incident (current state: %s).", alertState),
+			fmt.Sprintf("Alert must be firing or acknowledged before linking a ServiceNow incident (current state: %s).", alertState),
 		).WithDetails(map[string]any{"current_state": string(alertState), "current_version": version})
+	}
+	if alertState == model.AlertStateFiring && !allowTriage {
+		return nil, apierror.New(http.StatusForbidden, apierror.CodeForbiddenRBAC,
+			"Triage permission is required to acknowledge firing alerts when linking a ServiceNow incident.")
 	}
 
 	var existingID, existingStatusStr string
+	var existingUpdatedAt time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id::text, sync_status::text
+		SELECT id::text, sync_status::text, updated_at
 		FROM servicenow_incidents
 		WHERE alert_id = $1::uuid
 		FOR UPDATE
-	`, alertID).Scan(&existingID, &existingStatusStr)
+	`, alertID).Scan(&existingID, &existingStatusStr, &existingUpdatedAt)
 	if err == nil {
 		st := model.SnowSyncStatus(existingStatusStr)
 		if st == model.SnowSyncCreated || st == model.SnowSyncLinked {
 			return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentAlreadyLinked,
 				"A ServiceNow incident is already linked to this alert episode.")
 		}
-		if st == model.SnowSyncPending {
+		if st == model.SnowSyncPending && time.Since(existingUpdatedAt) <= stalePendingThreshold {
 			return nil, apierror.New(http.StatusConflict, apierror.CodeIncidentCreationInProgress,
 				"ServiceNow incident creation is currently in progress for this alert.")
 		}
-		// Replace failed reservation row with the linked ticket.
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to check linked incident.").WithCause(err)
+	}
+
+	autoAcked := false
+	if alertState == model.AlertStateFiring {
+		if _, execErr := tx.Exec(ctx, `
+			UPDATE alerts
+			SET state = 'acknowledged',
+				version = version + 1,
+				acknowledged_by = $2,
+				acknowledged_by_email = $3,
+				acknowledged_at = NOW()
+			WHERE id = $1::uuid
+		`, alertID, op.Login, model.StringPtrOrNil(op.Email)); execErr != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to acknowledge firing alert while linking incident.").WithCause(execErr)
+		}
+		autoAcked = true
+		alertState = model.AlertStateAcknowledged
+	}
+
+	if err == nil {
+		// Replace failed or stale pending reservation row with the linked ticket.
 		_, err = tx.Exec(ctx, `
 			UPDATE servicenow_incidents
 			SET sync_status = 'linked',
@@ -1129,7 +1232,7 @@ func (r *ServiceNowRepository) SaveLinkedIncident(
 		if err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to update linked incident.").WithCause(err)
 		}
-	} else if errors.Is(err, pgx.ErrNoRows) {
+	} else {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO servicenow_incidents (
 				alert_id, correlation_id, sync_status, snow_sys_id, incident_number, incident_url,
@@ -1153,8 +1256,30 @@ func (r *ServiceNowRepository) SaveLinkedIncident(
 		if err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to save linked incident.").WithCause(err)
 		}
-	} else {
-		return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to check linked incident.").WithCause(err)
+	}
+
+	if autoAcked {
+		prevAck := model.AlertStateFiring
+		nextAck := model.AlertStateAcknowledged
+		ackComment := "Acknowledged on ServiceNow incident link."
+		if err := insertAuditLogTx(ctx, tx, auditEntry{
+			AlertID:       alertID,
+			EventType:     model.AuditAlertAcknowledged,
+			ActorType:     model.ActorOperator,
+			ActorLogin:    op.Login,
+			ActorEmail:    model.StringPtrOrNil(op.Email),
+			ActorRole:     model.StringPtrOrNil(op.Role),
+			PreviousState: &prevAck,
+			NewState:      &nextAck,
+			Comment:       &ackComment,
+			Metadata: map[string]any{
+				"auto_acknowledged_by_incident": true,
+				"incident_number":               snowInc.Number,
+				"snow_sys_id":                   snowInc.SysID,
+			},
+		}); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, apierror.CodeDBUnavailable, "Failed to record acknowledgement audit event.").WithCause(err)
+		}
 	}
 
 	if err := insertAuditLogTx(ctx, tx, auditEntry{

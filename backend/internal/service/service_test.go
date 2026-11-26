@@ -164,10 +164,13 @@ type fakeIncidentRepo struct {
 	lastReopenNote      string
 	lastReopenSource    string
 	updateBySysIDCount  int
+	lastAllowTriage     bool
+	lastLinkAllowTriage bool
 }
 
-func (f *fakeIncidentRepo) ReserveIncidentCreation(_ context.Context, _ string, _ auth.OperatorContext, _ model.CreateIncidentRequest, _ bool, idem store.IdempotencyMeta) (*store.IncidentReservation, error) {
+func (f *fakeIncidentRepo) ReserveIncidentCreation(_ context.Context, _ string, _ auth.OperatorContext, _ model.CreateIncidentRequest, allowTriage bool, _ bool, idem store.IdempotencyMeta) (*store.IncidentReservation, error) {
 	f.lastIdem = idem
+	f.lastAllowTriage = allowTriage
 	if f.reserveErr != nil {
 		return nil, f.reserveErr
 	}
@@ -280,7 +283,8 @@ func (f *fakeIncidentRepo) FinalizeBulkIncidentFailed(_ context.Context, resv *s
 	return nil
 }
 
-func (f *fakeIncidentRepo) SaveLinkedIncident(_ context.Context, alertID string, _ auth.OperatorContext, snowInc store.SnowCreateResult, _ bool) (*model.IncidentSyncResponse, error) {
+func (f *fakeIncidentRepo) SaveLinkedIncident(_ context.Context, alertID string, _ auth.OperatorContext, snowInc store.SnowCreateResult, allowTriage bool, _ bool) (*model.IncidentSyncResponse, error) {
+	f.lastLinkAllowTriage = allowTriage
 	return &model.IncidentSyncResponse{
 		AlertID: alertID,
 		ServiceNowIncident: &model.ServiceNowIncident{
@@ -1137,6 +1141,88 @@ func TestOperatorWorkNoteAttribution(t *testing.T) {
 	}
 	if len(snow.workNotesPosted) != 2 || !containsStr(snow.workNotesPosted[1], "[Grafana NOC — noc.bot] Linked alert episode") {
 		t.Fatalf("unexpected LinkIncident attribution: %v", snow.workNotesPosted)
+	}
+}
+
+func TestIncidentServiceAllowTriagePropagation(t *testing.T) {
+	cfg := &config.Config{
+		GrafanaPublicURL:       "https://grafana.example.com",
+		DefaultCallerSysID:     "noc_001",
+		DefaultCallerUsername:  "noc",
+		DefaultAssignmentGroup: "Infra",
+		DefaultCategory:        "Infrastructure",
+	}
+	const alertID = "11111111-1111-4111-8111-111111111111"
+	sysID := "snow_sys_1"
+	incNum := "INC0000100"
+
+	repo := &fakeIncidentRepo{
+		reservation: &store.IncidentReservation{
+			IncidentID: "inc-1",
+			Alert: model.AlertDetail{
+				ID:        alertID,
+				State:     model.AlertStateFiring,
+				AlertName: "HighCPU",
+				Severity:  "critical",
+			},
+		},
+	}
+	snow := &fakeSnowClient{
+		createdRec: &servicenow.IncidentRecord{SysID: sysID, Number: incNum, State: 1},
+		foundByNum: &servicenow.IncidentRecord{SysID: sysID, Number: incNum, State: 1},
+	}
+	svc := NewIncidentService(repo, snow, fakeCallerLookup{
+		res: store.CallerResolution{SysID: "u_alice", ResolutionStatus: model.CallerResSSOMatched},
+	}, cfg, nil, nil)
+
+	editorOp := auth.OperatorContext{
+		Login:       "alice",
+		Role:        "Editor",
+		Permissions: []string{auth.PermAlertsRead, auth.PermAlertsTriage, auth.PermIncidentsWrite},
+	}
+	if _, err := svc.CreateIncident(context.Background(), alertID, editorOp, model.CreateIncidentRequest{
+		ShortDescription: "High CPU usage",
+		Impact:           1,
+		Urgency:          1,
+	}, ""); err != nil {
+		t.Fatalf("CreateIncident with Editor error: %v", err)
+	}
+	if !repo.lastAllowTriage {
+		t.Fatalf("expected allowTriage=true for Editor CreateIncident")
+	}
+
+	if _, err := svc.LinkIncident(context.Background(), alertID, editorOp, model.LinkIncidentRequest{
+		IncidentNumber: incNum,
+	}); err != nil {
+		t.Fatalf("LinkIncident with Editor error: %v", err)
+	}
+	if !repo.lastLinkAllowTriage {
+		t.Fatalf("expected allowTriage=true for Editor LinkIncident")
+	}
+
+	noTriageOp := auth.OperatorContext{
+		Login:       "bot",
+		Role:        "Editor",
+		Permissions: []string{auth.PermAlertsRead, auth.PermIncidentsWrite},
+	}
+	if _, err := svc.CreateIncident(context.Background(), alertID, noTriageOp, model.CreateIncidentRequest{
+		ShortDescription: "High CPU usage",
+		Impact:           1,
+		Urgency:          1,
+	}, ""); err != nil {
+		t.Fatalf("CreateIncident without PermAlertsTriage error: %v", err)
+	}
+	if repo.lastAllowTriage {
+		t.Fatalf("expected allowTriage=false when PermAlertsTriage is absent")
+	}
+
+	if _, err := svc.LinkIncident(context.Background(), alertID, noTriageOp, model.LinkIncidentRequest{
+		IncidentNumber: incNum,
+	}); err != nil {
+		t.Fatalf("LinkIncident without PermAlertsTriage error: %v", err)
+	}
+	if repo.lastLinkAllowTriage {
+		t.Fatalf("expected allowTriage=false on LinkIncident when PermAlertsTriage is absent")
 	}
 }
 

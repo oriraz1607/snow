@@ -17,6 +17,7 @@ const (
 	CodeIncidentNotFound           = "INCIDENT_NOT_FOUND"
 	CodeConflictStaleVersion       = "CONFLICT_STALE_VERSION"
 	CodeInvalidStateTransition     = "INVALID_STATE_TRANSITION"
+	CodeTicketRequiredForAck       = "TICKET_REQUIRED_FOR_ACKNOWLEDGE"
 	CodeIncidentAlreadyLinked      = "INCIDENT_ALREADY_LINKED"
 	CodeIncidentCreationInProgress = "INCIDENT_CREATION_IN_PROGRESS"
 	CodeIdempotencyKeyConflict     = "IDEMPOTENCY_KEY_CONFLICT"

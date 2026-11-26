@@ -87,7 +87,7 @@ func CanReopen(state AlertState) bool {
 
 // CanAttachIncident reports whether an alert in state may have a ServiceNow incident created or linked.
 func CanAttachIncident(state AlertState, allowRetrospective bool) bool {
-	if state == AlertStateAcknowledged {
+	if state == AlertStateFiring || state == AlertStateAcknowledged {
 		return true
 	}
 	return allowRetrospective && state == AlertStateResolved

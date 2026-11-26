@@ -36,6 +36,7 @@ export const LinkIncidentModal: React.FC<LinkIncidentModalProps> = ({
 
   const trimmed = incidentNumber.trim().toUpperCase();
   const isValid = trimmed.length >= 4;
+  const isFiring = alert.state === 'firing';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -59,8 +60,23 @@ export const LinkIncidentModal: React.FC<LinkIncidentModalProps> = ({
   };
 
   return (
-    <Modal isOpen={isOpen} title={`Link Existing Incident — ${alert.alert_name}`} onDismiss={onClose}>
+    <Modal
+      isOpen={isOpen}
+      title={
+        isFiring
+          ? `Acknowledge & Link Existing Incident — ${alert.alert_name}`
+          : `Link Existing Incident — ${alert.alert_name}`
+      }
+      onDismiss={onClose}
+    >
       <form onSubmit={handleSubmit}>
+        {isFiring && (
+          <div style={{ marginBottom: '12px' }} data-testid="link-modal-ack-notice">
+            <GrafanaAlert severity="info" title="Firing alert will be acknowledged">
+              Linking this ServiceNow incident will acknowledge the alert and move it to the Acknowledged queue.
+            </GrafanaAlert>
+          </div>
+        )}
         {error && (
           <div style={{ marginBottom: '12px' }}>
             <GrafanaAlert severity="error" title="Unable to link incident">
@@ -91,7 +107,11 @@ export const LinkIncidentModal: React.FC<LinkIncidentModalProps> = ({
             Cancel
           </Button>
           <Button variant="primary" type="submit" disabled={!isValid || submitting}>
-            {submitting ? 'Linking...' : 'Link Incident'}
+            {submitting
+              ? 'Linking...'
+              : isFiring
+                ? 'Acknowledge & Link Incident'
+                : 'Link Incident'}
           </Button>
         </Modal.ButtonRow>
       </form>

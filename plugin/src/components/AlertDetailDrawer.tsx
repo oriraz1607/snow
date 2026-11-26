@@ -48,7 +48,6 @@ interface AlertDetailDrawerProps {
   canWriteIncidents: boolean;
   onClose: () => void;
   onAlertUpdated: (updated: Alert) => void;
-  onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
   onReopen: (alert: Alert) => void;
   onOpenDismiss: (alert: Alert) => void;
@@ -71,7 +70,6 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   canWriteIncidents,
   onClose,
   onAlertUpdated,
-  onAcknowledge,
   onUnacknowledge,
   onReopen,
   onOpenDismiss,
@@ -658,15 +656,24 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
           )}
 
           {detail.state === 'firing' && (
-            <div className={styles.pinnedBar}>
+            <div className={styles.pinnedBar} data-testid="drawer-action-bar">
               <GatedButton
-                allowed={canTriage}
-                disabledReason={DISABLED_TRIAGE_REASON}
+                allowed={canTriage && canWriteIncidents}
+                disabledReason={!canWriteIncidents ? DISABLED_INCIDENT_REASON : DISABLED_TRIAGE_REASON}
                 variant="primary"
                 size="sm"
-                onClick={() => onAcknowledge(detail)}
+                onClick={() => onOpenCreateIncident(detail)}
               >
-                Acknowledge
+                Acknowledge &amp; Create Incident
+              </GatedButton>
+              <GatedButton
+                allowed={canTriage && canWriteIncidents}
+                disabledReason={!canWriteIncidents ? DISABLED_INCIDENT_REASON : DISABLED_TRIAGE_REASON}
+                variant="secondary"
+                size="sm"
+                onClick={() => onOpenLinkIncident(detail)}
+              >
+                Link Existing Incident
               </GatedButton>
               <GatedButton
                 allowed={canTriage}
@@ -851,51 +858,79 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
 
           {activeTab === 'servicenow' && (
             <div className={styles.tabBody}>
-              {!inc ? (
-                <div className={styles.emptyTab}>
-                  <p>No ServiceNow incident is linked to this alert episode.</p>
-                  {detail.state === 'acknowledged' && (
-                    <div className={styles.bannerActions}>
-                      <GatedButton
-                        allowed={canWriteIncidents}
-                        disabledReason={DISABLED_INCIDENT_REASON}
-                        variant="primary"
-                        size="sm"
-                        onClick={() => onOpenCreateIncident(detail)}
-                      >
-                        Create ServiceNow Incident
-                      </GatedButton>
-                      <GatedButton
-                        allowed={canWriteIncidents}
-                        disabledReason={DISABLED_INCIDENT_REASON}
-                        variant="secondary"
-                        size="sm"
-                        onClick={() => onOpenLinkIncident(detail)}
-                      >
-                        Link Existing Incident
-                      </GatedButton>
-                    </div>
-                  )}
-                </div>
+              {!hasLinkedIncident ? (
+                inc?.sync_status === 'pending' ? (
+                  <div className={styles.kvGrid} data-testid="drawer-snow-pending">
+                    <KvRow label="Sync Status" value="pending (creation in progress)" />
+                    <KvRow label="Caller Mode" value={inc.caller_mode} />
+                    <KvRow label="Assignment Group" value={inc.assignment_group || '—'} />
+                  </div>
+                ) : (
+                  <div className={styles.emptyTab}>
+                    {inc?.sync_status === 'failed' ? (
+                      <div style={{ marginBottom: '12px' }}>
+                        <GrafanaAlert severity="error" title="ServiceNow incident creation failed">
+                          {inc.last_error || 'Previous ServiceNow incident attempt failed. Retry or link an existing ticket.'}
+                        </GrafanaAlert>
+                      </div>
+                    ) : (
+                      <p>
+                        {detail.state === 'firing'
+                          ? 'No ServiceNow incident is linked yet. Creating or linking a ServiceNow incident will acknowledge this firing alert.'
+                          : 'No ServiceNow incident is linked to this alert episode.'}
+                      </p>
+                    )}
+                    {(detail.state === 'firing' || detail.state === 'acknowledged') && (
+                      <div className={styles.bannerActions}>
+                        <GatedButton
+                          allowed={canWriteIncidents && (detail.state !== 'firing' || canTriage)}
+                          disabledReason={
+                            !canWriteIncidents ? DISABLED_INCIDENT_REASON : DISABLED_TRIAGE_REASON
+                          }
+                          variant="primary"
+                          size="sm"
+                          onClick={() => onOpenCreateIncident(detail)}
+                        >
+                          {detail.state === 'firing'
+                            ? 'Acknowledge & Create Incident'
+                            : inc?.sync_status === 'failed'
+                              ? 'Retry ServiceNow Incident'
+                              : 'Create ServiceNow Incident'}
+                        </GatedButton>
+                        <GatedButton
+                          allowed={canWriteIncidents && (detail.state !== 'firing' || canTriage)}
+                          disabledReason={
+                            !canWriteIncidents ? DISABLED_INCIDENT_REASON : DISABLED_TRIAGE_REASON
+                          }
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => onOpenLinkIncident(detail)}
+                        >
+                          Link Existing Incident
+                        </GatedButton>
+                      </div>
+                    )}
+                  </div>
+                )
               ) : (
                 <>
                   <div className={styles.kvGrid}>
-                    <KvRow label="Incident Number" value={inc.incident_number || 'Pending'} />
-                    <KvRow label="Sys ID" value={inc.snow_sys_id || '—'} />
-                    <KvRow label="Sync Status" value={inc.sync_status} />
+                    <KvRow label="Incident Number" value={inc?.incident_number || 'Pending'} />
+                    <KvRow label="Sys ID" value={inc?.snow_sys_id || '—'} />
+                    <KvRow label="Sync Status" value={inc?.sync_status || '—'} />
                     <KvRow
                       label="ServiceNow State"
-                      value={inc.snow_state_label ? `${inc.snow_state_label} (${inc.snow_state ?? ''})` : '—'}
+                      value={inc?.snow_state_label ? `${inc.snow_state_label} (${inc.snow_state ?? ''})` : '—'}
                     />
-                    <KvRow label="Priority" value={inc.priority ? `P${inc.priority}` : '—'} />
-                    <KvRow label="Assignment Group" value={inc.assignment_group || '—'} />
-                    <KvRow label="Caller Mode" value={inc.caller_mode} />
-                    <KvRow label="Caller Resolution" value={inc.caller_resolution_status} />
-                    {inc.caller_fallback_reason && (
+                    <KvRow label="Priority" value={inc?.priority ? `P${inc.priority}` : '—'} />
+                    <KvRow label="Assignment Group" value={inc?.assignment_group || '—'} />
+                    <KvRow label="Caller Mode" value={inc?.caller_mode || '—'} />
+                    <KvRow label="Caller Resolution" value={inc?.caller_resolution_status || '—'} />
+                    {inc?.caller_fallback_reason && (
                       <KvRow label="Fallback Reason" value={inc.caller_fallback_reason} />
                     )}
-                    <KvRow label="Last Synced (UTC)" value={formatUtcTimestamp(inc.snow_state_synced_at)} />
-                    {inc.last_error && <KvRow label="Last Error" value={inc.last_error} />}
+                    <KvRow label="Last Synced (UTC)" value={formatUtcTimestamp(inc?.snow_state_synced_at)} />
+                    {inc?.last_error && <KvRow label="Last Error" value={inc.last_error} />}
                   </div>
 
                   <div className={styles.bannerActions}>
@@ -918,7 +953,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                     >
                       Post Work Note
                     </GatedButton>
-                    {inc.incident_url && (
+                    {inc?.incident_url && (
                       <a href={inc.incident_url} target="_blank" rel="noopener noreferrer" className={styles.externalLinkBtn}>
                         Open in ServiceNow ↗
                       </a>

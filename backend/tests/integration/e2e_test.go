@@ -280,21 +280,16 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			t.Fatalf("expected 403 FORBIDDEN_RBAC for Viewer ack, got %d", st)
 		}
 
-		// Editor (Alice) acknowledges
+		// Editor standalone acknowledge is blocked without a ticket
 		st, ackBody := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+flow1AlertID+"/acknowledge", aliceJWT, map[string]any{
 			"version": 1,
 			"comment": "Investigating WAL lag",
 		})
-		if st != http.StatusOK {
-			t.Fatalf("acknowledge failed: status=%d body=%s", st, string(ackBody))
-		}
-		var acked model.Alert
-		_ = json.Unmarshal(ackBody, &acked)
-		if acked.State != model.AlertStateAcknowledged || acked.Version != 2 || *acked.AcknowledgedBy != "alice.smith" {
-			t.Fatalf("unexpected acknowledged alert: %+v", acked)
+		if st != http.StatusConflict || !strings.Contains(string(ackBody), "TICKET_REQUIRED_FOR_ACKNOWLEDGE") {
+			t.Fatalf("expected 409 TICKET_REQUIRED_FOR_ACKNOWLEDGE for standalone ack, got status=%d body=%s", st, string(ackBody))
 		}
 
-		// Create SNOW incident with SSO match
+		// Create SNOW incident directly from firing alert -> atomically acknowledges + creates ticket
 		st, incRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+flow1AlertID+"/servicenow/incident", aliceJWT, map[string]any{
 			"short_description": "[CRITICAL] HighReplicationLag on orders-db",
 			"impact":            1,
@@ -314,6 +309,15 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			*incResp.ServiceNowIncident.CallerSysID != "u_alice_001" ||
 			len(incResp.Warnings) != 0 {
 			t.Fatalf("expected sso_matched u_alice_001 with 0 warnings, got %+v warnings=%v", incResp.ServiceNowIncident, incResp.Warnings)
+		}
+		st, detailRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+flow1AlertID, aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get flow1 alert after incident create failed: %d", st)
+		}
+		var acked model.AlertDetail
+		_ = json.Unmarshal(detailRaw, &acked)
+		if acked.State != model.AlertStateAcknowledged || acked.Version != 2 || acked.AcknowledgedBy == nil || *acked.AcknowledgedBy != "alice.smith" {
+			t.Fatalf("expected alert to be atomically acknowledged on SNOW create, got %+v", acked)
 		}
 		flow1SnowSysID = *incResp.ServiceNowIncident.SnowSysID
 		flow1IncidentNum = *incResp.ServiceNowIncident.IncidentNumber
@@ -357,11 +361,6 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		_ = json.Unmarshal(listRaw, &listResp)
 		flow2AlertID = listResp.Items[0].ID
 
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+flow2AlertID+"/acknowledge", missingSSOJWT, map[string]any{"version": 1})
-		if st != http.StatusOK {
-			t.Fatalf("acknowledge flow2 failed: %d", st)
-		}
-
 		st, incRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+flow2AlertID+"/servicenow/incident", missingSSOJWT, map[string]any{
 			"short_description": "[WARNING] NodeMemoryHigh",
 			"impact":            2,
@@ -379,6 +378,16 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			t.Fatalf("expected fallback_noc with warning, got %+v warnings=%v", incResp.ServiceNowIncident, incResp.Warnings)
 		}
 		flow2SnowSysID = *incResp.ServiceNowIncident.SnowSysID
+
+		st, d2Raw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+flow2AlertID, aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get flow2 detail failed: %d", st)
+		}
+		var d2 model.AlertDetail
+		_ = json.Unmarshal(d2Raw, &d2)
+		if d2.State != model.AlertStateAcknowledged {
+			t.Fatalf("expected flow2 alert to be acknowledged after incident creation, got %s", d2.State)
+		}
 
 		// Check snow_caller_fallback audit event
 		st, histRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+flow2AlertID+"/history", aliceJWT, nil)
@@ -621,50 +630,23 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		_ = json.Unmarshal(listRaw, &lr)
 		concAlertID := lr.Items[0].ID
 
-		// 10 parallel acknowledge calls from distinct operators
+		// 10 parallel ServiceNow incident creations directly on firing alert (atomic reserve + single winner)
 		const workers = 10
-		ackCodes := make(chan int, workers)
 		var wg sync.WaitGroup
+		incCodes := make(chan int, workers)
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
 				jwtTok := env.signJWT(t, fmt.Sprintf("op.%d", idx), "alice.smith@corp.example", "Op", "Editor")
-				code, _ := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+concAlertID+"/acknowledge", jwtTok, map[string]any{"version": 1})
-				ackCodes <- code
-			}(i)
-		}
-		wg.Wait()
-		close(ackCodes)
-		var okAck, conflictAck int
-		for c := range ackCodes {
-			switch c {
-			case http.StatusOK:
-				okAck++
-			case http.StatusConflict:
-				conflictAck++
-			default:
-				t.Fatalf("unexpected ack status %d", c)
-			}
-		}
-		if okAck != 1 || conflictAck != workers-1 {
-			t.Fatalf("expected 1 OK and %d 409 on concurrent ack, got ok=%d conflict=%d", workers-1, okAck, conflictAck)
-		}
-
-		// 10 parallel ServiceNow incident creations
-		incCodes := make(chan int, workers)
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				code, _ := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+concAlertID+"/servicenow/incident", aliceJWT, map[string]any{
+				code, _ := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+concAlertID+"/servicenow/incident", jwtTok, map[string]any{
 					"short_description": "[CRITICAL] Concurrent SNOW test",
 					"impact":            1,
 					"urgency":           1,
 					"caller_mode":       "sso_user",
 				})
 				incCodes <- code
-			}()
+			}(i)
 		}
 		wg.Wait()
 		close(incCodes)
@@ -682,8 +664,17 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		if createdInc != 1 || conflictInc != workers-1 {
 			t.Fatalf("expected 1 201 and %d 409 on concurrent SNOW create, got created=%d conflict=%d", workers-1, createdInc, conflictInc)
 		}
+		st, concDetailRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+concAlertID, aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get concAlert failed: %d", st)
+		}
+		var concDetail model.AlertDetail
+		_ = json.Unmarshal(concDetailRaw, &concDetail)
+		if concDetail.State != model.AlertStateAcknowledged {
+			t.Fatalf("expected concAlert to transition to acknowledged, got %s", concDetail.State)
+		}
 
-		// Post-commit timeout recovery via correlation_id
+		// Post-commit timeout recovery via correlation_id: alert stays firing on failure, acks only on retry adoption
 		const timeoutFP = "fp_timeout_e2e_06"
 		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
 			Version:  "4",
@@ -707,11 +698,6 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		_ = json.Unmarshal(listRaw2, &lr2)
 		timeoutAlertID := lr2.Items[0].ID
 
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+timeoutAlertID+"/acknowledge", aliceJWT, map[string]any{"version": 1})
-		if st != http.StatusOK {
-			t.Fatalf("ack timeout alert failed: %d", st)
-		}
-
 		// Fault: commit in mocksnow then sleep 3500ms (test compose sets SNOW_HTTP_TIMEOUT_SECONDS=2)
 		st, _ = env.doJSON(t, http.MethodPost, env.mockSnowURL+"/_mock/faults", "", map[string]any{
 			"create_timeout_after_commit_ms": 3500,
@@ -728,8 +714,17 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		if st != http.StatusGatewayTimeout {
 			t.Fatalf("expected 504 SNOW_TIMEOUT on slow commit, got %d (%s)", st, string(timeoutResp))
 		}
+		st, afterFailRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+timeoutAlertID, aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get timeoutAlertID after 504 failed: %d", st)
+		}
+		var afterFailDetail model.AlertDetail
+		_ = json.Unmarshal(afterFailRaw, &afterFailDetail)
+		if afterFailDetail.State != model.AlertStateFiring {
+			t.Fatalf("expected alert to remain firing after failed SNOW call (no ack without ticket), got %s", afterFailDetail.State)
+		}
 
-		// Clear fault and retry -> must adopt the already-committed ticket with zero duplicates
+		// Clear fault and retry -> must adopt the already-committed ticket and acknowledge atomically with zero duplicates
 		st, _ = env.doJSON(t, http.MethodPost, env.mockSnowURL+"/_mock/faults", "", map[string]any{})
 		if st != http.StatusOK {
 			t.Fatalf("clear faults failed: %d", st)
@@ -741,6 +736,15 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		})
 		if st != http.StatusCreated {
 			t.Fatalf("expected 201 Created on retry adoption, got %d (%s)", st, string(retryResp))
+		}
+		st, afterRetryRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+timeoutAlertID, aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get timeoutAlertID after retry failed: %d", st)
+		}
+		var afterRetryDetail model.AlertDetail
+		_ = json.Unmarshal(afterRetryRaw, &afterRetryDetail)
+		if afterRetryDetail.State != model.AlertStateAcknowledged {
+			t.Fatalf("expected timeoutAlertID to transition to acknowledged after ticket adoption, got %s", afterRetryDetail.State)
 		}
 
 		// Verify mocksnow has only 1 incident for concAlertID and 1 for timeoutAlertID
@@ -803,36 +807,33 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		if st != http.StatusOK {
 			t.Fatalf("reopen failed: %d", st)
 		}
-		// Ack then Unack then Ack again
+		// Standalone acknowledge must return 409 without a ticket
 		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+id+"/acknowledge", aliceJWT, map[string]any{"version": 3})
-		if st != http.StatusOK {
-			t.Fatalf("ack failed: %d", st)
-		}
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+id+"/unacknowledge", aliceJWT, map[string]any{"version": 4, "comment": "Shift handoff"})
-		if st != http.StatusOK {
-			t.Fatalf("unack failed: %d", st)
-		}
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+id+"/acknowledge", aliceJWT, map[string]any{"version": 5})
-		if st != http.StatusOK {
-			t.Fatalf("re-ack failed: %d", st)
+		if st != http.StatusConflict {
+			t.Fatalf("expected 409 on standalone ack, got %d", st)
 		}
 		// Notes
 		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+id+"/notes", aliceJWT, map[string]any{"comment": "Checking logs"})
 		if st != http.StatusCreated {
 			t.Fatalf("add note failed: %d", st)
 		}
-		// Link existing closed ticket (flow1IncidentNum -> snow_state=6) to acknowledged alert -> active_closed_ticket drift
+		// Link existing closed ticket (flow1IncidentNum -> snow_state=6) directly onto firing alert -> atomically acknowledges + active_closed_ticket drift
 		st, linkRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+id+"/servicenow/link", aliceJWT, map[string]any{
 			"incident_number": flow1IncidentNum,
 			"post_work_note":  true,
 		})
 		if st != http.StatusOK {
-			t.Fatalf("link incident failed: %d", st)
+			t.Fatalf("link incident failed: %d (%s)", st, string(linkRaw))
 		}
 		var linkResp model.IncidentSyncResponse
 		_ = json.Unmarshal(linkRaw, &linkResp)
 		if linkResp.IncidentDriftStatus != model.DriftActiveClosedTicket {
-			t.Fatalf("expected active_closed_ticket drift after linking closed ticket to acknowledged alert, got %s", linkResp.IncidentDriftStatus)
+			t.Fatalf("expected active_closed_ticket drift after linking closed ticket to firing alert, got %s", linkResp.IncidentDriftStatus)
+		}
+		// Unacknowledging while a ticket is linked is blocked with 409
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+id+"/unacknowledge", aliceJWT, map[string]any{"version": 4, "comment": "Shift handoff"})
+		if st != http.StatusConflict {
+			t.Fatalf("expected 409 when unacknowledging alert with linked ticket, got %d", st)
 		}
 		st, activeClosedRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?incident_drift=active_closed_ticket", viewerJWT, nil)
 		if st != http.StatusOK {
@@ -1112,15 +1113,18 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		}
 		inheritedID := refireList.Items[0].ID
 
-		// REV-05: ack -> dismiss -> reopen clears ack; ack -> dismiss -> resolve is NOT non_active_acknowledged
+		// REV-05: link(ack) -> dismiss -> reopen clears ack; link(ack) -> dismiss -> resolve is NOT non_active_acknowledged
 		_, dismissListRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?fingerprint="+dismissFP, aliceJWT, nil)
 		var dl model.ListAlertsResponse
 		_ = json.Unmarshal(dismissListRaw, &dl)
 		dismissID := dl.Items[0].ID
 
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/acknowledge", aliceJWT, map[string]any{"version": 1})
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/servicenow/link", aliceJWT, map[string]any{
+			"incident_number": flow1IncidentNum,
+			"post_work_note":  false,
+		})
 		if st != http.StatusOK {
-			t.Fatalf("ack dismissID failed: %d", st)
+			t.Fatalf("link dismissID failed: %d", st)
 		}
 		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/dismiss", aliceJWT, map[string]any{"version": 2, "reason": "testing reopen"})
 		if st != http.StatusOK {
@@ -1135,13 +1139,41 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		if reopened.AcknowledgedBy != nil || reopened.AcknowledgedAt != nil {
 			t.Fatalf("expected reopen to clear acknowledged_by/acknowledged_at, got %+v", reopened)
 		}
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/acknowledge", aliceJWT, map[string]any{"version": 4})
+
+		// Create a second firing alert to verify ack (via link) -> dismiss -> resolve stays excluded from non_active_acknowledged
+		const dismissResolveFP = "fp_dismiss_resolve_e2e_08"
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow8",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "firing",
+					Fingerprint: dismissResolveFP,
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels:      map[string]string{"alertname": "DismissThenResolveAlert2", "severity": "warning"},
+				},
+			},
+		})
 		if st != http.StatusOK {
-			t.Fatalf("re-ack dismissID failed: %d", st)
+			t.Fatalf("ingest dismissResolveFP failed: %d", st)
 		}
-		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+dismissID+"/dismiss", aliceJWT, map[string]any{"version": 5, "reason": "noise"})
+		_, drListRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?fingerprint="+dismissResolveFP, aliceJWT, nil)
+		var drList model.ListAlertsResponse
+		_ = json.Unmarshal(drListRaw, &drList)
+		drID := drList.Items[0].ID
+
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+drID+"/servicenow/link", aliceJWT, map[string]any{
+			"incident_number": flow1IncidentNum,
+			"post_work_note":  false,
+		})
 		if st != http.StatusOK {
-			t.Fatalf("second dismiss dismissID failed: %d", st)
+			t.Fatalf("link drID failed: %d", st)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+drID+"/dismiss", aliceJWT, map[string]any{"version": 2, "reason": "noise"})
+		if st != http.StatusOK {
+			t.Fatalf("dismiss drID failed: %d", st)
 		}
 		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
 			Version:  "4",
@@ -1150,17 +1182,17 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			Alerts: []model.AlertmanagerAlert{
 				{
 					Status:      "resolved",
-					Fingerprint: dismissFP,
+					Fingerprint: dismissResolveFP,
 					StartsAt:    tStart,
 					EndsAt:      tStart.Add(3 * time.Minute),
-					Labels:      map[string]string{"alertname": "DismissThenResolveAlert", "severity": "warning"},
+					Labels:      map[string]string{"alertname": "DismissThenResolveAlert2", "severity": "warning"},
 				},
 			},
 		})
 		if st != http.StatusOK {
 			t.Fatalf("resolve dismissed alert failed: %d", st)
 		}
-		_, naaRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?state=non_active_acknowledged&fingerprint="+dismissFP, aliceJWT, nil)
+		_, naaRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?state=non_active_acknowledged&fingerprint="+dismissResolveFP, aliceJWT, nil)
 		var naaList model.ListAlertsResponse
 		_ = json.Unmarshal(naaRaw, &naaList)
 		if len(naaList.Items) != 0 {
