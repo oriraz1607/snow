@@ -9,8 +9,8 @@ export type HistoryTimeRange = '' | '24h' | '7d' | '30d' | '90d';
 export interface FilterState {
   search: string;
   severities: string[];
-  environment: string;
-  site: string;
+  environments: string[];
+  sites: string[];
   team: string;
   instance: string;
   labels: string[];
@@ -77,6 +77,12 @@ function buildSelectOptions(
   ];
 }
 
+function buildUniqueValues(values: string[], selected: string[]): string[] {
+  return Array.from(
+    new Set([...values, ...selected].map((v) => v.trim()).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
+}
+
 export const FilterToolbar: React.FC<FilterToolbarProps> = ({
   filters,
   filterOptions,
@@ -109,14 +115,14 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
     return () => clearTimeout(timer);
   }, [searchInput, filters, onChangeFilters]);
 
-  const envOptions = useMemo(
-    () => buildSelectOptions('Env: All', 'Env: ', filterOptions.environments, filters.environment),
-    [filterOptions.environments, filters.environment]
+  const envValues = useMemo(
+    () => buildUniqueValues(filterOptions.environments ?? [], filters.environments),
+    [filterOptions.environments, filters.environments]
   );
 
-  const siteOptions = useMemo(
-    () => buildSelectOptions('Site: All', 'Site: ', filterOptions.sites, filters.site),
-    [filterOptions.sites, filters.site]
+  const siteValues = useMemo(
+    () => buildUniqueValues(filterOptions.sites ?? [], filters.sites),
+    [filterOptions.sites, filters.sites]
   );
 
   const teamOptions = useMemo(
@@ -144,6 +150,20 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
     onChangeFilters({ ...filters, severities: next });
   };
 
+  const toggleEnvironment = (env: string) => {
+    const exists = filters.environments.includes(env);
+    const next = exists
+      ? filters.environments.filter((e) => e !== env)
+      : [...filters.environments, env];
+    onChangeFilters({ ...filters, environments: next });
+  };
+
+  const toggleSite = (site: string) => {
+    const exists = filters.sites.includes(site);
+    const next = exists ? filters.sites.filter((s) => s !== site) : [...filters.sites, site];
+    onChangeFilters({ ...filters, sites: next });
+  };
+
   const addLabelFilter = () => {
     const trimmed = labelInput.trim();
     if (!trimmed || !trimmed.includes('=')) {
@@ -162,8 +182,8 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
   const hasActiveFilters =
     Boolean(searchInput.trim()) ||
     filters.severities.length > 0 ||
-    Boolean(filters.environment) ||
-    Boolean(filters.site) ||
+    filters.environments.length > 0 ||
+    filters.sites.length > 0 ||
     Boolean(filters.team) ||
     Boolean(filters.instance) ||
     filters.labels.length > 0 ||
@@ -187,34 +207,6 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
               }
             }}
             aria-label="Search alerts"
-          />
-        </div>
-
-        <div className={styles.compactSelectBox}>
-          <Select
-            aria-label="Filter by environment"
-            options={envOptions}
-            value={filters.environment}
-            onChange={(opt) =>
-              onChangeFilters({
-                ...filters,
-                environment: opt.value ?? '',
-              })
-            }
-          />
-        </div>
-
-        <div className={styles.compactSelectBox}>
-          <Select
-            aria-label="Filter by site"
-            options={siteOptions}
-            value={filters.site}
-            onChange={(opt) =>
-              onChangeFilters({
-                ...filters,
-                site: opt.value ?? '',
-              })
-            }
           />
         </div>
 
@@ -279,22 +271,80 @@ export const FilterToolbar: React.FC<FilterToolbarProps> = ({
       </div>
 
       <div className={styles.bottomRow}>
-        <div className={styles.severityChips}>
-          <span className={styles.chipLabel}>Severity:</span>
-          {SEVERITY_OPTIONS.map((sev) => {
-            const active = filters.severities.includes(sev);
-            return (
-              <button
-                key={sev}
-                type="button"
-                className={`${styles.sevChip} ${active ? styles.sevChipActive : ''}`}
-                aria-pressed={active}
-                onClick={() => toggleSeverity(sev)}
-              >
-                {sev}
-              </button>
-            );
-          })}
+        <div className={styles.quickSelectContainer}>
+          <div className={styles.chipGroup} role="group" aria-label="Filter by severity">
+            <span className={styles.chipLabel}>Severity:</span>
+            {SEVERITY_OPTIONS.map((sev) => {
+              const active = filters.severities.includes(sev);
+              return (
+                <button
+                  key={sev}
+                  type="button"
+                  className={`${styles.quickChip} ${styles.sevChip} ${active ? styles.quickChipActive : ''}`}
+                  aria-pressed={active}
+                  onClick={() => toggleSeverity(sev)}
+                >
+                  {sev}
+                </button>
+              );
+            })}
+          </div>
+
+          <div
+            className={styles.chipGroup}
+            role="group"
+            aria-label="Filter by environment"
+            data-testid="env-quick-select"
+          >
+            <span className={styles.chipLabel}>Env:</span>
+            {envValues.length > 0 ? (
+              envValues.map((env) => {
+                const active = filters.environments.includes(env);
+                return (
+                  <button
+                    key={env}
+                    type="button"
+                    data-testid={`env-chip-${env}`}
+                    className={`${styles.quickChip} ${active ? styles.quickChipActive : ''}`}
+                    aria-pressed={active}
+                    onClick={() => toggleEnvironment(env)}
+                  >
+                    {env}
+                  </button>
+                );
+              })
+            ) : (
+              <span className={styles.emptyChipHint}>None</span>
+            )}
+          </div>
+
+          <div
+            className={styles.chipGroup}
+            role="group"
+            aria-label="Filter by site"
+            data-testid="site-quick-select"
+          >
+            <span className={styles.chipLabel}>Site:</span>
+            {siteValues.length > 0 ? (
+              siteValues.map((site) => {
+                const active = filters.sites.includes(site);
+                return (
+                  <button
+                    key={site}
+                    type="button"
+                    data-testid={`site-chip-${site}`}
+                    className={`${styles.quickChip} ${active ? styles.quickChipActive : ''}`}
+                    aria-pressed={active}
+                    onClick={() => toggleSite(site)}
+                  >
+                    {site}
+                  </button>
+                );
+              })
+            ) : (
+              <span className={styles.emptyChipHint}>None</span>
+            )}
+          </div>
 
           {filters.labels.map((pair) => (
             <Tag
@@ -397,7 +447,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     align-items: center;
   `,
   searchBox: css`
-    flex: 2 1 250px;
+    flex: 2 1 260px;
     min-width: 220px;
   `,
   compactSelectBox: css`
@@ -405,15 +455,15 @@ const getStyles = (theme: GrafanaTheme2) => ({
     min-width: 135px;
   `,
   teamSelectBox: css`
-    flex: 0 1 175px;
+    flex: 0 1 180px;
     min-width: 145px;
   `,
   instanceSelectBox: css`
-    flex: 0 1 195px;
-    min-width: 160px;
+    flex: 0 1 200px;
+    min-width: 165px;
   `,
   sortSelectBox: css`
-    flex: 0 1 200px;
+    flex: 0 1 205px;
     min-width: 170px;
   `,
   labelInputGroup: css`
@@ -430,31 +480,53 @@ const getStyles = (theme: GrafanaTheme2) => ({
     align-items: center;
     gap: ${theme.spacing(1.25)};
   `,
-  severityChips: css`
+  quickSelectContainer: css`
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: ${theme.spacing(0.75)};
+    gap: ${theme.spacing(1.5)};
+  `,
+  chipGroup: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${theme.spacing(0.625)};
   `,
   chipLabel: css`
     font-size: ${theme.typography.bodySmall.fontSize};
     color: ${theme.colors.text.secondary};
-    margin-right: ${theme.spacing(0.5)};
+    margin-right: ${theme.spacing(0.25)};
   `,
-  sevChip: css`
+  emptyChipHint: css`
+    font-size: ${theme.typography.bodySmall.fontSize};
+    color: ${theme.colors.text.disabled};
+  `,
+  quickChip: css`
     padding: 3px 10px;
     border-radius: 12px;
     border: 1px solid ${theme.colors.border.medium};
     background: ${theme.colors.background.primary};
     color: ${theme.colors.text.secondary};
     font-size: ${theme.typography.bodySmall.fontSize};
-    text-transform: capitalize;
     cursor: pointer;
+
+    &:hover {
+      border-color: ${theme.colors.border.strong};
+      color: ${theme.colors.text.primary};
+    }
   `,
-  sevChipActive: css`
+  sevChip: css`
+    text-transform: capitalize;
+  `,
+  quickChipActive: css`
     background: ${theme.colors.primary.main};
     border-color: ${theme.colors.primary.main};
     color: ${theme.colors.primary.contrastText};
+
+    &:hover {
+      border-color: ${theme.colors.primary.main};
+      color: ${theme.colors.primary.contrastText};
+    }
   `,
   refreshControls: css`
     display: flex;

@@ -39,7 +39,10 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
     label: string;
     count: number;
     subtext: string;
-    accentColor: string;
+    bg: string;
+    fg: string;
+    subFg: string;
+    border: string;
     warningBadge?: string;
     warningTitle?: string;
   }> = [
@@ -48,14 +51,20 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
       label: 'Firing',
       count: summary.firing,
       subtext: firingSubtext,
-      accentColor: theme.colors.error.main,
+      bg: '#c4162a',
+      fg: '#ffffff',
+      subFg: 'rgba(255, 255, 255, 0.9)',
+      border: '#e02f44',
     },
     {
       key: 'acknowledged',
       label: 'Acknowledged',
       count: summary.acknowledged,
       subtext: `${summary.acknowledged_without_incident.toLocaleString()} without ticket · ${ticketOpen.toLocaleString()} ticket open`,
-      accentColor: theme.colors.warning.main,
+      bg: '#eab308',
+      fg: '#111217',
+      subFg: 'rgba(17, 18, 23, 0.85)',
+      border: '#facc15',
       warningBadge:
         activeClosedTickets > 0
           ? `⚠ ${activeClosedTickets.toLocaleString()} closed ticket${activeClosedTickets === 1 ? '' : 's'}`
@@ -73,14 +82,20 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
         summary.resolved_open_ticket > 0
           ? `${summary.resolved_open_ticket.toLocaleString()} open ServiceNow ticket`
           : 'Resolved after acknowledgement',
-      accentColor: '#a855f7',
+      bg: '#2e8540',
+      fg: '#ffffff',
+      subFg: 'rgba(255, 255, 255, 0.9)',
+      border: '#3fa355',
     },
     {
       key: 'dismissed',
       label: 'Dismissed',
       count: summary.dismissed,
       subtext: 'Suppressed for episode',
-      accentColor: theme.colors.text.secondary,
+      bg: '#3a414c',
+      fg: '#ffffff',
+      subFg: 'rgba(255, 255, 255, 0.85)',
+      border: '#4f5866',
     },
   ];
 
@@ -94,21 +109,17 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
             type="button"
             role="tab"
             className={`${styles.card} ${isActive ? styles.cardActive : ''}`}
-            style={{ borderTopColor: card.accentColor }}
+            style={{
+              backgroundColor: card.bg,
+              borderColor: card.border,
+              color: card.fg,
+            }}
             aria-selected={isActive}
             onClick={() => onSelectFilter(card.key)}
             data-testid={`kpi-card-${card.key}`}
           >
             <div className={styles.cardHeader}>
               <span className={styles.cardLabel}>{card.label}</span>
-              <span
-                className={styles.dot}
-                style={{ backgroundColor: card.accentColor }}
-                aria-hidden="true"
-              />
-            </div>
-            <div className={styles.cardValueRow}>
-              <div className={styles.cardValue}>{card.count.toLocaleString()}</div>
               {card.warningBadge && (
                 <span
                   className={styles.closedWarningBadge}
@@ -119,7 +130,10 @@ export const KpiFilterStrip: React.FC<KpiFilterStripProps> = ({
                 </span>
               )}
             </div>
-            <div className={styles.cardSubtext}>{card.subtext}</div>
+            <div className={styles.cardValue}>{card.count.toLocaleString()}</div>
+            <div className={styles.cardSubtext} style={{ color: card.subFg }}>
+              {card.subtext}
+            </div>
           </button>
         );
       })}
@@ -147,73 +161,59 @@ const getStyles = (theme: GrafanaTheme2) => ({
   card: css`
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
+    align-items: center;
+    justify-content: space-between;
     min-width: 0;
-    text-align: left;
-    padding: ${theme.spacing(1.25)} ${theme.spacing(1.75)};
-    background: ${theme.colors.background.secondary};
-    border: 1px solid ${theme.colors.border.weak};
-    border-top-width: 3px;
-    border-radius: ${theme.shape.radius.default};
+    min-height: 110px;
+    text-align: center;
+    padding: ${theme.spacing(1.25)} ${theme.spacing(1.5)};
+    border: 1px solid transparent;
+    border-radius: 3px;
     cursor: pointer;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    opacity: 0.84;
+    transition: opacity 0.15s ease, transform 0.12s ease, box-shadow 0.15s ease, filter 0.15s ease;
 
     &:hover {
-      border-color: ${theme.colors.border.strong};
-      background: ${theme.colors.background.elevated};
+      opacity: 1;
+      filter: brightness(1.06);
     }
   `,
   cardActive: css`
-    background: ${theme.colors.background.elevated};
-    box-shadow: 0 0 0 2px ${theme.colors.primary.main};
+    opacity: 1;
+    box-shadow: 0 0 0 2px ${theme.colors.background.canvas}, 0 0 0 4px ${theme.colors.text.maxContrast};
   `,
   cardHeader: css`
     display: flex;
     width: 100%;
-    justify-content: space-between;
+    justify-content: center;
     align-items: center;
     gap: ${theme.spacing(0.75)};
-    margin-bottom: ${theme.spacing(0.25)};
+    flex-wrap: wrap;
   `,
   cardLabel: css`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: ${theme.typography.bodySmall.fontSize};
-    font-weight: ${theme.typography.fontWeightMedium};
-    color: ${theme.colors.text.primary};
-  `,
-  dot: css`
-    flex-shrink: 0;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    display: inline-block;
-  `,
-  cardValueRow: css`
-    display: flex;
-    width: 100%;
-    align-items: center;
-    justify-content: space-between;
-    gap: ${theme.spacing(1)};
-    flex-wrap: wrap;
-    margin-bottom: ${theme.spacing(0.25)};
+    font-size: 12px;
+    font-weight: ${theme.typography.fontWeightBold};
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   `,
   cardValue: css`
-    font-size: ${theme.typography.h2.fontSize};
+    font-size: 38px;
     font-weight: ${theme.typography.fontWeightBold};
     font-variant-numeric: tabular-nums;
-    color: ${theme.colors.text.maxContrast};
-    line-height: 1.2;
+    line-height: 1.05;
+    margin: ${theme.spacing(0.5)} 0;
   `,
   closedWarningBadge: css`
     display: inline-flex;
     align-items: center;
-    padding: 2px 8px;
-    border-radius: 12px;
-    background: ${theme.colors.error.main};
-    color: ${theme.colors.error.contrastText};
-    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    background: #991b1b;
+    color: #ffffff;
+    font-size: 10px;
     font-weight: ${theme.typography.fontWeightBold};
     line-height: 1.3;
     white-space: nowrap;
@@ -223,7 +223,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: ${theme.typography.bodySmall.fontSize};
-    color: ${theme.colors.text.secondary};
+    font-size: 12px;
+    font-weight: ${theme.typography.fontWeightMedium};
   `,
 });

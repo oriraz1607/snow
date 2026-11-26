@@ -42,8 +42,8 @@ export const MAX_BULK_SELECTION = 50;
 const DEFAULT_FILTERS: FilterState = {
   search: '',
   severities: [],
-  environment: '',
-  site: '',
+  environments: [],
+  sites: [],
   team: '',
   instance: '',
   labels: [],
@@ -132,8 +132,8 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
     return {
       states,
       severities: filters.severities.length > 0 ? filters.severities : undefined,
-      environments: filters.environment ? [filters.environment] : undefined,
-      sites: filters.site ? [filters.site] : undefined,
+      environments: filters.environments.length > 0 ? filters.environments : undefined,
+      sites: filters.sites.length > 0 ? filters.sites : undefined,
       teams: filters.team ? [filters.team] : undefined,
       instances: filters.instance ? [filters.instance] : undefined,
       labels: filters.labels.length > 0 ? filters.labels : undefined,
@@ -621,6 +621,69 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         onResetAll={handleResetFilters}
       />
 
+      <AlertTable
+        alerts={items}
+        loading={loading}
+        canTriage={canTriage}
+        canWriteIncidents={canWriteSnow}
+        busyAlertId={busyAlertId}
+        selectedAlertIds={selectedAlertIds}
+        maxBulkSelection={MAX_BULK_SELECTION}
+        showServiceNowColumn={
+          viewMode === 'history' ||
+          quickFilter === 'acknowledged' ||
+          quickFilter === 'non_active_acknowledged'
+        }
+        sort={filters.sort}
+        onChangeSort={(nextSort) =>
+          setFilters((prev) => ({
+            ...prev,
+            sort: nextSort,
+          }))
+        }
+        onToggleSelectAlert={handleToggleSelectAlert}
+        onToggleSelectAll={handleToggleSelectAll}
+        onSelectAlert={(alert) => {
+          setFocusConfluenceOnOpen(false);
+          onSelectAlertId(alert.id);
+        }}
+        onOpenConfluenceEdit={(alert) => {
+          setFocusConfluenceOnOpen(true);
+          onSelectAlertId(alert.id);
+        }}
+        onAcknowledge={(alert) => void handleAcknowledge(alert)}
+        onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
+        onReopen={(alert) => void handleReopen(alert)}
+        onOpenDismiss={(alert) => setDismissModalAlerts([alert])}
+        onOpenCreateIncident={(alert) => setCreateModalAlerts([alert])}
+        onOpenLinkIncident={(alert) => setLinkModalAlert(alert)}
+        onOpenAddNote={(alert) =>
+          setNoteModal({
+            alert,
+            mode: 'triage_note',
+            title: `Add Triage Note — ${alert.alert_name}`,
+          })
+        }
+        onOpenWorkNote={(alert) =>
+          setNoteModal({
+            alert,
+            mode: 'snow_work_note',
+            title: `Post ServiceNow Work Note — ${alert.servicenow_incident?.incident_number || alert.alert_name}`,
+            initialText:
+              alert.incident_drift_status === 'resolved_open_ticket'
+                ? 'Alert resolved in Prometheus. Please verify recovery and resolve/close this incident.'
+                : '',
+          })
+        }
+        onSyncIncident={(alert) => void handleSyncIncident(alert)}
+        onFilterByFingerprint={(fp) =>
+          setFilters((prev) => ({
+            ...prev,
+            fingerprint: fp,
+          }))
+        }
+      />
+
       {selectedAlerts.length > 0 && (
         <div className={styles.bulkBar} data-testid="bulk-selection-bar">
           <div className={styles.bulkSummary}>
@@ -684,69 +747,6 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
           </div>
         </div>
       )}
-
-      <AlertTable
-        alerts={items}
-        loading={loading}
-        canTriage={canTriage}
-        canWriteIncidents={canWriteSnow}
-        busyAlertId={busyAlertId}
-        selectedAlertIds={selectedAlertIds}
-        maxBulkSelection={MAX_BULK_SELECTION}
-        showServiceNowColumn={
-          viewMode === 'history' ||
-          quickFilter === 'acknowledged' ||
-          quickFilter === 'non_active_acknowledged'
-        }
-        sort={filters.sort}
-        onChangeSort={(nextSort) =>
-          setFilters((prev) => ({
-            ...prev,
-            sort: nextSort,
-          }))
-        }
-        onToggleSelectAlert={handleToggleSelectAlert}
-        onToggleSelectAll={handleToggleSelectAll}
-        onSelectAlert={(alert) => {
-          setFocusConfluenceOnOpen(false);
-          onSelectAlertId(alert.id);
-        }}
-        onOpenConfluenceEdit={(alert) => {
-          setFocusConfluenceOnOpen(true);
-          onSelectAlertId(alert.id);
-        }}
-        onAcknowledge={(alert) => void handleAcknowledge(alert)}
-        onUnacknowledge={(alert) => void handleUnacknowledge(alert)}
-        onReopen={(alert) => void handleReopen(alert)}
-        onOpenDismiss={(alert) => setDismissModalAlerts([alert])}
-        onOpenCreateIncident={(alert) => setCreateModalAlerts([alert])}
-        onOpenLinkIncident={(alert) => setLinkModalAlert(alert)}
-        onOpenAddNote={(alert) =>
-          setNoteModal({
-            alert,
-            mode: 'triage_note',
-            title: `Add Triage Note — ${alert.alert_name}`,
-          })
-        }
-        onOpenWorkNote={(alert) =>
-          setNoteModal({
-            alert,
-            mode: 'snow_work_note',
-            title: `Post ServiceNow Work Note — ${alert.servicenow_incident?.incident_number || alert.alert_name}`,
-            initialText:
-              alert.incident_drift_status === 'resolved_open_ticket'
-                ? 'Alert resolved in Prometheus. Please verify recovery and resolve/close this incident.'
-                : '',
-          })
-        }
-        onSyncIncident={(alert) => void handleSyncIncident(alert)}
-        onFilterByFingerprint={(fp) =>
-          setFilters((prev) => ({
-            ...prev,
-            fingerprint: fp,
-          }))
-        }
-      />
 
       {(items.length > 0 || hasPrevPage || hasNextPage) && (
         <div className={styles.paginationBar} data-testid="pagination-bar">
@@ -815,7 +815,6 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
 
       <AlertDetailDrawer
         alertId={selectedAlertId}
-        metadata={metadata}
         canTriage={canTriage}
         canWriteIncidents={canWriteSnow}
         onClose={() => {
@@ -933,7 +932,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     width: 100%;
     max-width: 100%;
     box-sizing: border-box;
-    overflow-x: hidden;
+    overflow-x: clip;
     padding: ${theme.spacing(2.5)};
     margin: 0 auto;
   `,
@@ -984,17 +983,21 @@ const getStyles = (theme: GrafanaTheme2) => ({
     margin-bottom: ${theme.spacing(1.5)};
   `,
   bulkBar: css`
+    position: sticky;
+    bottom: ${theme.spacing(1)};
+    z-index: 15;
     display: flex;
     flex-wrap: wrap;
     justify-content: space-between;
     align-items: center;
     gap: ${theme.spacing(1.5)};
     padding: ${theme.spacing(1.25)} ${theme.spacing(1.5)};
-    margin-bottom: ${theme.spacing(1.5)};
+    margin-top: ${theme.spacing(1.5)};
     border: 1px solid ${theme.colors.primary.border};
     border-left: 4px solid ${theme.colors.primary.main};
     border-radius: ${theme.shape.radius.default};
     background: ${theme.colors.background.secondary};
+    box-shadow: ${theme.shadows.z3};
   `,
   bulkSummary: css`
     display: flex;

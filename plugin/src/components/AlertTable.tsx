@@ -337,10 +337,7 @@ export const AlertTable: React.FC<AlertTableProps> = ({
                       <div className={styles.mutedText}>Res {formatRelativeTime(alert.resolved_at)} ago</div>
                     </div>
                   ) : (
-                    <div>
-                      <div>{formatRelativeTime(alert.starts_at)}</div>
-                      <div className={styles.mutedText}>v{alert.version}</div>
-                    </div>
+                    <div>{formatRelativeTime(alert.starts_at)}</div>
                   )}
                 </td>
 
@@ -524,7 +521,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     width: 100%;
     max-width: 100%;
     border: 1px solid ${theme.colors.border.medium};
-    border-radius: ${theme.shape.radius.default};
+    border-radius: 2px;
     background: ${theme.colors.background.primary};
     overflow-x: visible;
 
@@ -547,23 +544,37 @@ const getStyles = (theme: GrafanaTheme2) => ({
       top: 0;
       z-index: 2;
       text-align: left;
-      padding: ${theme.spacing(1)} ${theme.spacing(1.25)};
+      padding: 8px 10px;
       font-size: 11px;
       font-weight: ${theme.typography.fontWeightBold};
       text-transform: uppercase;
       letter-spacing: 0.04em;
-      color: ${theme.colors.text.secondary};
-      background: ${theme.colors.background.secondary};
-      border-bottom: 1px solid ${theme.colors.border.medium};
+      color: ${theme.colors.text.primary};
+      background: ${theme.colors.background.canvas};
+      border-bottom: 2px solid ${theme.colors.border.medium};
+      border-right: 1px solid ${theme.colors.border.weak};
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+
+      &:last-child {
+        border-right: none;
+      }
     }
 
     td {
-      padding: ${theme.spacing(0.875)} ${theme.spacing(1.25)};
+      padding: 7px 10px;
       border-bottom: 1px solid ${theme.colors.border.weak};
+      border-right: 1px solid ${theme.colors.border.weak};
       vertical-align: middle;
+
+      &:last-child {
+        border-right: none;
+      }
+    }
+
+    tbody tr:last-child td {
+      border-bottom: none;
     }
   `,
   sortHeaderBtn: css`
@@ -623,17 +634,33 @@ const getStyles = (theme: GrafanaTheme2) => ({
     }
   `,
   zebraRow: css`
-    background: ${theme.colors.emphasize(theme.colors.background.primary, 0.015)};
+    background: ${theme.colors.emphasize(theme.colors.background.primary, 0.03)};
   `,
   selectedRow: css`
     background: rgba(50, 116, 217, 0.12) !important;
   `,
   sevCritical: css`
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(224, 47, 68, 0.16);
+    border: 1px solid rgba(224, 47, 68, 0.45);
+    font-size: 11px;
     font-weight: ${theme.typography.fontWeightBold};
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
     color: ${theme.colors.error.text};
   `,
   sevWarning: css`
-    font-weight: ${theme.typography.fontWeightMedium};
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(255, 153, 0, 0.14);
+    border: 1px solid rgba(255, 153, 0, 0.45);
+    font-size: 11px;
+    font-weight: ${theme.typography.fontWeightBold};
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
     color: ${theme.colors.warning.text};
   `,
   alertCell: css`

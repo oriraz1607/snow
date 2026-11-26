@@ -283,6 +283,9 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
     expect(row).toHaveTextContent('production');
     expect(row).toHaveTextContent('eu-west-1');
     expect(row).toHaveTextContent('observability');
+    expect(within(row).queryByText('v1')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('env-quick-select')).getByRole('button', { name: 'production' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('site-quick-select')).getByRole('button', { name: 'eu-west-1' })).toBeInTheDocument();
   });
 
   it('displays 409 Conflict toast when Acknowledge fails via the 3-squares menu and refreshes the queue', async () => {
@@ -504,6 +507,7 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     const teamSection = await screen.findByTestId('drawer-team-section');
     expect(teamSection).toHaveTextContent('No team connected');
+    expect(within(teamSection).queryByText('Quick select:')).not.toBeInTheDocument();
 
     await user.type(within(teamSection).getByLabelText('Tag team'), 'observability');
     await user.click(within(teamSection).getByRole('button', { name: 'Tag Team' }));
@@ -887,9 +891,10 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
 
     await waitFor(() => expect(screen.getByText('HighReplicationLag')).toBeInTheDocument());
 
-    // Filter by Env = staging
-    await user.click(screen.getByLabelText('Filter by environment'));
-    await user.click(await screen.findByText('Env: staging'));
+    // Filter by Env = staging quick-select chip
+    await user.click(
+      within(screen.getByLabelText('Filter by environment')).getByRole('button', { name: 'staging' })
+    );
     await waitFor(() =>
       expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
         expect.objectContaining({ environments: ['staging'] }),
@@ -897,9 +902,10 @@ describe('AlertQueuePage redesign, filters, bulk dismiss, RBAC, 3-squares action
       )
     );
 
-    // Filter by Site = eu-west-1
-    await user.click(screen.getByLabelText('Filter by site'));
-    await user.click(await screen.findByText('Site: eu-west-1'));
+    // Filter by Site = eu-west-1 quick-select chip
+    await user.click(
+      within(screen.getByLabelText('Filter by site')).getByRole('button', { name: 'eu-west-1' })
+    );
     await waitFor(() =>
       expect(mockedApi.listAlerts).toHaveBeenLastCalledWith(
         expect.objectContaining({ environments: ['staging'], sites: ['eu-west-1'] }),

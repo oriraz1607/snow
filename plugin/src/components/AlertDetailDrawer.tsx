@@ -17,7 +17,6 @@ import {
   Alert,
   AlertDetail,
   AlertHistoryResponse,
-  ServiceNowMetadataResponse,
 } from '../types/api';
 import {
   formatDurationBetween,
@@ -45,7 +44,6 @@ type DrawerTab = 'overview' | 'servicenow' | 'audit' | 'episodes';
 
 interface AlertDetailDrawerProps {
   alertId: string | null;
-  metadata: ServiceNowMetadataResponse | null;
   canTriage: boolean;
   canWriteIncidents: boolean;
   onClose: () => void;
@@ -69,7 +67,6 @@ const DISABLED_INCIDENT_REASON = 'Requires Editor or Admin role (incidents:write
 
 export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   alertId,
-  metadata,
   canTriage,
   canWriteIncidents,
   onClose,
@@ -269,15 +266,6 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   const confluenceDoc = detail
     ? getAlertConfluenceDoc(detail)
     : { url: null, source: 'none' as const, updatedBy: null };
-  const suggestedTeams = Array.from(
-    new Set([
-      'observability',
-      ...(metadata?.assignment_groups.map((g) => g.name) ?? []),
-      'Platform Engineering',
-      'Database SRE',
-      'Infrastructure',
-    ])
-  );
 
   return (
     <Drawer
@@ -384,13 +372,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                     value={teamInput}
                     disabled={!canTriage || savingTeam}
                     onChange={(e) => setTeamInput(e.currentTarget.value)}
-                    list="alert-team-suggestions"
                   />
-                  <datalist id="alert-team-suggestions">
-                    {suggestedTeams.map((t) => (
-                      <option key={t} value={t} />
-                    ))}
-                  </datalist>
                   <GatedButton
                     allowed={canTriage}
                     disabledReason={DISABLED_TRIAGE_REASON}
@@ -414,20 +396,6 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
                       Cancel
                     </Button>
                   )}
-                </div>
-                <div className={styles.quickTeamChips}>
-                  <span className={styles.metaText}>Quick select:</span>
-                  {suggestedTeams.slice(0, 5).map((t) => (
-                    <button
-                      key={t}
-                      type="button"
-                      className={styles.quickTeamChip}
-                      disabled={!canTriage || savingTeam}
-                      onClick={() => setTeamInput(t)}
-                    >
-                      {t}
-                    </button>
-                  ))}
                 </div>
               </div>
             )}
@@ -1155,31 +1123,6 @@ const getStyles = (theme: GrafanaTheme2) => ({
     display: flex;
     gap: ${theme.spacing(1)};
     align-items: center;
-  `,
-  quickTeamChips: css`
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: ${theme.spacing(0.75)};
-    margin-top: ${theme.spacing(0.75)};
-  `,
-  quickTeamChip: css`
-    padding: 2px 8px;
-    border-radius: 12px;
-    border: 1px solid ${theme.colors.border.medium};
-    background: ${theme.colors.background.primary};
-    color: ${theme.colors.text.primary};
-    font-size: 11px;
-    cursor: pointer;
-
-    &:hover:not(:disabled) {
-      border-color: ${theme.colors.primary.main};
-    }
-
-    &:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
   `,
   section: css`
     margin-bottom: ${theme.spacing(0.5)};
