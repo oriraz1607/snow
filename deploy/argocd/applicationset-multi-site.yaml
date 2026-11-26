@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: noc-alert-manager-multi-site
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - site: site-a
+            namespace: noc-alert-manager-site-a
+            cluster: https://kubernetes.default.svc
+          - site: site-b
+            namespace: noc-alert-manager-site-b
+            cluster: https://kubernetes.default.svc
+  template:
+    metadata:
+      name: "noc-alert-manager-{{site}}"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: noc-alert-manager
+      source:
+        repoURL: https://github.com/oriraz1607/snow.git
+        targetRevision: main
+        path: "deploy/k8s/overlays/multi-site/{{site}}"
+      destination:
+        server: "{{cluster}}"
+        namespace: "{{namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

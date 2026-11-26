@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: noc-alert-api
+  labels:
+    app.kubernetes.io/name: noc-alert-api
+    app.kubernetes.io/part-of: noc-alert-manager
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: noc-alert-api

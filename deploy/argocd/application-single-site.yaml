@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: noc-alert-manager-single-site
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: noc-alert-manager
+  source:
+    repoURL: https://github.com/oriraz1607/snow.git
+    targetRevision: main
+    path: deploy/k8s/overlays/single-site
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: noc-alert-manager-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,0 +1,11 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: noc-alert-api
+spec:
+  host: noc-alert-api.site-a.example.com
+  to:
+    kind: Service
+    name: noc-alert-api
+  port:
+    targetPort: http

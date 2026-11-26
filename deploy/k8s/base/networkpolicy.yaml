@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: noc-alert-api-ingress
+  labels:
+    app.kubernetes.io/name: noc-alert-api
+    app.kubernetes.io/part-of: noc-alert-manager
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: noc-alert-api
+  policyTypes:
+    - Ingress
+  ingress:
+    # Public/internal API port (8080): OpenShift ingress router, Grafana, and Alertmanager namespaces only
+    - ports:
+        - protocol: TCP
+          port: 8080
+      from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: grafana
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+    # Admin/metrics port (9090): cluster-internal monitoring namespace ONLY (never exposed externally)
+    - ports:
+        - protocol: TCP
+          port: 9090
+      from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring

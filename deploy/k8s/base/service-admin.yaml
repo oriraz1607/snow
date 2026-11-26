@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: noc-alert-api-admin
+  labels:
+    app.kubernetes.io/name: noc-alert-api
+    app.kubernetes.io/component: admin
+    app.kubernetes.io/part-of: noc-alert-manager
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: noc-alert-api
+  ports:
+    - name: admin
+      port: 9090
+      targetPort: admin
+      protocol: TCP

@@ -1,0 +1,19 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: noc-alert-api
+  labels:
+    app.kubernetes.io/name: noc-alert-api
+    app.kubernetes.io/part-of: noc-alert-manager
+spec:
+  host: noc-alert-api.apps.example.com
+  to:
+    kind: Service
+    name: noc-alert-api
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noc-alert-api-config
+data:
+  GRAFANA_PUBLIC_URL: "https://grafana.site-b.example.com"
+  ALLOW_LEGACY_PROXY_HEADER_AUTH: "false"
+  SNOW_INSTANCE_URL: "https://prod.service-now.com"
+  SNOW_TOKEN_URL: "https://prod.service-now.com/oauth_token.do"
+  TRUST_PROXY_HEADERS: "true"
+  CORS_ALLOWED_ORIGINS: "https://grafana.site-b.example.com"
+  CONFLUENCE_ALLOWED_HOSTS: "confluence.example.com,.confluence.internal"
