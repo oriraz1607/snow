@@ -49,39 +49,49 @@ type Config struct {
 	SnowNoteWorkerInterval       time.Duration
 	SnowAutoReopenCooldown       time.Duration
 	SnowAutoReopenMaxAttempts    int
-	AllowRetrospectiveIncident   bool
-	TLSCertFile                  string
-	TLSKeyFile                   string
+	AllowRetrospectiveIncident  bool
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	RateLimitEnabled            bool
+	RateLimitAPIRPS             int
+	RateLimitAPIBurst           int
+	RateLimitWebhookRPS         int
+	RateLimitWebhookBurst       int
+	TrustProxyHeaders           bool
+	CORSAllowedOrigins          []string
+	ConfluenceAllowedHosts      []string
 }
 
 // Load parses and validates environment variables into Config.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:                        envOrDefault("PORT", "8080"),
-		AdminPort:                   envOrDefault("ADMIN_PORT", "9090"),
-		LogLevel:                    envOrDefault("LOG_LEVEL", "info"),
-		DatabaseURL:                 strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		JWTSecret:                   os.Getenv("GRAFANA_PLUGIN_JWT_SECRET"),
-		JWTSecretPrevious:           os.Getenv("GRAFANA_PLUGIN_JWT_SECRET_PREVIOUS"),
-		JWTIssuer:                   envOrDefault("GRAFANA_PLUGIN_JWT_ISSUER", "noc-alert-manager-app"),
-		GrafanaPublicURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("GRAFANA_PUBLIC_URL")), "/"),
-		ProxySharedToken:            os.Getenv("GRAFANA_PROXY_SHARED_TOKEN"),
-		AlertmanagerWebhookToken:    os.Getenv("ALERTMANAGER_WEBHOOK_TOKEN"),
-		SnowInstanceURL:             strings.TrimRight(strings.TrimSpace(os.Getenv("SNOW_INSTANCE_URL")), "/"),
-		SnowAuthMode:                strings.ToLower(envOrDefault("SNOW_AUTH_MODE", SnowAuthOAuth)),
-		SnowTokenURL:                strings.TrimSpace(os.Getenv("SNOW_TOKEN_URL")),
-		SnowClientID:                strings.TrimSpace(os.Getenv("SNOW_CLIENT_ID")),
-		SnowClientSecret:            os.Getenv("SNOW_CLIENT_SECRET"),
-		SnowOAuthScope:              strings.TrimSpace(os.Getenv("SNOW_OAUTH_SCOPE")),
-		SnowUsername:                strings.TrimSpace(os.Getenv("SNOW_USERNAME")),
-		SnowPassword:                os.Getenv("SNOW_PASSWORD"),
-		DefaultCallerSysID:          strings.TrimSpace(os.Getenv("SNOW_DEFAULT_NOC_CALLER_SYS_ID")),
-		DefaultCallerUsername:       envOrDefault("SNOW_DEFAULT_NOC_CALLER_USERNAME", "noc"),
-		DefaultAssignmentGroup:      strings.TrimSpace(os.Getenv("SNOW_DEFAULT_ASSIGNMENT_GROUP")),
-		DefaultCategory:             envOrDefault("SNOW_DEFAULT_CATEGORY", "Infrastructure"),
-		SnowInboundWebhookSecret:    os.Getenv("SNOW_INBOUND_WEBHOOK_SECRET"),
-		TLSCertFile:                 strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
-		TLSKeyFile:                  strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
+		Port:                     envOrDefault("PORT", "8080"),
+		AdminPort:                envOrDefault("ADMIN_PORT", "9090"),
+		LogLevel:                 envOrDefault("LOG_LEVEL", "info"),
+		DatabaseURL:              strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		JWTSecret:                os.Getenv("GRAFANA_PLUGIN_JWT_SECRET"),
+		JWTSecretPrevious:        os.Getenv("GRAFANA_PLUGIN_JWT_SECRET_PREVIOUS"),
+		JWTIssuer:                envOrDefault("GRAFANA_PLUGIN_JWT_ISSUER", "noc-alert-manager-app"),
+		GrafanaPublicURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("GRAFANA_PUBLIC_URL")), "/"),
+		ProxySharedToken:         os.Getenv("GRAFANA_PROXY_SHARED_TOKEN"),
+		AlertmanagerWebhookToken: os.Getenv("ALERTMANAGER_WEBHOOK_TOKEN"),
+		SnowInstanceURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("SNOW_INSTANCE_URL")), "/"),
+		SnowAuthMode:             strings.ToLower(envOrDefault("SNOW_AUTH_MODE", SnowAuthOAuth)),
+		SnowTokenURL:             strings.TrimSpace(os.Getenv("SNOW_TOKEN_URL")),
+		SnowClientID:             strings.TrimSpace(os.Getenv("SNOW_CLIENT_ID")),
+		SnowClientSecret:         os.Getenv("SNOW_CLIENT_SECRET"),
+		SnowOAuthScope:           strings.TrimSpace(os.Getenv("SNOW_OAUTH_SCOPE")),
+		SnowUsername:             strings.TrimSpace(os.Getenv("SNOW_USERNAME")),
+		SnowPassword:             os.Getenv("SNOW_PASSWORD"),
+		DefaultCallerSysID:       strings.TrimSpace(os.Getenv("SNOW_DEFAULT_NOC_CALLER_SYS_ID")),
+		DefaultCallerUsername:    envOrDefault("SNOW_DEFAULT_NOC_CALLER_USERNAME", "noc"),
+		DefaultAssignmentGroup:   strings.TrimSpace(os.Getenv("SNOW_DEFAULT_ASSIGNMENT_GROUP")),
+		DefaultCategory:          envOrDefault("SNOW_DEFAULT_CATEGORY", "Infrastructure"),
+		SnowInboundWebhookSecret: os.Getenv("SNOW_INBOUND_WEBHOOK_SECRET"),
+		TLSCertFile:              strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
+		TLSKeyFile:               strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
+		CORSAllowedOrigins:       parseCSVEnv("CORS_ALLOWED_ORIGINS", false),
+		ConfluenceAllowedHosts:   parseCSVEnv("CONFLUENCE_ALLOWED_HOSTS", true),
 	}
 
 	var err error
@@ -134,6 +144,32 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.AllowRetrospectiveIncident, err = envBool("ALLOW_RETROSPECTIVE_INCIDENT_CREATE", false); err != nil {
+		return nil, err
+	}
+	if cfg.RateLimitEnabled, err = envBool("RATE_LIMIT_ENABLED", true); err != nil {
+		return nil, err
+	}
+	apiRPS, err := envInt32("RATE_LIMIT_API_RPS", 60, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimitAPIRPS = int(apiRPS)
+	apiBurst, err := envInt32("RATE_LIMIT_API_BURST", 120, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimitAPIBurst = int(apiBurst)
+	whRPS, err := envInt32("RATE_LIMIT_WEBHOOK_RPS", 30, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimitWebhookRPS = int(whRPS)
+	whBurst, err := envInt32("RATE_LIMIT_WEBHOOK_BURST", 60, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimitWebhookBurst = int(whBurst)
+	if cfg.TrustProxyHeaders, err = envBool("TRUST_PROXY_HEADERS", false); err != nil {
 		return nil, err
 	}
 
@@ -211,7 +247,38 @@ func (c Config) LogValue() slog.Value {
 		slog.Int("snow_auto_reopen_max_attempts", c.SnowAutoReopenMaxAttempts),
 		slog.Bool("snow_auto_post_resolved_note", c.SnowAutoPostResolvedNote),
 		slog.Bool("tls_enabled", c.TLSCertFile != "" && c.TLSKeyFile != ""),
+		slog.Bool("rate_limit_enabled", c.RateLimitEnabled),
+		slog.Int("rate_limit_api_rps", c.RateLimitAPIRPS),
+		slog.Int("rate_limit_webhook_rps", c.RateLimitWebhookRPS),
+		slog.Bool("trust_proxy_headers", c.TrustProxyHeaders),
+		slog.Int("cors_allowed_origins_count", len(c.CORSAllowedOrigins)),
+		slog.Int("confluence_allowed_hosts_count", len(c.ConfluenceAllowedHosts)),
 	)
+}
+
+func parseCSVEnv(key string, lowercase bool) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		v := strings.TrimSpace(part)
+		if v == "" {
+			continue
+		}
+		if lowercase {
+			v = strings.ToLower(v)
+		} else {
+			v = strings.TrimRight(v, "/")
+		}
+		if _, ok := seen[v]; !ok {
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func envOrDefault(key, def string) string {

@@ -57,3 +57,59 @@ func TestConfigTLSValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigHardeningDefaultsAndValidation(t *testing.T) {
+	t.Run("defaults AllowLegacyProxyHeaderAuth to false and sets hardening defaults", func(t *testing.T) {
+		setMinimalValidEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected Load error: %v", err)
+		}
+		if cfg.AllowLegacyProxyHeaderAuth {
+			t.Fatalf("expected AllowLegacyProxyHeaderAuth to default to false")
+		}
+		if !cfg.RateLimitEnabled {
+			t.Fatalf("expected RateLimitEnabled to default to true")
+		}
+		if cfg.RateLimitAPIRPS != 60 || cfg.RateLimitAPIBurst != 120 {
+			t.Fatalf("unexpected API rate limit defaults: rps=%d burst=%d", cfg.RateLimitAPIRPS, cfg.RateLimitAPIBurst)
+		}
+		if cfg.RateLimitWebhookRPS != 30 || cfg.RateLimitWebhookBurst != 60 {
+			t.Fatalf("unexpected webhook rate limit defaults: rps=%d burst=%d", cfg.RateLimitWebhookRPS, cfg.RateLimitWebhookBurst)
+		}
+		if cfg.TrustProxyHeaders {
+			t.Fatalf("expected TrustProxyHeaders to default to false")
+		}
+		if len(cfg.CORSAllowedOrigins) != 0 || len(cfg.ConfluenceAllowedHosts) != 0 {
+			t.Fatalf("expected empty CORS/Confluence allowlists by default")
+		}
+	})
+
+	t.Run("parses CORS_ALLOWED_ORIGINS and CONFLUENCE_ALLOWED_HOSTS and rejects invalid rate limit", func(t *testing.T) {
+		setMinimalValidEnv(t)
+		t.Setenv("CORS_ALLOWED_ORIGINS", " https://grafana.corp.example/ , https://noc.corp.example ")
+		t.Setenv("CONFLUENCE_ALLOWED_HOSTS", " Confluence.Corp.Example , .atlassian.net ")
+		t.Setenv("RATE_LIMIT_API_RPS", "45")
+		t.Setenv("RATE_LIMIT_WEBHOOK_BURST", "90")
+		t.Setenv("TRUST_PROXY_HEADERS", "true")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected Load error: %v", err)
+		}
+		if len(cfg.CORSAllowedOrigins) != 2 || cfg.CORSAllowedOrigins[0] != "https://grafana.corp.example" {
+			t.Fatalf("unexpected CORSAllowedOrigins: %+v", cfg.CORSAllowedOrigins)
+		}
+		if len(cfg.ConfluenceAllowedHosts) != 2 || cfg.ConfluenceAllowedHosts[0] != "confluence.corp.example" || cfg.ConfluenceAllowedHosts[1] != ".atlassian.net" {
+			t.Fatalf("unexpected ConfluenceAllowedHosts: %+v", cfg.ConfluenceAllowedHosts)
+		}
+		if cfg.RateLimitAPIRPS != 45 || cfg.RateLimitWebhookBurst != 90 || !cfg.TrustProxyHeaders {
+			t.Fatalf("unexpected parsed hardening values: %+v", cfg)
+		}
+
+		t.Setenv("RATE_LIMIT_WEBHOOK_RPS", "0")
+		if _, err := Load(); err == nil {
+			t.Fatalf("expected error for RATE_LIMIT_WEBHOOK_RPS=0")
+		}
+	})
+}

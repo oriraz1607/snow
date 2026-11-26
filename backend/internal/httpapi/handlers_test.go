@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/oriraz/grafana-snow-integration/backend/internal/apierror"
 	"github.com/oriraz/grafana-snow-integration/backend/internal/auth"
+	"github.com/oriraz/grafana-snow-integration/backend/internal/config"
 	"github.com/oriraz/grafana-snow-integration/backend/internal/model"
 )
 
@@ -460,6 +463,110 @@ func TestAlertsHandlerHistoryPagination(t *testing.T) {
 			r.ServeHTTP(rec, req)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 for %s, got %d", urlStr, rec.Code)
+			}
+		}
+	})
+}
+
+func TestHardeningMiddlewareAndLegacyAuthWarning(t *testing.T) {
+	t.Run("SecurityHeadersMiddleware sets standard security headers and HSTS when TLS active", func(t *testing.T) {
+		h := SecurityHeadersMiddleware(true)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" ||
+			rec.Header().Get("X-Frame-Options") != "DENY" ||
+			rec.Header().Get("Referrer-Policy") != "no-referrer" ||
+			rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Fatalf("missing expected security headers: %+v", rec.Header())
+		}
+	})
+
+	t.Run("CORSMiddleware enforces origin allowlist and handles preflight", func(t *testing.T) {
+		h := CORSMiddleware([]string{"https://grafana.corp.example"})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		okReq := httptest.NewRequest(http.MethodOptions, "/api/v1/alerts", nil)
+		okReq.Header.Set("Origin", "https://grafana.corp.example")
+		okReq.Header.Set("Access-Control-Request-Method", "GET")
+		okRec := httptest.NewRecorder()
+		h.ServeHTTP(okRec, okReq)
+		if okRec.Code != http.StatusNoContent || okRec.Header().Get("Access-Control-Allow-Origin") != "https://grafana.corp.example" {
+			t.Fatalf("expected 204 CORS preflight for allowed origin, got %d (%+v)", okRec.Code, okRec.Header())
+		}
+
+		badReq := httptest.NewRequest(http.MethodOptions, "/api/v1/alerts", nil)
+		badReq.Header.Set("Origin", "https://evil.example")
+		badReq.Header.Set("Access-Control-Request-Method", "GET")
+		badRec := httptest.NewRecorder()
+		h.ServeHTTP(badRec, badReq)
+		if badRec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 CORS preflight for disallowed origin, got %d", badRec.Code)
+		}
+	})
+
+	t.Run("RateLimitMiddleware enforces token bucket burst and emits 429 RATE_LIMITED", func(t *testing.T) {
+		h := RateLimitMiddleware(1, 2, false)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		for i := 0; i < 2; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/alertmanager", nil)
+			req.RemoteAddr = "10.0.0.5:12345"
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected burst request %d to pass, got %d", i+1, rec.Code)
+			}
+		}
+
+		req3 := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/alertmanager", nil)
+		req3.RemoteAddr = "10.0.0.5:12345"
+		rec3 := httptest.NewRecorder()
+		h.ServeHTTP(rec3, req3)
+		if rec3.Code != http.StatusTooManyRequests ||
+			rec3.Header().Get("Retry-After") == "" ||
+			!strings.Contains(rec3.Body.String(), apierror.CodeRateLimited) {
+			t.Fatalf("expected 429 RATE_LIMITED with Retry-After, got code=%d headers=%+v body=%s", rec3.Code, rec3.Header(), rec3.Body.String())
+		}
+	})
+
+	t.Run("NewAPIRouter emits startup warning when AllowLegacyProxyHeaderAuth is true", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		cfg := &config.Config{
+			JWTSecret:                  "test-secret",
+			JWTIssuer:                  "noc-alert-manager-app",
+			AllowLegacyProxyHeaderAuth: true,
+			ProxySharedToken:           "legacy-token",
+			AlertmanagerWebhookToken:   "am-token",
+			RateLimitEnabled:           true,
+			RateLimitAPIRPS:            10,
+			RateLimitAPIBurst:          10,
+			RateLimitWebhookRPS:        5,
+			RateLimitWebhookBurst:      2,
+		}
+		router := NewAPIRouter(cfg, logger, nil, NewAlertsHandler(&stubAlertStore{}), NewServiceNowHandler(&stubIncidentService{}), &WebhooksHandler{})
+
+		if !strings.Contains(logBuf.String(), "ALLOW_LEGACY_PROXY_HEADER_AUTH is enabled") {
+			t.Fatalf("expected startup warning log for legacy proxy auth, got %s", logBuf.String())
+		}
+
+		// Verify webhook route gets rate limited when burst=2 is exceeded
+		for i := 0; i < 3; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/alertmanager", nil)
+			req.RemoteAddr = "192.0.2.10:5555"
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if i < 2 && rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 from webhook auth before rate limit hit on call %d, got %d", i+1, rec.Code)
+			}
+			if i == 2 && rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("expected 429 RATE_LIMITED on 3rd webhook call, got %d", rec.Code)
 			}
 		}
 	})

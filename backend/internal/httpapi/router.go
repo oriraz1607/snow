@@ -24,7 +24,39 @@ func NewAPIRouter(
 	r := chi.NewRouter()
 	r.Use(RequestIDMiddleware())
 	r.Use(RecoverMiddleware(logger))
+	r.Use(SecurityHeadersMiddleware(cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""))
+	r.Use(CORSMiddleware(cfg.CORSAllowedOrigins))
 	r.Use(AccessLogAndMetricsMiddleware(logger, metrics))
+
+	if cfg.AllowLegacyProxyHeaderAuth && logger != nil {
+		logger.Warn(
+			"ALLOW_LEGACY_PROXY_HEADER_AUTH is enabled; legacy proxy header authentication is deprecated and must be disabled in production",
+			slog.String("component", "http_server"),
+		)
+	}
+
+	var apiRateLimit func(http.Handler) http.Handler
+	var webhookRateLimit func(http.Handler) http.Handler
+	if cfg.RateLimitEnabled {
+		apiRPS := cfg.RateLimitAPIRPS
+		if apiRPS <= 0 {
+			apiRPS = 60
+		}
+		apiBurst := cfg.RateLimitAPIBurst
+		if apiBurst <= 0 {
+			apiBurst = 120
+		}
+		whRPS := cfg.RateLimitWebhookRPS
+		if whRPS <= 0 {
+			whRPS = 30
+		}
+		whBurst := cfg.RateLimitWebhookBurst
+		if whBurst <= 0 {
+			whBurst = 60
+		}
+		apiRateLimit = RateLimitMiddleware(float64(apiRPS), apiBurst, cfg.TrustProxyHeaders)
+		webhookRateLimit = RateLimitMiddleware(float64(whRPS), whBurst, cfg.TrustProxyHeaders)
+	}
 
 	operatorAuth := auth.OperatorMiddleware(auth.OperatorAuthConfig{
 		JWTSecret:                cfg.JWTSecret,
@@ -37,6 +69,9 @@ func NewAPIRouter(
 	r.Route("/api/v1", func(v1 chi.Router) {
 		// Operator-facing alert & ServiceNow routes
 		v1.Group(func(op chi.Router) {
+			if apiRateLimit != nil {
+				op.Use(apiRateLimit)
+			}
 			op.Use(operatorAuth)
 
 			op.With(auth.RequirePermission(auth.PermAlertsRead)).Get("/alerts", alerts.List)
@@ -60,11 +95,16 @@ func NewAPIRouter(
 		})
 
 		// Machine-to-machine webhooks
-		v1.With(auth.AlertmanagerBearerMiddleware(cfg.AlertmanagerWebhookToken)).
-			Post("/webhooks/alertmanager", webhooks.Alertmanager)
+		v1.Group(func(wh chi.Router) {
+			if webhookRateLimit != nil {
+				wh.Use(webhookRateLimit)
+			}
+			wh.With(auth.AlertmanagerBearerMiddleware(cfg.AlertmanagerWebhookToken)).
+				Post("/webhooks/alertmanager", webhooks.Alertmanager)
 
-		v1.With(auth.ServiceNowWebhookMiddleware(cfg.SnowInboundWebhookSecret, cfg.AlertmanagerMaxPayloadBytes)).
-			Post("/webhooks/servicenow", webhooks.ServiceNow)
+			wh.With(auth.ServiceNowWebhookMiddleware(cfg.SnowInboundWebhookSecret, cfg.AlertmanagerMaxPayloadBytes)).
+				Post("/webhooks/servicenow", webhooks.ServiceNow)
+		})
 
 		v1.With(auth.ServiceNowWebhookMiddleware(cfg.SnowInboundWebhookSecret, cfg.AlertmanagerMaxPayloadBytes)).
 			Get("/integrations/servicenow/incidents/{snow_sys_id}/active-status", snow.IncidentActiveStatus)

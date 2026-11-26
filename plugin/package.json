@@ -1,6 +1,6 @@
 {
   "name": "noc-alert-manager-app",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Grafana App Plugin for Prometheus Alertmanager triage with ServiceNow incident integration",
   "private": true,
   "scripts": {
