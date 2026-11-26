@@ -307,7 +307,7 @@ func AccessLogAndMetricsMiddleware(logger *slog.Logger, metrics *observability.M
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, defaultJSONBodyLimit)
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {

@@ -382,7 +382,7 @@ func DecodeCursor(encoded string) (*PageCursor, error) {
 	return &c, nil
 }
 
-// AcknowledgeRequest is the payload for POST /api/v1/alerts/{id}/acknowledge, /unacknowledge, and /reopen.
+// StateMutationRequest is the payload for POST /api/v1/alerts/{id}/acknowledge, /unacknowledge, and /reopen.
 type StateMutationRequest struct {
 	Version int    `json:"version"`
 	Comment string `json:"comment"`
@@ -651,7 +651,7 @@ func IsValidUUID(s string) bool {
 	return true
 }
 
-// NormalizeLabelsOrAnnotations clones a string map cleanly (nil -> empty map).
+// NormalizeStringMap clones a string map cleanly (nil -> empty map).
 func NormalizeStringMap(src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return map[string]string{}

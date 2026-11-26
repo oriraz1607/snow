@@ -39,7 +39,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error connecting to PostgreSQL: %v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close(context.Background())
+	defer func() { _ = conn.Close(context.Background()) }()
 
 	runner, err := migrate.NewRunner(conn, *dir)
 	if err != nil {

@@ -97,7 +97,7 @@ func TestMintOperatorJWTClaims(t *testing.T) {
 	if claims.ID == "" {
 		t.Fatal("expected non-empty jti claim")
 	}
-	if gotTTL := claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time); gotTTL != 60*time.Second {
+	if gotTTL := claims.ExpiresAt.Sub(claims.IssuedAt.Time); gotTTL != 60*time.Second {
 		t.Fatalf("expected 60s TTL, got %s", gotTTL)
 	}
 	if len(claims.Permissions) != 3 {

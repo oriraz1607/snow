@@ -43,7 +43,6 @@ interface AlertTableProps {
 }
 
 const DISABLED_TRIAGE_REASON = 'Requires Editor or Admin role (alerts:triage permission)';
-const DISABLED_INCIDENT_REASON = 'Requires Editor or Admin role (incidents:write permission)';
 
 export const AlertTable: React.FC<AlertTableProps> = ({
   alerts,

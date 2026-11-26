@@ -359,7 +359,7 @@ export const AlertQueuePage: React.FC<AlertQueuePageProps> = ({
         setBusyAlertId(null);
       }
     },
-    [handleConflict, refresh, upsertAlert]
+    [handleConflict, quickFilter, refresh, upsertAlert]
   );
 
   const handleUnacknowledge = useCallback(

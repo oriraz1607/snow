@@ -134,7 +134,7 @@ func (e *testEnv) resetState(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	if _, err := conn.Exec(ctx, `TRUNCATE TABLE alerts, snow_user_cache, webhook_ingestion_log, alert_fingerprint_teams, idempotency_keys, team_assignment_group_mappings RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := conn.Exec(ctx, `TRUNCATE TABLE alerts, snow_user_cache, webhook_ingestion_log, alert_fingerprint_teams, idempotency_keys, team_assignment_group_mappings, alert_confluence_docs RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
 
@@ -171,16 +171,16 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		if err := ownerConn.QueryRow(ctx, `
 			SELECT COUNT(*) FROM information_schema.tables
 			WHERE table_schema = 'public'
-			  AND table_name IN ('alerts','servicenow_incidents','alert_audit_log','snow_user_cache','webhook_ingestion_log','alert_fingerprint_teams','idempotency_keys','team_assignment_group_mappings')
-		`).Scan(&tableCount); err != nil || tableCount != 8 {
-			t.Fatalf("expected 8 tables, got %d (err=%v)", tableCount, err)
+			  AND table_name IN ('alerts','servicenow_incidents','alert_audit_log','snow_user_cache','webhook_ingestion_log','alert_fingerprint_teams','idempotency_keys','team_assignment_group_mappings','alert_confluence_docs')
+		`).Scan(&tableCount); err != nil || tableCount != 9 {
+			t.Fatalf("expected 9 tables, got %d (err=%v)", tableCount, err)
 		}
 
 		if err := ownerConn.QueryRow(ctx, `
 			SELECT COUNT(*) FROM pg_trigger
-			WHERE tgname IN ('trg_alerts_updated_at','trg_servicenow_incidents_updated_at','trg_alert_fingerprint_teams_updated_at','trg_idempotency_keys_updated_at','trg_team_assignment_group_mappings_updated_at')
-		`).Scan(&triggerCount); err != nil || triggerCount != 5 {
-			t.Fatalf("expected 5 triggers, got %d (err=%v)", triggerCount, err)
+			WHERE tgname IN ('trg_alerts_updated_at','trg_servicenow_incidents_updated_at','trg_alert_fingerprint_teams_updated_at','trg_idempotency_keys_updated_at','trg_team_assignment_group_mappings_updated_at','trg_alert_confluence_docs_updated_at')
+		`).Scan(&triggerCount); err != nil || triggerCount != 6 {
+			t.Fatalf("expected 6 triggers, got %d (err=%v)", triggerCount, err)
 		}
 
 		if err := ownerConn.QueryRow(ctx, `
@@ -192,10 +192,11 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 			    'idx_snow_incidents_sys_id','idx_snow_incidents_number','idx_audit_log_alert_id_created',
 			    'idx_snow_user_cache_expires_at','idx_webhook_ingestion_log_received_at',
 			    'idx_alerts_non_active_ack','idx_idempotency_keys_expires_at','idx_alerts_active_severity_rank',
-			    'idx_alerts_resolved_at_desc'
+			    'idx_alerts_resolved_at_desc','idx_alerts_instance_lower_asc','idx_alerts_instance_lower_desc',
+			    'idx_alerts_instance_exact'
 			  )
-		`).Scan(&indexCount); err != nil || indexCount != 15 {
-			t.Fatalf("expected 15 indexes, got %d (err=%v)", indexCount, err)
+		`).Scan(&indexCount); err != nil || indexCount != 18 {
+			t.Fatalf("expected 18 indexes, got %d (err=%v)", indexCount, err)
 		}
 
 		// Verify alert_api_app cannot UPDATE or DELETE alert_audit_log
@@ -1264,6 +1265,220 @@ func TestEndToEndPhase1Stack(t *testing.T) {
 		}
 		if !gotPartial {
 			t.Fatalf("timed out waiting for partial sibling resolution note on bulk ticket")
+		}
+	})
+
+	t.Run("Flow9_InstanceFilterSortAndConfluenceDocs", func(t *testing.T) {
+		tStart := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+
+		st, body := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow9",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "firing",
+					Fingerprint: "fp_flow9_zeta",
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						"alertname": "ZetaDiskAlert",
+						"severity":  "critical",
+						"instance":  "zeta-01.prod:9100",
+					},
+					Annotations: map[string]string{
+						"runbook_url": "https://runbooks.example.com/zeta",
+					},
+				},
+				{
+					Status:      "firing",
+					Fingerprint: "fp_flow9_alpha",
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						"alertname": "AlphaCpuAlert",
+						"severity":  "warning",
+						"host":      "alpha-host.prod",
+					},
+				},
+				{
+					Status:      "firing",
+					Fingerprint: "fp_flow9_empty",
+					StartsAt:    tStart,
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						"alertname": "EmptyInstAlert",
+						"severity":  "warning",
+					},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("ingest flow9 alerts failed: %d (%s)", st, string(body))
+		}
+
+		// Filter by extracted host->instance fallback and search by instance
+		st, alphaRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?instance=alpha-host.prod", aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("instance filter request failed: %d (%s)", st, string(alphaRaw))
+		}
+		var alphaList model.ListAlertsResponse
+		if err := json.Unmarshal(alphaRaw, &alphaList); err != nil {
+			t.Fatalf("unmarshal alpha instance list: %v", err)
+		}
+		if len(alphaList.Items) != 1 || alphaList.Items[0].AlertName != "AlphaCpuAlert" || alphaList.Items[0].Instance != "alpha-host.prod" {
+			t.Fatalf("expected AlphaCpuAlert with instance=alpha-host.prod, got %+v", alphaList.Items)
+		}
+		alphaID := alphaList.Items[0].ID
+
+		st, searchInstRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?search=zeta-01.prod", aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("instance search failed: %d (%s)", st, string(searchInstRaw))
+		}
+		var searchInstList model.ListAlertsResponse
+		_ = json.Unmarshal(searchInstRaw, &searchInstList)
+		if len(searchInstList.Items) != 1 || searchInstList.Items[0].Instance != "zeta-01.prod:9100" {
+			t.Fatalf("expected instance search match zeta-01.prod:9100, got %+v", searchInstList.Items)
+		}
+
+		// Instance sorting ASC & DESC with NULLS LAST (empty instance stays last in both orders) and keyset pagination
+		st, ascP1Raw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?state=firing&sort=instance_asc&limit=2", aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("instance_asc p1 failed: %d (%s)", st, string(ascP1Raw))
+		}
+		var ascP1 model.ListAlertsResponse
+		_ = json.Unmarshal(ascP1Raw, &ascP1)
+		if len(ascP1.Items) != 2 || ascP1.NextCursor == nil {
+			t.Fatalf("expected 2 items and non-nil next_cursor on instance_asc p1, got %+v", ascP1)
+		}
+		if ascP1.Items[0].Instance != "alpha-host.prod" {
+			t.Fatalf("expected alpha-host.prod first in instance_asc, got %+v", ascP1.Items)
+		}
+
+		st, ascP2Raw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?state=firing&sort=instance_asc&limit=20&cursor="+*ascP1.NextCursor, aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("instance_asc p2 failed: %d (%s)", st, string(ascP2Raw))
+		}
+		var ascP2 model.ListAlertsResponse
+		_ = json.Unmarshal(ascP2Raw, &ascP2)
+		if len(ascP2.Items) == 0 || ascP2.Items[len(ascP2.Items)-1].Instance != "" {
+			t.Fatalf("expected empty instance NULLS LAST on final page in instance_asc, got %+v", ascP2.Items)
+		}
+
+		st, descRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?state=firing&sort=instance_desc&limit=20", aliceJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("instance_desc failed: %d (%s)", st, string(descRaw))
+		}
+		var descList model.ListAlertsResponse
+		_ = json.Unmarshal(descRaw, &descList)
+		if len(descList.Items) < 3 || descList.Items[0].Instance != "zeta-01.prod:9100" || descList.Items[len(descList.Items)-1].Instance != "" {
+			t.Fatalf("expected zeta-01.prod:9100 first and empty instance last in instance_desc, got %+v", descList.Items)
+		}
+
+		// Confluence doc URL validation (400 on http://), Viewer RBAC (403), and Editor persistence + audit (200)
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+alphaID+"/confluence", aliceJWT, map[string]any{
+			"confluence_url": "http://insecure.example.com/display/NOC/Alpha",
+		})
+		if st != http.StatusBadRequest {
+			t.Fatalf("expected 400 INVALID_REQUEST on non-HTTPS confluence_url, got %d", st)
+		}
+
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+alphaID+"/confluence", viewerJWT, map[string]any{
+			"confluence_url": "https://confluence.example.com/display/NOC/AlphaCpuAlert",
+		})
+		if st != http.StatusForbidden {
+			t.Fatalf("expected 403 FORBIDDEN_RBAC for Viewer confluence update, got %d", st)
+		}
+
+		const targetDocURL = "https://confluence.example.com/display/NOC/AlphaCpuAlert"
+		st, confRaw := env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/alerts/"+alphaID+"/confluence", aliceJWT, map[string]any{
+			"confluence_url": targetDocURL,
+		})
+		if st != http.StatusOK {
+			t.Fatalf("expected 200 updating confluence_url, got %d (%s)", st, string(confRaw))
+		}
+		var updatedAlpha model.Alert
+		_ = json.Unmarshal(confRaw, &updatedAlpha)
+		if updatedAlpha.ConfluenceURL == nil || *updatedAlpha.ConfluenceURL != targetDocURL || updatedAlpha.ConfluenceURLSource != model.ConfluenceSourceOverride {
+			t.Fatalf("unexpected updated confluence fields: %+v", updatedAlpha)
+		}
+
+		// Verify detail endpoint and immutable audit log event
+		st, detailRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+alphaID, viewerJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get alert detail failed: %d (%s)", st, string(detailRaw))
+		}
+		var detailAlpha model.AlertDetail
+		_ = json.Unmarshal(detailRaw, &detailAlpha)
+		if detailAlpha.ConfluenceURL == nil || *detailAlpha.ConfluenceURL != targetDocURL {
+			t.Fatalf("expected confluence_url on alert detail, got %+v", detailAlpha)
+		}
+
+		st, histRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts/"+alphaID+"/history", viewerJWT, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get alert history failed: %d (%s)", st, string(histRaw))
+		}
+		var hist model.AlertHistoryResponse
+		_ = json.Unmarshal(histRaw, &hist)
+		foundConfAudit := false
+		for _, ev := range hist.AuditEvents {
+			if ev.EventType == model.AuditAlertConfluenceURLUpdated {
+				foundConfAudit = true
+				break
+			}
+		}
+		if !foundConfAudit {
+			t.Fatalf("expected %s audit event, got %+v", model.AuditAlertConfluenceURLUpdated, hist.AuditEvents)
+		}
+
+		// Resolve & re-fire a new episode with the same alertname -> inherits alert_confluence_docs mapping
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow9",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "resolved",
+					Fingerprint: "fp_flow9_alpha",
+					StartsAt:    tStart,
+					EndsAt:      tStart.Add(30 * time.Second),
+					Labels: map[string]string{
+						"alertname": "AlphaCpuAlert",
+						"severity":  "warning",
+						"host":      "alpha-host.prod",
+					},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("resolve flow9 alpha failed: %d", st)
+		}
+		st, _ = env.doJSON(t, http.MethodPost, env.apiURL+"/api/v1/webhooks/alertmanager", env.amToken, model.AlertmanagerWebhookPayload{
+			Version:  "4",
+			GroupKey: "gk-flow9-refire",
+			Receiver: "alert-api",
+			Alerts: []model.AlertmanagerAlert{
+				{
+					Status:      "firing",
+					Fingerprint: "fp_flow9_alpha_refire",
+					StartsAt:    tStart.Add(1 * time.Minute),
+					EndsAt:      time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						"alertname": "AlphaCpuAlert",
+						"severity":  "warning",
+						"instance":  "alpha-host-2.prod",
+					},
+				},
+			},
+		})
+		if st != http.StatusOK {
+			t.Fatalf("re-fire flow9 alpha failed: %d", st)
+		}
+		_, refireRaw := env.doJSON(t, http.MethodGet, env.apiURL+"/api/v1/alerts?fingerprint=fp_flow9_alpha_refire&state=firing", viewerJWT, nil)
+		var refireResp model.ListAlertsResponse
+		_ = json.Unmarshal(refireRaw, &refireResp)
+		if len(refireResp.Items) != 1 || refireResp.Items[0].ConfluenceURL == nil || *refireResp.Items[0].ConfluenceURL != targetDocURL || refireResp.Items[0].ConfluenceURLSource != model.ConfluenceSourceOverride {
+			t.Fatalf("expected new episode with same alert_name to inherit confluence_url, got %+v", refireResp.Items)
 		}
 	})
 }

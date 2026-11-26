@@ -149,7 +149,7 @@ func parseAndValidateJWT(tokenStr, secret, issuer string) (OperatorContext, erro
 	if claims.IssuedAt == nil || claims.ExpiresAt == nil {
 		return OperatorContext{}, fmt.Errorf("missing iat or exp claim")
 	}
-	ttl := claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time)
+	ttl := claims.ExpiresAt.Sub(claims.IssuedAt.Time)
 	if ttl < 0 || ttl > MaxJWTLifetime {
 		return OperatorContext{}, fmt.Errorf("token lifetime %s exceeds maximum %s", ttl, MaxJWTLifetime)
 	}
